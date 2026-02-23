@@ -1,0 +1,20 @@
+[project]
+name = "stock-minute-ai"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "aiohttp>=3.13.3",
+    "alpaca-py>=0.43.2",
+    "duckdb>=1.4.4",
+    "numpy>=2.4.2",
+    "pandas>=2.3.3",
+    "plotly>=6.5.2",
+    "pydantic>=2.12.5",
+    "pytest>=9.0.2",
+    "python-dotenv>=1.2.1",
+    "rich>=14.3.3",
+    "ruff>=0.15.2",
+    "streamlit>=1.54.0",
+]
