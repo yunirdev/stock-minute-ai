@@ -1,0 +1,21 @@
+# DuckDB database
+*.duckdb
+
+# Data folders
+data/
+downloads/
+history/
+*.csv
+*.parquet
+*.feather
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual env
+.venv/
+venv/
+
+# Env file
+.env

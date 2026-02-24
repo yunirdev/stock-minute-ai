@@ -17,4 +17,5 @@ dependencies = [
     "rich>=14.3.3",
     "ruff>=0.15.2",
     "streamlit>=1.54.0",
+    "yfinance>=1.2.0",
 ]
