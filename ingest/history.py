@@ -1,366 +1,213 @@
+"""Fetch historical bar data from Alpaca and write to DuckDB.
+
+Usage:
+    python -m ingest.history
+    # or
+    python ingest/history.py
+
+Reads from .env:
+    ALPACA_API_KEY
+    ALPACA_API_SECRET
+    ALPACA_DATA_FEED   (iex | sip | delayed_sip)
+    SYMBOLS            (comma-separated, e.g. AAPL,MSFT,NVDA)
+    HISTORY_START      (e.g. 2016-01-01)
+    HISTORY_CHUNK_DAYS (chunk size for minute-bar fetches, e.g. 20)
+    DB_PATH            (path to DuckDB file, e.g. market.duckdb)
+"""
+
 import sys
 from pathlib import Path
+
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-import asyncio
 import os
-import threading
-from typing import List
-import time
 from datetime import datetime, timedelta, timezone
 
 import duckdb
 import pandas as pd
-import plotly.graph_objects as go
-import streamlit as st
 from dotenv import load_dotenv
 
-from ingest.alpaca_stream import AlpacaBarStreamer, Bar
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed, Adjustment
 
 
-def parse_symbols(raw: str) -> List[str]:
-    return [s.strip().upper() for s in raw.split(",") if s.strip()]
-
-
-def make_hint(bar: Bar) -> str:
-    direction = "上涨" if bar.close >= bar.open else "下跌"
-    rng = (bar.high - bar.low) if (bar.high is not None and bar.low is not None) else 0.0
-    return f"{bar.symbol} {direction}，本分钟振幅 {rng:.4f}，成交量 {bar.volume:.0f}"
-
-
-@st.cache_resource
-def start_streamer(symbols: List[str], feed: str, db_path: str):
-    streamer = AlpacaBarStreamer(symbols=symbols, feed=feed, db_path=db_path)
-
-    def _runner():
-        asyncio.run(streamer.run())
-
-    t = threading.Thread(target=_runner, daemon=True)
-    t.start()
-    return streamer
-
-
-def is_crypto_symbol(symbol: str) -> bool:
-    s = symbol.upper()
-    return s.endswith("-USD") or (s.endswith("USD") and "-" in s)
-
-
-def get_data_range(db_path: str, symbol: str, timeframe: str):
-    con = duckdb.connect(db_path)
-    if timeframe == "1d":
-        mn, mx = con.execute(
-            "SELECT min(dt), max(dt) FROM daily_bars WHERE symbol = ?",
-            [symbol],
-        ).fetchone()
-        con.close()
-        if mn is None or mx is None:
-            return None, None
-        return pd.Timestamp(mn), pd.Timestamp(mx)
-    mn, mx = con.execute(
-        "SELECT min(ts), max(ts) FROM minute_bars WHERE symbol = ?",
-        [symbol],
-    ).fetchone()
-    con.close()
-    if mn is None or mx is None:
-        return None, None
-    mn = pd.Timestamp(mn)
-    mx = pd.Timestamp(mx)
-    if mn.tzinfo is None:
-        mn = mn.tz_localize("UTC")
-    if mx.tzinfo is None:
-        mx = mx.tz_localize("UTC")
-    return mn, mx
-
-
-def load_all_bars(db_path: str, symbol: str, timeframe: str) -> pd.DataFrame:
-    tf_seconds = {"1m": 60, "5m": 300, "30m": 1800, "1h": 3600}
-    con = duckdb.connect(db_path)
-
-    if timeframe == "1d":
-        df = con.execute(
-            """
-            SELECT
-              symbol,
-              dt::TIMESTAMP AS timestamp,
-              open, high, low, close, volume
-            FROM daily_bars
-            WHERE symbol = ?
-            ORDER BY dt ASC
-            """,
-            [symbol],
-        ).df()
-        con.close()
-        return df
-
-    sec = tf_seconds.get(timeframe, 60)
-    bucket_expr = (
-        f"to_timestamp(floor(epoch(ts AT TIME ZONE 'America/New_York')/{sec})*{sec}) "
-        f"AT TIME ZONE 'America/New_York'"
+def _ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS minute_bars (
+            symbol TEXT,
+            ts TIMESTAMPTZ,
+            open DOUBLE,
+            high DOUBLE,
+            low DOUBLE,
+            close DOUBLE,
+            volume BIGINT,
+            source TEXT,
+            PRIMARY KEY(symbol, ts, source)
+        );
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_bars (
+            symbol TEXT,
+            dt DATE,
+            open DOUBLE,
+            high DOUBLE,
+            low DOUBLE,
+            close DOUBLE,
+            volume BIGINT,
+            source TEXT,
+            PRIMARY KEY(symbol, dt, source)
+        );
+        """
     )
 
-    if timeframe == "1m":
-        df = con.execute(
-            """
-            SELECT symbol, ts as timestamp, open, high, low, close, volume
-            FROM minute_bars
-            WHERE symbol = ?
-            ORDER BY ts ASC
-            """,
-            [symbol],
-        ).df()
-        con.close()
-        return df
 
-    df = con.execute(
-        f"""
-        WITH b AS (
-          SELECT
-            symbol,
-            {bucket_expr} AS bucket_ts,
-            ts, open, high, low, close, volume
-          FROM minute_bars
-          WHERE symbol = ?
+def _upsert_daily(con: duckdb.DuckDBPyConnection, df: pd.DataFrame, source: str) -> int:
+    df = df[["symbol", "timestamp", "open", "high", "low", "close", "volume"]].copy()
+    df["dt"] = df["timestamp"].apply(
+        lambda t: t.date() if hasattr(t, "date") else t
+    )
+    df["source"] = source
+    con.register("_tmp_daily", df)
+    con.execute(
+        """
+        INSERT INTO daily_bars(symbol, dt, open, high, low, close, volume, source)
+        SELECT symbol, dt, open, high, low, close, volume::BIGINT, source
+        FROM _tmp_daily
+        ON CONFLICT(symbol, dt, source) DO UPDATE SET
+            open=excluded.open,
+            high=excluded.high,
+            low=excluded.low,
+            close=excluded.close,
+            volume=excluded.volume;
+        """
+    )
+    con.unregister("_tmp_daily")
+    return len(df)
+
+
+def _upsert_minute(con: duckdb.DuckDBPyConnection, df: pd.DataFrame, source: str) -> int:
+    df = df[["symbol", "timestamp", "open", "high", "low", "close", "volume"]].copy()
+    df = df.rename(columns={"timestamp": "ts"})
+    df["source"] = source
+    con.register("_tmp_minute", df)
+    con.execute(
+        """
+        INSERT INTO minute_bars(symbol, ts, open, high, low, close, volume, source)
+        SELECT symbol, ts, open, high, low, close, volume::BIGINT, source
+        FROM _tmp_minute
+        ON CONFLICT(symbol, ts, source) DO UPDATE SET
+            open=excluded.open,
+            high=excluded.high,
+            low=excluded.low,
+            close=excluded.close,
+            volume=excluded.volume;
+        """
+    )
+    con.unregister("_tmp_minute")
+    return len(df)
+
+
+def _parse_feed(feed_str: str) -> DataFeed:
+    feed_str = feed_str.lower()
+    mapping = {
+        "iex": DataFeed.IEX,
+        "sip": DataFeed.SIP,
+        "delayed_sip": DataFeed.DELAYED_SIP,
+    }
+    return mapping.get(feed_str, DataFeed.IEX)
+
+
+def main() -> None:
+    load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
+
+    api_key = os.getenv("ALPACA_API_KEY", "")
+    api_secret = os.getenv("ALPACA_API_SECRET", "")
+    if not api_key or not api_secret:
+        print("ERROR: Missing ALPACA_API_KEY / ALPACA_API_SECRET in .env")
+        sys.exit(1)
+
+    symbols = [
+        s.strip().upper()
+        for s in os.getenv("SYMBOLS", "AAPL,MSFT").split(",")
+        if s.strip()
+    ]
+    history_start = os.getenv("HISTORY_START", "2020-01-01")
+    chunk_days = int(os.getenv("HISTORY_CHUNK_DAYS", "20"))
+    db_path = os.getenv("DB_PATH", "market.duckdb")
+    feed_str = os.getenv("ALPACA_DATA_FEED", os.getenv("ALPACA_FEED", "iex"))
+    feed = _parse_feed(feed_str)
+
+    print(f"DB_PATH : {db_path}")
+    print(f"Symbols : {symbols}")
+    print(f"Start   : {history_start}")
+    print(f"Feed    : {feed_str}")
+
+    client = StockHistoricalDataClient(api_key, api_secret)
+    con = duckdb.connect(db_path)
+    _ensure_schema(con)
+
+    start_dt = datetime.strptime(history_start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    end_dt = datetime.now(timezone.utc)
+
+    # ── Daily bars ────────────────────────────────────────────────────────────
+    print(f"\nFetching daily bars {history_start} → today ...")
+    try:
+        req = StockBarsRequest(
+            symbol_or_symbols=symbols,
+            timeframe=TimeFrame.Day,
+            start=start_dt,
+            end=end_dt,
+            feed=feed,
+            adjustment=Adjustment.RAW,
         )
-        SELECT
-          symbol,
-          bucket_ts AS timestamp,
-          arg_min(open, ts)  AS open,
-          max(high)          AS high,
-          min(low)           AS low,
-          arg_max(close, ts) AS close,
-          sum(volume)        AS volume
-        FROM b
-        GROUP BY symbol, bucket_ts
-        ORDER BY bucket_ts ASC
-        """,
-        [symbol],
-    ).df()
+        bars = client.get_stock_bars(req)
+        df = bars.df
+        if df is not None and not df.empty:
+            df = df.reset_index()
+            count = _upsert_daily(con, df, "alpaca")
+            print(f"  daily_bars: {count} rows upserted")
+        else:
+            print("  daily_bars: no data returned")
+    except Exception as exc:
+        print(f"  daily_bars: ERROR – {exc}")
+
+    # ── Minute bars (chunked to avoid rate-limit / memory issues) ─────────────
+    print(f"\nFetching minute bars in {chunk_days}-day chunks ...")
+    total_minute = 0
+    cur = start_dt
+    while cur < end_dt:
+        chunk_end = min(cur + timedelta(days=chunk_days), end_dt)
+        print(f"  {cur.date()} → {chunk_end.date()} ...", end=" ", flush=True)
+        try:
+            req = StockBarsRequest(
+                symbol_or_symbols=symbols,
+                timeframe=TimeFrame.Minute,
+                start=cur,
+                end=chunk_end,
+                feed=feed,
+            )
+            bars = client.get_stock_bars(req)
+            df = bars.df
+            if df is not None and not df.empty:
+                df = df.reset_index()
+                count = _upsert_minute(con, df, "alpaca")
+                total_minute += count
+                print(f"{count} rows")
+            else:
+                print("no data")
+        except Exception as exc:
+            print(f"ERROR – {exc}")
+        cur = chunk_end
+
+    print(f"\n  minute_bars total: {total_minute} rows upserted")
     con.close()
-    return df
+    print("\nDone.")
 
 
-def _build_x_labels(df_hist: pd.DataFrame, timeframe: str) -> pd.Series:
-    ts = pd.to_datetime(df_hist["timestamp"], errors="coerce")
-    if getattr(ts.dt, "tz", None) is not None:
-        ts_local = ts.dt.tz_convert("America/New_York")
-    else:
-        ts_local = ts
-    fmt = "%Y-%m-%d" if timeframe == "1d" else "%Y-%m-%d %H:%M"
-    return ts_local.dt.strftime(fmt)
-
-
-def _day_start_xs(df_hist: pd.DataFrame, timeframe: str) -> List[str]:
-    if timeframe == "1d":
-        return []
-    ts = pd.to_datetime(df_hist["timestamp"], errors="coerce")
-    if getattr(ts.dt, "tz", None) is not None:
-        ts_local = ts.dt.tz_convert("America/New_York")
-    else:
-        ts_local = ts
-    dates = ts_local.dt.date
-    start_idx = df_hist.index[dates.ne(dates.shift())].tolist()
-    x_labels = _build_x_labels(df_hist, timeframe)
-    return [x_labels.loc[i] for i in start_idx]
-
-
-st.set_page_config(page_title="US Stocks Minute Bars (Local)", layout="wide")
-st.title("美股分钟数据（本地实时）")
-
-load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
-db_path = os.getenv("DB_PATH", "market.duckdb")
-
-default_symbols = os.getenv("SYMBOLS", "AAPL,MSFT")
-default_feed = os.getenv("ALPACA_FEED", "iex")
-
-with st.sidebar:
-    auto_refresh = st.checkbox("自动刷新", value=True)
-    refresh_sec = st.slider("刷新间隔(秒)", 1, 15, 15)
-    symbols_text = st.text_input("Symbols (comma separated)", default_symbols)
-    options = ["iex", "sip", "test"]
-    idx = options.index(default_feed) if default_feed in options else 0
-    feed = st.selectbox("Alpaca Feed", options=options, index=idx)
-    timeframe = st.selectbox("周期", options=["1m", "5m", "30m", "1h", "1d"], index=0)
-    no_gap = st.checkbox("无 gap（按数据顺序显示，忽略所有缺失日期）", value=True)
-    show_day_separators = st.checkbox("非日线：按天分隔虚线", value=True)
-    st.caption("如果订阅权限不够，sip 可能会报错，先用 iex。")
-    st.caption(f"DB: {db_path}")
-
-symbols = parse_symbols(symbols_text)
-if not symbols:
-    st.warning("请在左侧输入至少 1 个股票代码（例如 AAPL）。")
-    time.sleep(1)
-    st.rerun()
-
-streamer = start_streamer(symbols, feed, db_path)
-
-latest = streamer.latest
-rows, hints = [], []
-for sym in symbols:
-    bar = latest.get(sym)
-    if bar:
-        rows.append(
-            {
-                "symbol": bar.symbol,
-                "timestamp": bar.timestamp,
-                "open": bar.open,
-                "high": bar.high,
-                "low": bar.low,
-                "close": bar.close,
-                "volume": bar.volume,
-            }
-        )
-        hints.append(make_hint(bar))
-
-col1, col2 = st.columns([2, 1])
-
-with col1:
-    st.subheader("最新分钟K线")
-    if rows:
-        df_latest = pd.DataFrame(rows).sort_values(["symbol"])
-        st.dataframe(df_latest, use_container_width=True)
-    else:
-        st.info("还没收到数据（可能市场休市 / Key 不对 / feed 权限不够）。")
-
-with col2:
-    st.subheader("提示")
-    if hints:
-        for h in hints:
-            st.write("• " + h)
-    else:
-        st.write("等待数据中…")
-
-st.subheader(f"K线图（{timeframe}）")
-symbol_for_chart = st.selectbox("选择股票", options=symbols, index=0)
-only_completed = st.checkbox("只显示已完成K线（更稳定）", value=False)
-
-df_hist = load_all_bars(db_path, symbol_for_chart, timeframe)
-
-if only_completed and (not df_hist.empty) and timeframe != "1m":
-    df_hist = df_hist.iloc[:-1]
-
-if df_hist.empty:
-    st.info("还没有历史数据可画（确认 history.py 已写入，并且 Streamlit 使用同一个 DB_PATH）。")
-else:
-    df_hist = df_hist.dropna(subset=["timestamp", "open", "high", "low", "close"]).reset_index(drop=True)
-
-    is_daily = (timeframe == "1d")
-    is_crypto = is_crypto_symbol(symbol_for_chart)
-
-    fig = go.Figure()
-
-    if no_gap:
-        x_vals = _build_x_labels(df_hist, timeframe).tolist()
-
-        fig.add_trace(
-            go.Candlestick(
-                x=x_vals,
-                open=df_hist["open"],
-                high=df_hist["high"],
-                low=df_hist["low"],
-                close=df_hist["close"],
-                name="OHLC",
-            )
-        )
-        fig.add_trace(
-            go.Bar(
-                x=x_vals,
-                y=df_hist["volume"],
-                name="Volume",
-                opacity=0.3,
-                yaxis="y2",
-            )
-        )
-
-        if (not is_daily) and show_day_separators:
-            for x in _day_start_xs(df_hist, timeframe):
-                fig.add_vline(x=x, line_width=1, line_dash="dot", line_color="gray", opacity=0.35)
-
-        fig.update_layout(
-            xaxis=dict(
-                type="category",
-                categoryorder="array",
-                categoryarray=x_vals,
-                rangeslider=dict(visible=False),
-            ),
-            height=650,
-            margin=dict(l=10, r=10, t=30, b=10),
-            yaxis=dict(title="Price"),
-            yaxis2=dict(title="Volume", overlaying="y", side="right", showgrid=False),
-            legend=dict(orientation="h"),
-        )
-        st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displaylogo": False})
-
-    else:
-        rangebreaks = []
-        if not is_crypto:
-            if is_daily:
-                rangebreaks = [dict(bounds=["sat", "mon"])]
-            else:
-                rangebreaks = [
-                    dict(bounds=["sat", "mon"]),
-                    dict(bounds=[16, 9.5], pattern="hour"),
-                ]
-
-        fig.add_trace(
-            go.Candlestick(
-                x=df_hist["timestamp"],
-                open=df_hist["open"],
-                high=df_hist["high"],
-                low=df_hist["low"],
-                close=df_hist["close"],
-                name="OHLC",
-            )
-        )
-        fig.add_trace(
-            go.Bar(
-                x=df_hist["timestamp"],
-                y=df_hist["volume"],
-                name="Volume",
-                opacity=0.3,
-                yaxis="y2",
-            )
-        )
-
-        if (not is_daily) and show_day_separators:
-            ts = pd.to_datetime(df_hist["timestamp"])
-            if getattr(ts.dt, "tz", None) is not None:
-                dates = ts.dt.tz_convert("America/New_York").dt.date
-            else:
-                dates = ts.dt.date
-            starts = df_hist.loc[dates.ne(dates.shift()), "timestamp"].tolist()
-            for x in starts:
-                fig.add_vline(x=x, line_width=1, line_dash="dot", line_color="gray", opacity=0.35)
-
-        mn, mx = get_data_range(db_path, symbol_for_chart, timeframe)
-        x_range = [mn, mx] if (mn is not None and mx is not None) else None
-
-        fig.update_layout(
-            xaxis=dict(
-                type="date",
-                rangebreaks=rangebreaks,
-                rangeslider=dict(visible=True),
-                rangeselector=dict(
-                    buttons=[
-                        dict(count=1, label="1D", step="day", stepmode="backward"),
-                        dict(count=5, label="5D", step="day", stepmode="backward"),
-                        dict(count=1, label="1M", step="month", stepmode="backward"),
-                        dict(count=3, label="3M", step="month", stepmode="backward"),
-                        dict(count=6, label="6M", step="month", stepmode="backward"),
-                        dict(count=1, label="1Y", step="year", stepmode="backward"),
-                        dict(step="all", label="ALL"),
-                    ]
-                ),
-                range=x_range,
-            ),
-            height=650,
-            margin=dict(l=10, r=10, t=30, b=10),
-            yaxis=dict(title="Price"),
-            yaxis2=dict(title="Volume", overlaying="y", side="right", showgrid=False),
-            legend=dict(orientation="h"),
-        )
-
-        st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displaylogo": False})
-
-if auto_refresh:
-    time.sleep(refresh_sec)
-    st.rerun()
+if __name__ == "__main__":
+    main()
