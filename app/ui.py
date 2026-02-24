@@ -41,7 +41,7 @@ def load_recent_bars(db_path: str, symbol: str, limit: int = 200) -> pd.DataFram
 def make_hint(bar: Bar) -> str:
     # 先用规则提示（MVP）：后面你再接 ML/LLM
     direction = "上涨" if bar.close >= bar.open else "下跌"
-    rng = (bar.high - bar.low) if (bar.high and bar.low) else 0.0
+    rng = bar.high - bar.low
     return f"{bar.symbol} {direction}，本分钟振幅 {rng:.4f}，成交量 {bar.volume:.0f}"
 
 
@@ -106,7 +106,7 @@ with col1:
     st.subheader("最新分钟K线")
     if rows:
         df = pd.DataFrame(rows).sort_values(["symbol"])
-        st.dataframe(df, width="stretch")
+        st.dataframe(df, use_container_width=True)
     else:
         st.info("还没收到数据（可能市场休市 / Key 不对 / feed 权限不够）。")
 
@@ -165,7 +165,7 @@ else:
         legend=dict(orientation="h"),
     )
 
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, use_container_width=True)
 
 time.sleep(2)
 st.rerun()
