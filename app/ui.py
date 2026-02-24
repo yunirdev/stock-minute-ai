@@ -740,7 +740,6 @@ with tabs[0]:
         width="stretch",
         config={"scrollZoom": True, "displaylogo": False},
     )
-
     st.caption("BBI = (SMA3 + SMA6 + SMA12 + SMA24) / 4；autoscale 时默认仅显示最近 90 根。")
 
 
@@ -817,7 +816,6 @@ if show_macd_panel and "MACD" in ind_list:
                     margin=dict(l=10, r=10, t=30, b=10),
                 )
             st.plotly_chart(fig_macd, width="stretch", config={"scrollZoom": True, "displaylogo": False})
-
 
 # -----------------------------
 # Auto refresh
