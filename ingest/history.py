@@ -31,7 +31,7 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed, Adjustment
-
+from pathlib import Path
 
 def _ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
     con.execute(
@@ -138,7 +138,8 @@ def main() -> None:
     ]
     history_start = os.getenv("HISTORY_START", "2020-01-01")
     chunk_days = int(os.getenv("HISTORY_CHUNK_DAYS", "20"))
-    db_path = os.getenv("DB_PATH", "market.duckdb")
+    ROOT = Path(__file__).resolve().parents[1]
+    db_path = str(ROOT / "market.duckdb")
     feed_str = os.getenv("ALPACA_DATA_FEED", os.getenv("ALPACA_FEED", "iex"))
     feed = _parse_feed(feed_str)
 

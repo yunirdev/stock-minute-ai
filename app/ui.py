@@ -16,8 +16,8 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
-
 from ingest.alpaca_stream import AlpacaBarStreamer, Bar
+from pathlib import Path
 
 
 # -----------------------------
@@ -269,12 +269,12 @@ def _apply_grid_signals(out: pd.DataFrame, close: pd.Series, grid_pct: float) ->
     for i in range(1, len(close)):
         price = float(close.iloc[i])
         if price <= next_buy:
-            out.iloc[i, sig_col] = 1
+            out.at[i, "strat_signal"] = 1
             ref_price = price
             next_buy = ref_price * (1.0 - grid_pct)
             next_sell = ref_price * (1.0 + grid_pct)
         elif price >= next_sell:
-            out.iloc[i, sig_col] = -1
+            out.at[i, "strat_signal"] = -1
             ref_price = price
             next_buy = ref_price * (1.0 - grid_pct)
             next_sell = ref_price * (1.0 + grid_pct)
@@ -426,9 +426,8 @@ def _build_strategy_signals(df: pd.DataFrame, strategy: str, **kwargs) -> pd.Dat
     elif strategy == "半仓定投(月投2万)":
         period = int(kwargs.get("dca_period", 20))
         buy_idx = list(range(0, len(out), period))
-        sig_col = out.columns.get_loc("strat_signal")
         for i in buy_idx:
-            out.iloc[i, sig_col] = 1
+            out.at[i, "strat_signal"] = 1
 
     elif strategy == "半仓小网格(5%间距)":
         _apply_grid_signals(out, close, 0.05)
@@ -439,9 +438,8 @@ def _build_strategy_signals(df: pd.DataFrame, strategy: str, **kwargs) -> pd.Dat
     elif strategy == "半仓高频投(周投5k)":
         period = int(kwargs.get("dca_period", 5))
         buy_idx = list(range(0, len(out), period))
-        sig_col = out.columns.get_loc("strat_signal")
         for i in buy_idx:
-            out.iloc[i, sig_col] = 1
+            out.at[i, "strat_signal"] = 1
 
     elif strategy == "移动止损(回撤20%)":
         trail_pct = float(kwargs.get("trail_pct", 0.20))
@@ -572,7 +570,6 @@ def start_streamer(symbols: List[str], feed: str, db_path: str):
     t.start()
     return streamer
 
-
 # -----------------------------
 # Streamlit UI
 # -----------------------------
@@ -580,7 +577,8 @@ st.set_page_config(page_title="US Stocks Bars (DuckDB)", layout="wide")
 st.title("K线（DuckDB + Alpaca 实时）")
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
-db_path = os.getenv("DB_PATH", "market.duckdb")
+ROOT = Path(__file__).resolve().parents[1]
+db_path = str(ROOT / "market.duckdb")
 
 default_symbols = os.getenv("SYMBOLS", "AAPL,MSFT")
 default_feed = os.getenv("ALPACA_FEED", "iex")
