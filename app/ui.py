@@ -135,11 +135,12 @@ def _compute_indicators(
         out["bbi"] = (ma3 + ma6 + ma12 + ma24) / 4
 
     if "RSI" in ind_list:
+        n = int(rsi_n)
         delta = close.diff()
         gain = delta.clip(lower=0.0)
         loss = (-delta).clip(lower=0.0)
-        avg_gain = gain.rolling(int(rsi_n)).mean()
-        avg_loss = loss.rolling(int(rsi_n)).mean()
+        avg_gain = gain.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+        avg_loss = loss.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
         rs = avg_gain / avg_loss.replace(0, pd.NA)
         out["rsi"] = 100 - (100 / (1 + rs))
 
@@ -732,7 +733,8 @@ if df_hist.empty:
     st.stop()
 
 df_hist = df_hist.dropna(subset=["timestamp", "open", "high", "low", "close"]).reset_index(drop=True)
-df_hist["timestamp"] = pd.to_datetime(df_hist["timestamp"], errors="coerce")
+df_hist["timestamp"] = pd.to_datetime(df_hist["timestamp"], utc=True)
+df_hist["timestamp"] = df_hist["timestamp"].dt.tz_convert("America/New_York")
 df_hist = df_hist.dropna(subset=["timestamp"]).reset_index(drop=True)
 
 if only_completed and timeframe != "1m" and len(df_hist) > 1:
@@ -742,13 +744,13 @@ st.sidebar.caption(f"rows(total): {len(df_hist):,}")
 st.sidebar.caption(f"range: {df_hist['timestamp'].min()} → {df_hist['timestamp'].max()}")
 
 # -----------------------------
-# Performance: view window only (default 90, autoscale forces 90)
+# Compute indicators on FULL history first (stable rolling/ewm),
+# then slice view window for rendering.
 # -----------------------------
-df_view = df_hist.tail(int(window_n)).copy().reset_index(drop=True)
+df_hist_full = df_hist.copy().reset_index(drop=True)
 
-# indicators + signals (on view window only)
-df_view = _compute_indicators(
-    df=df_view,
+df_hist_full = _compute_indicators(
+    df=df_hist_full,
     ind_list=ind_list,
     sma_n=int(sma_n),
     ema_fast=int(ema_fast),
@@ -761,8 +763,8 @@ df_view = _compute_indicators(
     macd_signal=int(macd_signal),
     atr_n=int(atr_n),
 )
-df_view = _build_signals(
-    df=df_view,
+df_hist_full = _build_signals(
+    df=df_hist_full,
     use_signal_model=use_signal_model,
     signal_mode=signal_mode,
     ind_list=ind_list,
@@ -771,8 +773,8 @@ df_view = _build_signals(
     rsi_buy=float(rsi_buy),
     rsi_sell=float(rsi_sell),
 )
-df_view = _build_strategy_signals(
-    df_view,
+df_hist_full = _build_strategy_signals(
+    df_hist_full,
     selected_strategy,
     macd_fast=int(macd_fast),
     macd_slow=int(macd_slow),
@@ -789,7 +791,7 @@ df_view = _build_strategy_signals(
     dca_period=int(dca_period_monthly) if selected_strategy == "半仓定投(月投2万)" else int(dca_period_weekly),
 )
 
-df_hist = df_view
+df_hist = df_hist_full.tail(int(window_n)).copy().reset_index(drop=True)
 is_crypto = is_crypto_symbol(symbol_for_chart)
 
 tab_names = ["Main"]
@@ -933,6 +935,7 @@ with tabs[0]:
         tick_idx, tick_text = _tick_for_nogap(df_hist, timeframe)
 
         fig.update_layout(
+            uirevision=f"{symbol_for_chart}-{timeframe}-{x_mode}"，
             shapes=shapes,
             xaxis=dict(
                 type="linear",
@@ -1059,10 +1062,10 @@ with tabs[0]:
             xmax = xmax.replace(tzinfo=timezone.utc)
 
         fig.update_layout(
+            uirevision=f"{symbol_for_chart}-{timeframe}-{x_mode}"，
             shapes=shapes,
             xaxis=dict(
                 type="date",
-                range=[xmin, xmax],
                 rangebreaks=rb,
                 rangeslider=dict(visible=not autoscale),
             ),

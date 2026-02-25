@@ -106,7 +106,7 @@ def get_max_history_days(db_path: str, symbol: str, timeframe: str) -> int:
         mx = mx.replace(tzinfo=timezone.utc)
     return max((mx - mn).days + 1, 1)
 
-
+@st.cache_data(ttl=2)
 def load_bars_days(db_path: str, symbol: str, timeframe: str, days: int) -> pd.DataFrame:
     tf_seconds = {"1m": 60, "5m": 300, "30m": 1800, "1h": 3600}
     con = duckdb.connect(db_path)
@@ -290,8 +290,8 @@ else:
 
     fig.update_layout(
         xaxis=dict(
+            uirevision=f"{symbol_for_chart}-{timeframe}",
             type="date",
-            range=[xmin, xmax],
             rangeslider=dict(visible=True),
             rangeselector=dict(
                 buttons=[
