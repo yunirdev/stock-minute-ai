@@ -935,7 +935,7 @@ with tabs[0]:
         tick_idx, tick_text = _tick_for_nogap(df_hist, timeframe)
 
         fig.update_layout(
-            uirevision=f"{symbol_for_chart}-{timeframe}-{x_mode}"，
+            uirevision=f"{symbol_for_chart}-{timeframe}-{x_mode}",
             shapes=shapes,
             xaxis=dict(
                 type="linear",
@@ -1062,7 +1062,7 @@ with tabs[0]:
             xmax = xmax.replace(tzinfo=timezone.utc)
 
         fig.update_layout(
-            uirevision=f"{symbol_for_chart}-{timeframe}-{x_mode}"，
+            uirevision=f"{symbol_for_chart}-{timeframe}-{x_mode}",
             shapes=shapes,
             xaxis=dict(
                 type="date",
