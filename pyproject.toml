@@ -1,7 +1,7 @@
 [project]
 name = "stock-minute-ai"
 version = "0.1.0"
-description = "Add your description here"
+description = "Real-time and historical US stock minute-bar data pipeline with DuckDB storage and an interactive Streamlit candlestick dashboard powered by Alpaca Markets."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
