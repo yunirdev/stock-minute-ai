@@ -30,7 +30,7 @@ def parse_symbols(raw: str) -> List[str]:
 def make_hint(bar: Bar) -> str:
     direction = "上涨" if bar.close >= bar.open else "下跌"
     rng = (bar.high - bar.low) if (bar.high is not None and bar.low is not None) else 0.0
-    return f"{bar.symbol} {direction}，本分钟振幅 {rng:.4f}，成交量 {bar.volume:.0f}"
+    return f"{bar.symbol} {direction},本分钟振幅 {rng:.4f},成交量 {bar.volume:.0f}"
 
 
 def is_crypto_symbol(symbol: str) -> bool:
@@ -727,7 +727,7 @@ only_completed = st.checkbox("只显示已完成K线（更稳定）", value=Fals
 
 df_hist = load_all_bars(db_path, symbol_for_chart, timeframe)
 if df_hist.empty:
-    st.info("没有可画的数据：确认写入 daily_bars / minute_bars，并且 DB_PATH 一致。")
+    st.info("没有可画的数据：确认写入 daily_bars / minute_bars,并且 DB_PATH 一致。")
     st.stop()
 
 df_hist = df_hist.dropna(subset=["timestamp", "open", "high", "low", "close"]).reset_index(drop=True)
