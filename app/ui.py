@@ -7,7 +7,7 @@ import asyncio
 import os
 import threading
 import time
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from datetime import timezone
 
 import numpy as np
@@ -17,7 +17,6 @@ import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
 from ingest.alpaca_stream import AlpacaBarStreamer, Bar
-from pathlib import Path
 
 
 # -----------------------------
@@ -91,6 +90,18 @@ def _tick_for_nogap(df: pd.DataFrame, timeframe: str) -> Tuple[List[int], List[s
     return tick_idx, tick_text
 
 
+def _col_int_signal(df: pd.DataFrame, col: str) -> np.ndarray:
+    # Avoid pandas FutureWarning: object dtype + fillna downcasting
+    s = pd.to_numeric(df[col], errors="coerce")
+    return s.fillna(0).astype(int).to_numpy()
+
+
+def _bool_shift_prev(x: pd.Series) -> pd.Series:
+    # Avoid pandas FutureWarning: object dtype + fillna downcasting
+    s = x.shift(1)
+    return s.where(s.notna(), False).astype(bool)
+
+
 def _compute_indicators(
     df: pd.DataFrame,
     ind_list: List[str],
@@ -125,8 +136,6 @@ def _compute_indicators(
         out["bb_up"] = mid + float(bb_k) * sd
         out["bb_dn"] = mid - float(bb_k) * sd
 
-    # BBI (TOS Average() == SMA)
-    # BBI = (MA3 + MA6 + MA12 + MA24) / 4
     if "BBI" in ind_list:
         ma3 = close.rolling(3).mean()
         ma6 = close.rolling(6).mean()
@@ -243,12 +252,26 @@ STRATEGY_OPTIONS = [
     "唐奇安通道(20周突破)",
     "上周高低点(周K突破)",
     "三阳买两阴卖(形态跟踪)",
+    "全仓买入并持有",
+    "分期定投(每N bars)",
     "半仓定投(月投2万)",
     "半仓小网格(5%间距)",
     "半仓大网格(10%间距)",
     "半仓高频投(周投5k)",
     "移动止损(回撤20%)",
+    "BBI上穿下穿(收盘确认)",
+    "BBI回踩不破做多(顺势二次上车)",
+    "BBI回踩不破+斜率过滤",
+    "BBI跌破反抽不过做空/卖出",
 ]
+
+
+def _bbi_series(close: pd.Series) -> pd.Series:
+    ma3 = close.rolling(3).mean()
+    ma6 = close.rolling(6).mean()
+    ma12 = close.rolling(12).mean()
+    ma24 = close.rolling(24).mean()
+    return (ma3 + ma6 + ma12 + ma24) / 4
 
 
 def _cross_above(a: pd.Series, b: pd.Series) -> pd.Series:
@@ -265,7 +288,6 @@ def _apply_grid_signals(out: pd.DataFrame, close: pd.Series, grid_pct: float) ->
     ref_price = float(close.iloc[0])
     next_buy = ref_price * (1.0 - grid_pct)
     next_sell = ref_price * (1.0 + grid_pct)
-    sig_col = out.columns.get_loc("strat_signal")
     for i in range(1, len(close)):
         price = float(close.iloc[i])
         if price <= next_buy:
@@ -386,9 +408,7 @@ def _build_strategy_signals(df: pd.DataFrame, strategy: str, **kwargs) -> pd.Dat
         cci_n = int(kwargs.get("cci_n", 20))
         tp = (high + low + close) / 3
         tp_ma = tp.rolling(cci_n).mean()
-        mean_dev = tp.rolling(cci_n).apply(
-            lambda x: np.mean(np.abs(x - x.mean())), raw=True
-        )
+        mean_dev = tp.rolling(cci_n).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True)
         cci = (tp - tp_ma) / (0.015 * mean_dev.replace(0, pd.NA))
         p100 = pd.Series(100.0, index=cci.index)
         n100 = pd.Series(-100.0, index=cci.index)
@@ -423,7 +443,18 @@ def _build_strategy_signals(df: pd.DataFrame, strategy: str, **kwargs) -> pd.Dat
         out.loc[three_yang, "strat_signal"] = 1
         out.loc[two_yin, "strat_signal"] = -1
 
-    elif strategy == "半仓定投(月投2万)":
+    elif strategy == "全仓买入并持有":
+        if len(out) > 0:
+            out.at[0, "strat_signal"] = 1
+
+    elif strategy == "分期定投(每N bars)":
+        period = int(kwargs.get("dca_period", 20))
+        if period < 1:
+            period = 1
+        for i in range(0, len(out), period):
+            out.at[i, "strat_signal"] = 1
+
+    elif strategy in ["半仓定投(月投2万)", "半仓高频投(周投5k)"]:
         period = int(kwargs.get("dca_period", 20))
         buy_idx = list(range(0, len(out), period))
         for i in buy_idx:
@@ -435,18 +466,286 @@ def _build_strategy_signals(df: pd.DataFrame, strategy: str, **kwargs) -> pd.Dat
     elif strategy == "半仓大网格(10%间距)":
         _apply_grid_signals(out, close, 0.10)
 
-    elif strategy == "半仓高频投(周投5k)":
-        period = int(kwargs.get("dca_period", 5))
-        buy_idx = list(range(0, len(out), period))
-        for i in buy_idx:
-            out.at[i, "strat_signal"] = 1
-
     elif strategy == "移动止损(回撤20%)":
         trail_pct = float(kwargs.get("trail_pct", 0.20))
         peak = close.cummax()
         drawdown = (close - peak) / peak
         out.loc[drawdown < -trail_pct, "strat_signal"] = -1
 
+    elif strategy == "BBI上穿下穿(收盘确认)":
+        bbi = out["bbi"] if "bbi" in out.columns else _bbi_series(close)
+        out.loc[_cross_above(close, bbi), "strat_signal"] = 1
+        out.loc[_cross_below(close, bbi), "strat_signal"] = -1
+
+    elif strategy == "BBI回踩不破做多(顺势二次上车)":
+        bbi = out["bbi"] if "bbi" in out.columns else _bbi_series(close)
+        eps = float(kwargs.get("bbi_eps", 0.002))
+        breakout = bool(kwargs.get("bbi_breakout", True))
+
+        trend = close > bbi
+        touch = low <= bbi * (1.0 + eps)
+        hold_ = close >= bbi
+        setup = trend & touch & hold_
+
+        if breakout:
+            setup_prev = _bool_shift_prev(setup)
+            confirm_now = close > high.shift(1)
+            out.loc[setup_prev & confirm_now, "strat_signal"] = 1
+        else:
+            out.loc[setup, "strat_signal"] = 1
+
+        out.loc[_cross_below(close, bbi), "strat_signal"] = -1
+
+    elif strategy == "BBI回踩不破+斜率过滤":
+        bbi = out["bbi"] if "bbi" in out.columns else _bbi_series(close)
+        eps = float(kwargs.get("bbi_eps", 0.002))
+        breakout = bool(kwargs.get("bbi_breakout", True))
+
+        slope_up = bbi > bbi.shift(1)
+        trend = (close > bbi) & slope_up
+        touch = low <= bbi * (1.0 + eps)
+        hold_ = close >= bbi
+        setup = trend & touch & hold_
+
+        if breakout:
+            setup_prev = _bool_shift_prev(setup)
+            confirm_now = close > high.shift(1)
+            out.loc[setup_prev & confirm_now, "strat_signal"] = 1
+        else:
+            out.loc[setup, "strat_signal"] = 1
+
+        out.loc[_cross_below(close, bbi), "strat_signal"] = -1
+
+    elif strategy == "BBI跌破反抽不过做空/卖出":
+        bbi = out["bbi"] if "bbi" in out.columns else _bbi_series(close)
+        eps = float(kwargs.get("bbi_fail_eps", 0.002))
+
+        below = close < bbi
+        retest = high >= bbi * (1.0 - eps)
+        fail = close <= bbi
+        setup = below & retest & fail
+        out.loc[setup, "strat_signal"] = -1
+
+        out.loc[_cross_above(close, bbi), "strat_signal"] = 1
+
+    return out
+
+
+def _simulate_trades_one_lot(df: pd.DataFrame, signal_col: str = "strat_signal") -> Tuple[int, int, float]:
+    if df is None or df.empty or signal_col not in df.columns:
+        return 0, 0, 0.0
+
+    n = len(df)
+    sig = _col_int_signal(df, signal_col)
+    open_ = df["open"].astype(float).to_numpy()
+    close = df["close"].astype(float).to_numpy()
+
+    def px_next(i: int) -> float:
+        j = i + 1
+        if j < n and np.isfinite(open_[j]):
+            return float(open_[j])
+        return float(close[i])
+
+    pos = 0
+    entry_px = None
+
+    wins = 0
+    trades = 0
+    equity = 1.0
+
+    for i in range(n):
+        s = int(sig[i])
+        if s == 0:
+            continue
+
+        price = px_next(i)
+
+        if pos == 0:
+            pos = 1 if s > 0 else -1
+            entry_px = price
+            continue
+
+        if (pos == 1 and s < 0) or (pos == -1 and s > 0):
+            exit_px = price
+            if entry_px is None or entry_px <= 0 or not np.isfinite(entry_px) or not np.isfinite(exit_px):
+                pos = 1 if s > 0 else -1
+                entry_px = price
+                continue
+
+            trade_ret = (exit_px / entry_px - 1.0) * pos
+            trades += 1
+            if trade_ret > 0:
+                wins += 1
+            equity *= (1.0 + trade_ret)
+
+            pos = 1 if s > 0 else -1
+            entry_px = price
+
+    cum_ret_pct = (equity - 1.0) * 100.0
+    return wins, trades, cum_ret_pct
+
+
+def _current_position_and_entry(
+    df: pd.DataFrame,
+    signal_col: str = "strat_signal",
+) -> Tuple[int, Optional[float]]:
+    if df is None or df.empty or signal_col not in df.columns:
+        return 0, None
+
+    n = len(df)
+    sig = _col_int_signal(df, signal_col)
+    open_ = df["open"].astype(float).to_numpy()
+    close = df["close"].astype(float).to_numpy()
+
+    def px_next(i: int) -> float:
+        j = i + 1
+        if j < n and np.isfinite(open_[j]):
+            return float(open_[j])
+        return float(close[i])
+
+    pos = 0
+    entry_px: Optional[float] = None
+
+    for i in range(n):
+        s = int(sig[i])
+        if s == 0:
+            continue
+
+        if pos == 0:
+            pos = 1 if s > 0 else -1
+            entry_px = px_next(i)
+            continue
+
+        if (pos == 1 and s > 0) or (pos == -1 and s < 0):
+            continue
+
+        if (pos == 1 and s < 0) or (pos == -1 and s > 0):
+            pos = 0
+            entry_px = None
+            continue
+
+    return pos, entry_px
+
+
+def _strategy_indicator_and_price(
+    df: pd.DataFrame,
+    signal_col: str = "strat_signal",
+    current_price: Optional[float] = None,
+) -> Tuple[str, str, str]:
+    if df is None or df.empty:
+        return "hold", "", ""
+
+    pos, entry_px = _current_position_and_entry(df, signal_col=signal_col)
+    if entry_px is None or not np.isfinite(entry_px) or entry_px <= 0:
+        return "hold", "", ""
+
+    if current_price is None or not np.isfinite(current_price):
+        px = float(df["close"].astype(float).iloc[-1])
+    else:
+        px = float(current_price)
+
+    if not np.isfinite(px):
+        return "hold", "", ""
+
+    if pos == 1 and px < entry_px:
+        return "买入", f"{entry_px:.4f}", ""
+    if pos == -1 and px < entry_px:
+        return "卖出", "", f"{entry_px:.4f}"
+
+    return "hold", "", ""
+
+
+@st.cache_data(ttl=10)
+def build_strategy_stats_table_3windows(
+    df_full: pd.DataFrame,
+    strategies: List[str],
+    base_params: dict,
+    dca_period_monthly: int,
+    dca_period_weekly: int,
+    current_price: Optional[float] = None,
+) -> pd.DataFrame:
+    def _one_window(n: Optional[int]) -> pd.DataFrame:
+        df_use = df_full.copy()
+        if n is not None:
+            df_use = df_use.tail(int(n)).copy().reset_index(drop=True)
+
+        rows = []
+        for strat in strategies:
+            if strat == "无 (None)":
+                continue
+
+            params = dict(base_params)
+            if strat in ["半仓定投(月投2万)", "分期定投(每N bars)"]:
+                params["dca_period"] = int(dca_period_monthly)
+            elif strat == "半仓高频投(周投5k)":
+                params["dca_period"] = int(dca_period_weekly)
+            else:
+                params["dca_period"] = int(dca_period_monthly)
+
+            df_s = _build_strategy_signals(df_use, strat, **params)
+            w, t, cr = _simulate_trades_one_lot(df_s, "strat_signal")
+            wr = (w / t * 100.0) if t > 0 else 0.0
+            rows.append(
+                {
+                    "strategy": strat,
+                    "win_rate": f"{w}/{t} ({wr:.1f}%)",
+                    "cum_return_%": round(cr, 2),
+                }
+            )
+        return pd.DataFrame(rows)
+
+    df360 = _one_window(360).rename(columns={"win_rate": "win_360", "cum_return_%": "ret_360"})
+    df1000 = _one_window(1000).rename(columns={"win_rate": "win_1000", "cum_return_%": "ret_1000"})
+    dfmax = _one_window(None).rename(columns={"win_rate": "win_max", "cum_return_%": "ret_max"})
+
+    out = df360.merge(df1000, on="strategy", how="outer").merge(dfmax, on="strategy", how="outer")
+
+    indicator_map = {}
+    buy_price_map = {}
+    sell_price_map = {}
+
+    for strat in strategies:
+        if strat == "无 (None)":
+            continue
+
+        params = dict(base_params)
+        if strat in ["半仓定投(月投2万)", "分期定投(每N bars)"]:
+            params["dca_period"] = int(dca_period_monthly)
+        elif strat == "半仓高频投(周投5k)":
+            params["dca_period"] = int(dca_period_weekly)
+        else:
+            params["dca_period"] = int(dca_period_monthly)
+
+        df_s_full = _build_strategy_signals(df_full.copy(), strat, **params)
+        ind, bp, sp = _strategy_indicator_and_price(df_s_full, signal_col="strat_signal", current_price=current_price)
+        indicator_map[strat] = ind
+        buy_price_map[strat] = bp
+        sell_price_map[strat] = sp
+
+    # Avoid object fillna downcasting warnings: use where(notna, default)
+    s_ind = out["strategy"].map(indicator_map)
+    out["indicator"] = s_ind.where(s_ind.notna(), "hold")
+
+    s_bp = out["strategy"].map(buy_price_map)
+    out["buy_price"] = s_bp.where(s_bp.notna(), "")
+
+    s_sp = out["strategy"].map(sell_price_map)
+    out["sell_price"] = s_sp.where(s_sp.notna(), "")
+
+    out = out[
+        [
+            "strategy",
+            "win_360",
+            "ret_360",
+            "win_1000",
+            "ret_1000",
+            "win_max",
+            "ret_max",
+            "indicator",
+            "buy_price",
+            "sell_price",
+        ]
+    ]
     return out
 
 
@@ -570,6 +869,7 @@ def start_streamer(symbols: List[str], feed: str, db_path: str):
     t.start()
     return streamer
 
+
 # -----------------------------
 # Streamlit UI
 # -----------------------------
@@ -586,7 +886,7 @@ default_feed = os.getenv("ALPACA_FEED", "iex")
 with st.sidebar:
     st.caption(f"DB: {db_path}")
 
-    auto_refresh = st.checkbox("自动刷新", value=True)
+    auto_refresh = st.checkbox("自动刷新", value=False)
     refresh_sec = st.slider("刷新间隔(秒)", 1, 15, 2)
 
     symbols_text = st.text_input("Symbols (comma separated)", default_symbols)
@@ -594,7 +894,7 @@ with st.sidebar:
     idx = options.index(default_feed) if default_feed in options else 0
     feed = st.selectbox("Alpaca Feed", options=options, index=idx)
 
-    timeframe = st.selectbox("周期", options=["1m", "5m", "30m", "1h", "1d"], index=0)
+    timeframe = st.selectbox("周期", options=["1m", "5m", "30m", "1h", "1d"], index=2)
 
     x_mode = st.selectbox(
         "X轴模式",
@@ -607,8 +907,8 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### View / Autoscale")
-    autoscale = st.checkbox("autoscale（仅显示最近90根 + y轴按窗口自动）", value=True)
-    window_n = st.slider("可见窗口K线数", 30, 3000, 90, step=10)
+    autoscale = st.checkbox("autoscale（仅显示最近90根 + y轴按窗口自动）", value=False)
+    window_n = st.slider("可见窗口K线数", 30, 3000, 120, step=10)
     if autoscale:
         window_n = 90
 
@@ -638,18 +938,17 @@ with st.sidebar:
     atr_n = st.number_input("ATR n", 2, 200, 14) if "ATR" in ind_list else 14
 
     use_signal_model = st.checkbox("启用指示器模型（给买卖点）", value=False)
-    signal_mode = (
-        st.selectbox("模型类型", ["Rule-based", "Score-based"], index=0) if use_signal_model else "Rule-based"
-    )
+    signal_mode = st.selectbox("模型类型", ["Rule-based", "Score-based"], index=0) if use_signal_model else "Rule-based"
 
     show_rsi_panel = st.checkbox("显示 RSI 面板", value=("RSI" in ind_list))
     show_macd_panel = st.checkbox("显示 MACD 面板", value=("MACD" in ind_list))
 
     st.markdown("---")
     st.markdown("### 策略系统")
-    selected_strategy = st.selectbox("选择策略", options=STRATEGY_OPTIONS, index=0)
+    _default_strat = "BBI回踩不破做多(顺势二次上车)"
+    _default_strat_idx = STRATEGY_OPTIONS.index(_default_strat) if _default_strat in STRATEGY_OPTIONS else 0
+    selected_strategy = st.selectbox("选择策略", options=STRATEGY_OPTIONS, index=_default_strat_idx)
 
-    # Strategy-specific parameters
     kdj_n = 9
     cci_n = 20
     donchian_n = 100
@@ -658,6 +957,7 @@ with st.sidebar:
     trail_pct = 0.20
     dca_period_monthly = 20
     dca_period_weekly = 5
+    dca_period_staged = 20
 
     if selected_strategy == "KDJ极值反转(J线探底)":
         kdj_n = st.number_input("KDJ n", 5, 30, 9)
@@ -672,12 +972,27 @@ with st.sidebar:
     elif selected_strategy == "移动止损(回撤20%)":
         trail_pct = st.number_input("回撤阈值(%)", 5, 50, 20) / 100.0
     elif selected_strategy == "半仓定投(月投2万)":
-        dca_period_monthly = st.number_input("定投周期(bars)", 5, 100, 20)
+        dca_period_monthly = st.number_input("定投周期(bars)", 5, 200, 20)
     elif selected_strategy == "半仓高频投(周投5k)":
-        dca_period_weekly = st.number_input("高频投周期(bars)", 1, 30, 5)
+        dca_period_weekly = st.number_input("高频投周期(bars)", 1, 100, 5)
+    elif selected_strategy == "分期定投(每N bars)":
+        dca_period_staged = st.number_input("分期周期(bars)", 1, 500, 20)
 
     show_kdj_panel = st.checkbox("显示 KDJ 面板", value=(selected_strategy == "KDJ极值反转(J线探底)"))
     show_cci_panel = st.checkbox("显示 CCI 面板", value=(selected_strategy == "CCI顺势指标(±100突破)"))
+
+    if selected_strategy in ["BBI回踩不破做多(顺势二次上车)", "BBI回踩不破+斜率过滤"]:
+        bbi_eps = st.number_input("BBI回踩容忍(%)", 0.0, 2.0, 0.2, step=0.05) / 100.0
+        bbi_breakout = st.checkbox("确认：本根突破上一根高点", value=True)
+    else:
+        bbi_eps = 0.002
+        bbi_breakout = True
+
+    if selected_strategy == "BBI跌破反抽不过做空/卖出":
+        bbi_fail_eps = st.number_input("反抽容忍(%)", 0.0, 2.0, 0.2, step=0.05) / 100.0
+    else:
+        bbi_fail_eps = 0.002
+
 
 symbols = parse_symbols(symbols_text)
 if not symbols:
@@ -741,10 +1056,6 @@ if only_completed and timeframe != "1m" and len(df_hist) > 1:
 st.sidebar.caption(f"rows(total): {len(df_hist):,}")
 st.sidebar.caption(f"range: {df_hist['timestamp'].min()} → {df_hist['timestamp'].max()}")
 
-# -----------------------------
-# Compute indicators on FULL history first (stable rolling/ewm),
-# then slice view window for rendering.
-# -----------------------------
 df_hist_full = df_hist.copy().reset_index(drop=True)
 
 df_hist_full = _compute_indicators(
@@ -771,6 +1082,14 @@ df_hist_full = _build_signals(
     rsi_buy=float(rsi_buy),
     rsi_sell=float(rsi_sell),
 )
+
+if selected_strategy == "半仓高频投(周投5k)":
+    dca_period_use = int(dca_period_weekly)
+elif selected_strategy == "分期定投(每N bars)":
+    dca_period_use = int(dca_period_staged)
+else:
+    dca_period_use = int(dca_period_monthly)
+
 df_hist_full = _build_strategy_signals(
     df_hist_full,
     selected_strategy,
@@ -786,7 +1105,10 @@ df_hist_full = _build_strategy_signals(
     vol_ma_n=int(vol_ma_n),
     week_n=int(week_n),
     trail_pct=float(trail_pct),
-    dca_period=int(dca_period_monthly) if selected_strategy == "半仓定投(月投2万)" else int(dca_period_weekly),
+    dca_period=int(dca_period_use),
+    bbi_eps=float(bbi_eps),
+    bbi_breakout=bool(bbi_breakout),
+    bbi_fail_eps=float(bbi_fail_eps),
 )
 
 df_hist = df_hist_full.tail(int(window_n)).copy().reset_index(drop=True)
@@ -803,16 +1125,12 @@ if show_cci_panel:
     tab_names.append("CCI")
 tabs = st.tabs(tab_names)
 
-# -----------------------------
-# Main chart
-# -----------------------------
 with tabs[0]:
     fig = go.Figure()
 
     if x_mode.startswith("NO_GAP"):
         n = len(df_hist)
         x_idx = list(range(n))
-
         hover_time = _build_time_strings(df_hist, timeframe).to_numpy()
 
         fig.add_trace(
@@ -830,7 +1148,6 @@ with tabs[0]:
                 ),
             )
         )
-
         fig.add_trace(
             go.Bar(
                 x=x_idx,
@@ -843,19 +1160,14 @@ with tabs[0]:
             )
         )
 
-        # overlays
         if "SMA" in ind_list and f"sma_{int(sma_n)}" in df_hist.columns:
             fig.add_trace(go.Scatter(x=x_idx, y=df_hist[f"sma_{int(sma_n)}"], mode="lines", name=f"SMA{sma_n}"))
 
         if "EMA" in ind_list:
             if f"ema_{int(ema_fast)}" in df_hist.columns:
-                fig.add_trace(
-                    go.Scatter(x=x_idx, y=df_hist[f"ema_{int(ema_fast)}"], mode="lines", name=f"EMA{ema_fast}")
-                )
+                fig.add_trace(go.Scatter(x=x_idx, y=df_hist[f"ema_{int(ema_fast)}"], mode="lines", name=f"EMA{ema_fast}"))
             if f"ema_{int(ema_slow)}" in df_hist.columns:
-                fig.add_trace(
-                    go.Scatter(x=x_idx, y=df_hist[f"ema_{int(ema_slow)}"], mode="lines", name=f"EMA{ema_slow}")
-                )
+                fig.add_trace(go.Scatter(x=x_idx, y=df_hist[f"ema_{int(ema_slow)}"], mode="lines", name=f"EMA{ema_slow}"))
 
         if "BBANDS" in ind_list and {"bb_up", "bb_mid", "bb_dn"}.issubset(df_hist.columns):
             fig.add_trace(go.Scatter(x=x_idx, y=df_hist["bb_up"], mode="lines", name="BB Up"))
@@ -865,11 +1177,9 @@ with tabs[0]:
         if "BBI" in ind_list and "bbi" in df_hist.columns:
             fig.add_trace(go.Scatter(x=x_idx, y=df_hist["bbi"], mode="lines", name="BBI"))
 
-        # buy/sell markers (existing signal model)
         if use_signal_model and "signal" in df_hist.columns:
             buys = df_hist.index[df_hist["signal"] == 1].tolist()
             sells = df_hist.index[df_hist["signal"] == -1].tolist()
-
             if buys:
                 fig.add_trace(
                     go.Scatter(
@@ -895,7 +1205,6 @@ with tabs[0]:
                     )
                 )
 
-        # strategy signal markers
         if selected_strategy != "无 (None)" and "strat_signal" in df_hist.columns:
             s_buys = df_hist.index[df_hist["strat_signal"] == 1].tolist()
             s_sells = df_hist.index[df_hist["strat_signal"] == -1].tolist()
@@ -924,7 +1233,6 @@ with tabs[0]:
                     )
                 )
 
-        # day separator shapes (batch)
         shapes = []
         if timeframe != "1d" and show_day_separators:
             day_starts = _day_start_positions_idx(df_hist, timeframe)
@@ -974,19 +1282,13 @@ with tabs[0]:
         )
 
         if "SMA" in ind_list and f"sma_{int(sma_n)}" in df_hist.columns:
-            fig.add_trace(
-                go.Scatter(x=df_hist["timestamp"], y=df_hist[f"sma_{int(sma_n)}"], mode="lines", name=f"SMA{sma_n}")
-            )
+            fig.add_trace(go.Scatter(x=df_hist["timestamp"], y=df_hist[f"sma_{int(sma_n)}"], mode="lines", name=f"SMA{sma_n}"))
 
         if "EMA" in ind_list:
             if f"ema_{int(ema_fast)}" in df_hist.columns:
-                fig.add_trace(
-                    go.Scatter(x=df_hist["timestamp"], y=df_hist[f"ema_{int(ema_fast)}"], mode="lines", name=f"EMA{ema_fast}")
-                )
+                fig.add_trace(go.Scatter(x=df_hist["timestamp"], y=df_hist[f"ema_{int(ema_fast)}"], mode="lines", name=f"EMA{ema_fast}"))
             if f"ema_{int(ema_slow)}" in df_hist.columns:
-                fig.add_trace(
-                    go.Scatter(x=df_hist["timestamp"], y=df_hist[f"ema_{int(ema_slow)}"], mode="lines", name=f"EMA{ema_slow}")
-                )
+                fig.add_trace(go.Scatter(x=df_hist["timestamp"], y=df_hist[f"ema_{int(ema_slow)}"], mode="lines", name=f"EMA{ema_slow}"))
 
         if "BBANDS" in ind_list and {"bb_up", "bb_mid", "bb_dn"}.issubset(df_hist.columns):
             fig.add_trace(go.Scatter(x=df_hist["timestamp"], y=df_hist["bb_up"], mode="lines", name="BB Up"))
@@ -1020,7 +1322,6 @@ with tabs[0]:
                     )
                 )
 
-        # strategy signal markers
         if selected_strategy != "无 (None)" and "strat_signal" in df_hist.columns:
             s_buys = df_hist.index[df_hist["strat_signal"] == 1].tolist()
             s_sells = df_hist.index[df_hist["strat_signal"] == -1].tolist()
@@ -1052,13 +1353,6 @@ with tabs[0]:
             starts = df_hist.loc[dates.ne(dates.shift()), "timestamp"].tolist()
             shapes.extend(_make_shapes_day_separators_date(starts))
 
-        xmin = df_hist["timestamp"].min()
-        xmax = df_hist["timestamp"].max()
-        if getattr(xmin, "tzinfo", None) is None:
-            xmin = xmin.replace(tzinfo=timezone.utc)
-        if getattr(xmax, "tzinfo", None) is None:
-            xmax = xmax.replace(tzinfo=timezone.utc)
-
         fig.update_layout(
             uirevision=f"{symbol_for_chart}-{timeframe}-{x_mode}",
             shapes=shapes,
@@ -1074,17 +1368,51 @@ with tabs[0]:
             legend=dict(orientation="h"),
         )
 
-    st.plotly_chart(
-        fig,
-        width="stretch",
-        config={"scrollZoom": True, "displaylogo": False},
-    )
+    st.plotly_chart(fig, width="stretch", config={"scrollZoom": True, "displaylogo": False})
     st.caption("BBI = (SMA3 + SMA6 + SMA12 + SMA24) / 4；autoscale 时默认仅显示最近 90 根。")
 
+    base_params_for_table = dict(
+        macd_fast=int(macd_fast),
+        macd_slow=int(macd_slow),
+        macd_signal=int(macd_signal),
+        rsi_n=int(rsi_n),
+        bb_n=int(bb_n),
+        bb_k=float(bb_k),
+        kdj_n=int(kdj_n),
+        cci_n=int(cci_n),
+        donchian_n=int(donchian_n),
+        vol_ma_n=int(vol_ma_n),
+        week_n=int(week_n),
+        trail_pct=float(trail_pct),
+        bbi_eps=float(bbi_eps),
+        bbi_breakout=bool(bbi_breakout),
+        bbi_fail_eps=float(bbi_fail_eps),
+    )
 
-# -----------------------------
-# RSI panel
-# -----------------------------
+    latest_px = None
+    try:
+        b = streamer.latest.get(symbol_for_chart)
+        if b is not None and b.close is not None and np.isfinite(float(b.close)):
+            latest_px = float(b.close)
+    except Exception:
+        latest_px = None
+
+    stats_df = build_strategy_stats_table_3windows(
+        df_full=df_hist_full,
+        strategies=STRATEGY_OPTIONS,
+        base_params=base_params_for_table,
+        dca_period_monthly=int(dca_period_monthly),
+        dca_period_weekly=int(dca_period_weekly),
+        current_price=latest_px,
+    )
+
+    st.markdown("### 策略历史统计（三窗口同表：360 / 1000 / 最大；胜率=胜/总(%)；累计回报%）")
+    if stats_df.empty:
+        st.info("没有可用统计（数据不足或策略无交易信号）。")
+    else:
+        st.dataframe(stats_df, width="stretch", hide_index=True)
+
+
 tab_offset = 1
 if show_rsi_panel and "RSI" in ind_list:
     with tabs[tab_offset]:
@@ -1122,10 +1450,6 @@ if show_rsi_panel and "RSI" in ind_list:
             st.plotly_chart(fig_rsi, width="stretch", config={"scrollZoom": True, "displaylogo": False})
     tab_offset += 1
 
-
-# -----------------------------
-# MACD panel
-# -----------------------------
 if show_macd_panel and "MACD" in ind_list:
     with tabs[tab_offset]:
         need_cols = {"macd", "macd_signal", "macd_hist"}
@@ -1146,9 +1470,7 @@ if show_macd_panel and "MACD" in ind_list:
             else:
                 fig_macd.add_trace(go.Bar(x=df_hist["timestamp"], y=df_hist["macd_hist"], name="Hist", opacity=0.5))
                 fig_macd.add_trace(go.Scatter(x=df_hist["timestamp"], y=df_hist["macd"], mode="lines", name="MACD"))
-                fig_macd.add_trace(
-                    go.Scatter(x=df_hist["timestamp"], y=df_hist["macd_signal"], mode="lines", name="Signal")
-                )
+                fig_macd.add_trace(go.Scatter(x=df_hist["timestamp"], y=df_hist["macd_signal"], mode="lines", name="Signal"))
                 fig_macd.update_layout(
                     xaxis=dict(type="date", rangeslider=dict(visible=False)),
                     height=320,
@@ -1157,9 +1479,6 @@ if show_macd_panel and "MACD" in ind_list:
             st.plotly_chart(fig_macd, width="stretch", config={"scrollZoom": True, "displaylogo": False})
     tab_offset += 1
 
-# -----------------------------
-# KDJ panel
-# -----------------------------
 if show_kdj_panel:
     with tabs[tab_offset]:
         kdj_n_val = int(kdj_n)
@@ -1200,9 +1519,6 @@ if show_kdj_panel:
         st.plotly_chart(fig_kdj, width="stretch", config={"scrollZoom": True, "displaylogo": False})
     tab_offset += 1
 
-# -----------------------------
-# CCI panel
-# -----------------------------
 if show_cci_panel:
     with tabs[tab_offset]:
         cci_n_val = int(cci_n)
@@ -1211,9 +1527,7 @@ if show_cci_panel:
         low_c = df_hist["low"].astype(float)
         tp_c = (high_c + low_c + close_c) / 3
         tp_ma_c = tp_c.rolling(cci_n_val).mean()
-        mean_dev_c = tp_c.rolling(cci_n_val).apply(
-            lambda x: np.mean(np.abs(x - x.mean())), raw=True
-        )
+        mean_dev_c = tp_c.rolling(cci_n_val).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True)
         cci_vals = (tp_c - tp_ma_c) / (0.015 * mean_dev_c.replace(0, pd.NA))
 
         fig_cci = go.Figure()
@@ -1236,9 +1550,6 @@ if show_cci_panel:
         fig_cci.add_hline(y=-100, line_dash="dash", line_color="red", opacity=0.5)
         st.plotly_chart(fig_cci, width="stretch", config={"scrollZoom": True, "displaylogo": False})
 
-# -----------------------------
-# Auto refresh
-# -----------------------------
 if auto_refresh:
     time.sleep(refresh_sec)
     st.rerun()
