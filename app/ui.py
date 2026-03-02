@@ -13,8 +13,10 @@ import numpy as np
 import duckdb
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 from dotenv import load_dotenv
+from scipy import stats
 
 from ingest.alpaca_stream import AlpacaBarStreamer, Bar
 
@@ -509,6 +511,35 @@ def _build_strategy_signals(df: pd.DataFrame, strategy: str, **kwargs) -> pd.Dat
 
 
 # -----------------------------
+# P-value formatting / H0: mean(trade_ret)=0
+# -----------------------------
+def _fmt_pval(p: Optional[float]) -> str:
+    if p is None:
+        return ""
+    try:
+        p = float(p)
+        if not np.isfinite(p):
+            return ""
+        if p < 0.001:
+            return "<0.001"
+        return f"{p:.3f}"
+    except Exception:
+        return ""
+
+
+def _pval_h0_mean_zero(trade_rets: List[float]) -> str:
+    if trade_rets is None:
+        return ""
+    x = np.asarray(trade_rets, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size < 2:
+        return ""
+    res = stats.ttest_1samp(x, popmean=0.0, alternative="two-sided")
+    p = float(res.pvalue) if hasattr(res, "pvalue") else None
+    return _fmt_pval(p)
+
+
+# -----------------------------
 # Balance / Win-rate (NO forced sell; mark-to-market)
 # -----------------------------
 def _simulate_signal_strategy_mark_to_market(
@@ -517,9 +548,9 @@ def _simulate_signal_strategy_mark_to_market(
     exec_col: str = "strat_exec_px",
     leverage: float = 1.0,
     initial_capital: float = INITIAL_CAPITAL,
-) -> Tuple[int, int, float]:
+) -> Tuple[int, int, float, List[float]]:
     if df is None or df.empty or signal_col not in df.columns or exec_col not in df.columns:
-        return 0, 0, float(initial_capital)
+        return 0, 0, float(initial_capital), []
 
     L = float(leverage)
     if not np.isfinite(L) or L < 1.0:
@@ -535,6 +566,7 @@ def _simulate_signal_strategy_mark_to_market(
     entry_px: Optional[float] = None
     wins = 0
     trades = 0
+    trade_rets: List[float] = []
     equity = float(initial_capital)
 
     for i in range(len(df)):
@@ -566,6 +598,7 @@ def _simulate_signal_strategy_mark_to_market(
 
             trade_ret = (exit_px / entry_px - 1.0) * pos
             trades += 1
+            trade_rets.append(float(trade_ret))
             if trade_ret > 0:
                 wins += 1
 
@@ -579,6 +612,7 @@ def _simulate_signal_strategy_mark_to_market(
             pos = 1 if s > 0 else -1
             entry_px = p
 
+    # mark-to-market for final open position (not included in trade_rets)
     if equity > 0 and pos != 0 and entry_px is not None and np.isfinite(entry_px) and entry_px > 0:
         if np.isfinite(close_last) and close_last > 0:
             unreal_ret = (close_last / entry_px - 1.0) * pos
@@ -586,10 +620,12 @@ def _simulate_signal_strategy_mark_to_market(
             if not np.isfinite(equity) or equity < 0:
                 equity = 0.0
 
-    return wins, trades, float(equity)
+    return wins, trades, float(equity), trade_rets
 
 
-def _simulate_buy_hold_balance(df: pd.DataFrame, leverage: float = 1.0, initial_capital: float = INITIAL_CAPITAL) -> Tuple[int, int, float]:
+def _simulate_buy_hold_balance(
+    df: pd.DataFrame, leverage: float = 1.0, initial_capital: float = INITIAL_CAPITAL
+) -> Tuple[int, int, float]:
     if df is None or df.empty:
         return 0, 0, float(initial_capital)
 
@@ -633,7 +669,9 @@ def _dca_indices(nbars: int, n_tranches: int = DCA_N) -> List[int]:
     return out
 
 
-def _simulate_dca_20_balance(df: pd.DataFrame, leverage: float = 1.0, initial_capital: float = INITIAL_CAPITAL) -> Tuple[int, int, float]:
+def _simulate_dca_20_balance(
+    df: pd.DataFrame, leverage: float = 1.0, initial_capital: float = INITIAL_CAPITAL
+) -> Tuple[int, int, float]:
     if df is None or df.empty:
         return 0, 0, float(initial_capital)
 
@@ -683,17 +721,6 @@ def _simulate_dca_20_balance(df: pd.DataFrame, leverage: float = 1.0, initial_ca
     return 0, 0, float(equity)
 
 
-def _months_label_from_window(df_window: pd.DataFrame) -> int:
-    if df_window is None or df_window.empty or "timestamp_utc" not in df_window.columns:
-        return 1
-    ts = pd.to_datetime(df_window["timestamp_utc"], errors="coerce", utc=True).dropna()
-    if ts.empty:
-        return 1
-    days = int((ts.max() - ts.min()).days)
-    m = int(round(days / 30.0))
-    return max(1, m)
-
-
 def _fmt_int_cell(x) -> str:
     if x is None:
         return ""
@@ -709,13 +736,6 @@ def _fmt_int_cell(x) -> str:
 
 
 def _span_label(df_window: pd.DataFrame) -> str:
-    """
-    用 calendar time span 给窗口做标签（更适合 1m 数据）：
-      >=60d -> Xm
-      >=1d  -> Xd
-      >=1h  -> Xh
-      else  -> Xbars
-    """
     if df_window is None or df_window.empty or "timestamp_utc" not in df_window.columns:
         return "0bars"
     ts = pd.to_datetime(df_window["timestamp_utc"], errors="coerce", utc=True).dropna()
@@ -764,13 +784,14 @@ def _indicator_and_one_price(
     last_sell_i = int(sell_idx[-1]) if len(sell_idx) else None
 
     last_buy_px = float(exec_px[last_buy_i]) if last_buy_i is not None and np.isfinite(exec_px[last_buy_i]) else None
-    last_sell_px = float(exec_px[last_sell_i]) if last_sell_i is not None and np.isfinite(exec_px[last_sell_i]) else None
+    last_sell_px = (
+        float(exec_px[last_sell_i]) if last_sell_i is not None and np.isfinite(exec_px[last_sell_i]) else None
+    )
 
     cond_buy = (last_buy_px is not None) and (current_px < last_buy_px)
     cond_sell = (last_sell_px is not None) and (current_px > last_sell_px)
 
     if cond_buy and cond_sell:
-        # 两者都触发时，取“最近那次信号”的方向
         if last_buy_i is not None and last_sell_i is not None and last_sell_i > last_buy_i:
             return "sell", _fmt_int_cell(last_sell_px)
         return "buy", _fmt_int_cell(last_buy_px)
@@ -795,24 +816,24 @@ def build_strategy_stats_table_3windows(
         for strat in strategies:
             if strat == "全仓买入并持有":
                 _, _, bal = _simulate_buy_hold_balance(df_use, leverage=leverage, initial_capital=INITIAL_CAPITAL)
-                rows.append({"strategy": strat, "win_rate": "0/0 (0%)", "balance": int(round(bal))})
+                rows.append({"strategy": strat, "win_rate": "0/0 (0%)", "balance": int(round(bal)), "p_h0": ""})
                 continue
 
             if strat == "分期定投(20次均匀)":
                 _, _, bal = _simulate_dca_20_balance(df_use, leverage=leverage, initial_capital=INITIAL_CAPITAL)
-                rows.append({"strategy": strat, "win_rate": "0/0 (0%)", "balance": int(round(bal))})
+                rows.append({"strategy": strat, "win_rate": "0/0 (0%)", "balance": int(round(bal)), "p_h0": ""})
                 continue
 
             df_s = _build_strategy_signals(df_use, strat, **base_params)
-            w, t, bal = _simulate_signal_strategy_mark_to_market(
+            w, t, bal, trade_rets = _simulate_signal_strategy_mark_to_market(
                 df_s, "strat_signal", "strat_exec_px", leverage=leverage, initial_capital=INITIAL_CAPITAL
             )
             wr_int = int(round((w / t * 100.0))) if t > 0 else 0
-            rows.append({"strategy": strat, "win_rate": f"{w}/{t} ({wr_int}%)", "balance": int(round(bal))})
+            p0 = _pval_h0_mean_zero(trade_rets)
+            rows.append({"strategy": strat, "win_rate": f"{w}/{t} ({wr_int}%)", "balance": int(round(bal)), "p_h0": p0})
 
         return pd.DataFrame(rows)
 
-    # 3 windows
     df360_raw = df_full.tail(360).copy().reset_index(drop=True)
     df1000_raw = df_full.tail(1000).copy().reset_index(drop=True)
     dfmax_raw = df_full.copy().reset_index(drop=True)
@@ -821,13 +842,30 @@ def build_strategy_stats_table_3windows(
     span1000 = _span_label(df1000_raw)
     spanmax = _span_label(dfmax_raw)
 
-    df360 = _window_stats(df360_raw).rename(columns={"win_rate": f"win_{span360}_w360", "balance": f"bal_{span360}_w360"})
-    df1000 = _window_stats(df1000_raw).rename(columns={"win_rate": f"win_{span1000}_w1000", "balance": f"bal_{span1000}_w1000"})
-    dfmax = _window_stats(dfmax_raw).rename(columns={"win_rate": f"win_{spanmax}_wmax", "balance": f"bal_{spanmax}_wmax"})
+    df360 = _window_stats(df360_raw).rename(
+        columns={
+            "win_rate": f"win_{span360}_w360",
+            "balance": f"bal_{span360}_w360",
+            "p_h0": f"p0_{span360}_w360",
+        }
+    )
+    df1000 = _window_stats(df1000_raw).rename(
+        columns={
+            "win_rate": f"win_{span1000}_w1000",
+            "balance": f"bal_{span1000}_w1000",
+            "p_h0": f"p0_{span1000}_w1000",
+        }
+    )
+    dfmax = _window_stats(dfmax_raw).rename(
+        columns={
+            "win_rate": f"win_{spanmax}_wmax",
+            "balance": f"bal_{spanmax}_wmax",
+            "p_h0": f"p0_{spanmax}_wmax",
+        }
+    )
 
     out = df360.merge(df1000, on="strategy", how="outer").merge(dfmax, on="strategy", how="outer")
 
-    # indicator + one price
     indicator_map: Dict[str, str] = {}
     price_map: Dict[str, str] = {}
 
@@ -845,12 +883,10 @@ def build_strategy_stats_table_3windows(
     out["indicator"] = out["strategy"].map(indicator_map).fillna("hold")
     out["signal_price"] = out["strategy"].map(price_map).fillna("").map(_fmt_int_cell)
 
-    # 所有余额列变成“无小数”的字符串
     for c in out.columns:
         if c.startswith("bal_"):
             out[c] = out[c].map(_fmt_int_cell)
 
-    # 排序：买入持有、定投永远第1/2；其余按 wmax balance desc
     top_names = ["全仓买入并持有", "分期定投(20次均匀)"]
     top = out[out["strategy"].isin(top_names)].copy()
     rest = out[~out["strategy"].isin(top_names)].copy()
@@ -862,16 +898,18 @@ def build_strategy_stats_table_3windows(
 
     out = pd.concat([top, rest], ignore_index=True)
 
-    # 最终列顺序（不会再 KeyError，因为列名唯一）
     out = out[
         [
             "strategy",
             f"win_{span360}_w360",
             f"bal_{span360}_w360",
+            f"p0_{span360}_w360",
             f"win_{span1000}_w1000",
             f"bal_{span1000}_w1000",
+            f"p0_{span1000}_w1000",
             f"win_{spanmax}_wmax",
             f"bal_{spanmax}_wmax",
+            f"p0_{spanmax}_wmax",
             "indicator",
             "signal_price",
         ]
@@ -1157,7 +1195,15 @@ df_sel = _build_strategy_signals(df_hist_win, selected_strategy, **base_params_f
 
 tabs = st.tabs(["Main"])
 with tabs[0]:
-    fig = go.Figure()
+    # Two-row layout: candles top, volume bottom (volume不会抢占蜡烛空间)
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.02,
+        row_heights=[0.78, 0.22],
+    )
+
     hover_time = _build_time_strings(df_hist_win, timeframe).to_numpy()
 
     if x_mode.startswith("NO_GAP"):
@@ -1176,36 +1222,40 @@ with tabs[0]:
                     "Time: %{customdata}<br>"
                     "O: %{open}<br>H: %{high}<br>L: %{low}<br>C: %{close}<extra></extra>"
                 ),
-            )
+            ),
+            row=1,
+            col=1,
         )
+
         fig.add_trace(
             go.Bar(
                 x=x,
                 y=df_hist_win["volume"].astype(float),
                 name="Volume",
-                opacity=0.30,
-                yaxis="y2",
+                opacity=0.35,
                 customdata=hover_time,
                 hovertemplate="Time: %{customdata}<br>Vol: %{y}<extra></extra>",
-            )
+            ),
+            row=2,
+            col=1,
         )
 
         if "SMA" in ind_list and f"sma_{int(sma_n)}" in df_hist_win.columns:
-            fig.add_trace(go.Scatter(x=x, y=df_hist_win[f"sma_{int(sma_n)}"], mode="lines", name=f"SMA{sma_n}"))
+            fig.add_trace(go.Scatter(x=x, y=df_hist_win[f"sma_{int(sma_n)}"], mode="lines", name=f"SMA{sma_n}"), row=1, col=1)
 
         if "EMA" in ind_list:
             if f"ema_{int(ema_fast)}" in df_hist_win.columns:
-                fig.add_trace(go.Scatter(x=x, y=df_hist_win[f"ema_{int(ema_fast)}"], mode="lines", name=f"EMA{ema_fast}"))
+                fig.add_trace(go.Scatter(x=x, y=df_hist_win[f"ema_{int(ema_fast)}"], mode="lines", name=f"EMA{ema_fast}"), row=1, col=1)
             if f"ema_{int(ema_slow)}" in df_hist_win.columns:
-                fig.add_trace(go.Scatter(x=x, y=df_hist_win[f"ema_{int(ema_slow)}"], mode="lines", name=f"EMA{ema_slow}"))
+                fig.add_trace(go.Scatter(x=x, y=df_hist_win[f"ema_{int(ema_slow)}"], mode="lines", name=f"EMA{ema_slow}"), row=1, col=1)
 
         if "BBANDS" in ind_list and {"bb_up", "bb_mid", "bb_dn"}.issubset(df_hist_win.columns):
-            fig.add_trace(go.Scatter(x=x, y=df_hist_win["bb_up"], mode="lines", name="BB Up"))
-            fig.add_trace(go.Scatter(x=x, y=df_hist_win["bb_mid"], mode="lines", name="BB Mid"))
-            fig.add_trace(go.Scatter(x=x, y=df_hist_win["bb_dn"], mode="lines", name="BB Dn"))
+            fig.add_trace(go.Scatter(x=x, y=df_hist_win["bb_up"], mode="lines", name="BB Up"), row=1, col=1)
+            fig.add_trace(go.Scatter(x=x, y=df_hist_win["bb_mid"], mode="lines", name="BB Mid"), row=1, col=1)
+            fig.add_trace(go.Scatter(x=x, y=df_hist_win["bb_dn"], mode="lines", name="BB Dn"), row=1, col=1)
 
         if "BBI" in ind_list and "bbi" in df_hist_win.columns:
-            fig.add_trace(go.Scatter(x=x, y=df_hist_win["bbi"], mode="lines", name="BBI"))
+            fig.add_trace(go.Scatter(x=x, y=df_hist_win["bbi"], mode="lines", name="BBI"), row=1, col=1)
 
         buy_idx = df_sel.index[df_sel["strat_signal"] == 1].tolist()
         sell_idx = df_sel.index[df_sel["strat_signal"] == -1].tolist()
@@ -1219,7 +1269,9 @@ with tabs[0]:
                     marker=dict(symbol="triangle-up", size=12),
                     customdata=[hover_time[i] for i in buy_idx],
                     hovertemplate=f"{selected_strategy} BUY<br>Time: %{{customdata}}<br>Px: %{{y}}<extra></extra>",
-                )
+                ),
+                row=1,
+                col=1,
             )
         if sell_idx:
             fig.add_trace(
@@ -1231,7 +1283,9 @@ with tabs[0]:
                     marker=dict(symbol="triangle-down", size=12),
                     customdata=[hover_time[i] for i in sell_idx],
                     hovertemplate=f"{selected_strategy} SELL<br>Time: %{{customdata}}<br>Px: %{{y}}<extra></extra>",
-                )
+                ),
+                row=1,
+                col=1,
             )
 
         shapes = []
@@ -1240,47 +1294,56 @@ with tabs[0]:
 
         tick_idx, tick_text = _tick_for_nogap(df_hist_win, timeframe)
 
-        fig.update_layout(
-            uirevision=f"{symbol_for_chart}-{timeframe}-{x_mode}",
-            shapes=shapes,
-            xaxis=dict(type="linear", tickmode="array", tickvals=tick_idx, ticktext=tick_text, tickangle=0, rangeslider=dict(visible=False)),
-            height=700,
-            margin=dict(l=10, r=10, t=30, b=10),
-            yaxis=dict(title="Price", fixedrange=False),
-            yaxis2=dict(title="Volume", overlaying="y", side="right", showgrid=False, fixedrange=False),
-            legend=dict(orientation="h"),
+        fig.update_xaxes(
+            row=2,
+            col=1,
+            type="linear",
+            tickmode="array",
+            tickvals=tick_idx,
+            ticktext=tick_text,
+            tickangle=0,
+            rangeslider=dict(visible=False),
         )
+        fig.update_xaxes(row=1, col=1, rangeslider=dict(visible=False))
 
     else:
         rb = _rangebreaks_for_us_market(timeframe, is_crypto=is_crypto)
         x_ts = _utc_to_ny(df_hist_win["timestamp_utc"])
 
-        fig.add_trace(go.Candlestick(x=x_ts, open=df_hist_win["open"], high=df_hist_win["high"], low=df_hist_win["low"], close=df_hist_win["close"], name="OHLC"))
-        fig.add_trace(go.Bar(x=x_ts, y=df_hist_win["volume"].astype(float), name="Volume", opacity=0.30, yaxis="y2"))
+        fig.add_trace(
+            go.Candlestick(x=x_ts, open=df_hist_win["open"], high=df_hist_win["high"], low=df_hist_win["low"], close=df_hist_win["close"], name="OHLC"),
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Bar(x=x_ts, y=df_hist_win["volume"].astype(float), name="Volume", opacity=0.35),
+            row=2,
+            col=1,
+        )
 
         if "SMA" in ind_list and f"sma_{int(sma_n)}" in df_hist_win.columns:
-            fig.add_trace(go.Scatter(x=x_ts, y=df_hist_win[f"sma_{int(sma_n)}"], mode="lines", name=f"SMA{sma_n}"))
+            fig.add_trace(go.Scatter(x=x_ts, y=df_hist_win[f"sma_{int(sma_n)}"], mode="lines", name=f"SMA{sma_n}"), row=1, col=1)
 
         if "EMA" in ind_list:
             if f"ema_{int(ema_fast)}" in df_hist_win.columns:
-                fig.add_trace(go.Scatter(x=x_ts, y=df_hist_win[f"ema_{int(ema_fast)}"], mode="lines", name=f"EMA{ema_fast}"))
+                fig.add_trace(go.Scatter(x=x_ts, y=df_hist_win[f"ema_{int(ema_fast)}"], mode="lines", name=f"EMA{ema_fast}"), row=1, col=1)
             if f"ema_{int(ema_slow)}" in df_hist_win.columns:
-                fig.add_trace(go.Scatter(x=x_ts, y=df_hist_win[f"ema_{int(ema_slow)}"], mode="lines", name=f"EMA{ema_slow}"))
+                fig.add_trace(go.Scatter(x=x_ts, y=df_hist_win[f"ema_{int(ema_slow)}"], mode="lines", name=f"EMA{ema_slow}"), row=1, col=1)
 
         if "BBANDS" in ind_list and {"bb_up", "bb_mid", "bb_dn"}.issubset(df_hist_win.columns):
-            fig.add_trace(go.Scatter(x=x_ts, y=df_hist_win["bb_up"], mode="lines", name="BB Up"))
-            fig.add_trace(go.Scatter(x=x_ts, y=df_hist_win["bb_mid"], mode="lines", name="BB Mid"))
-            fig.add_trace(go.Scatter(x=x_ts, y=df_hist_win["bb_dn"], mode="lines", name="BB Dn"))
+            fig.add_trace(go.Scatter(x=x_ts, y=df_hist_win["bb_up"], mode="lines", name="BB Up"), row=1, col=1)
+            fig.add_trace(go.Scatter(x=x_ts, y=df_hist_win["bb_mid"], mode="lines", name="BB Mid"), row=1, col=1)
+            fig.add_trace(go.Scatter(x=x_ts, y=df_hist_win["bb_dn"], mode="lines", name="BB Dn"), row=1, col=1)
 
         if "BBI" in ind_list and "bbi" in df_hist_win.columns:
-            fig.add_trace(go.Scatter(x=x_ts, y=df_hist_win["bbi"], mode="lines", name="BBI"))
+            fig.add_trace(go.Scatter(x=x_ts, y=df_hist_win["bbi"], mode="lines", name="BBI"), row=1, col=1)
 
         buy_idx = df_sel.index[df_sel["strat_signal"] == 1].tolist()
         sell_idx = df_sel.index[df_sel["strat_signal"] == -1].tolist()
         if buy_idx:
-            fig.add_trace(go.Scatter(x=x_ts.iloc[buy_idx], y=df_sel.loc[buy_idx, "strat_exec_px"], mode="markers", name=f"{selected_strategy} BUY", marker=dict(symbol="triangle-up", size=12)))
+            fig.add_trace(go.Scatter(x=x_ts.iloc[buy_idx], y=df_sel.loc[buy_idx, "strat_exec_px"], mode="markers", name=f"{selected_strategy} BUY", marker=dict(symbol="triangle-up", size=12)), row=1, col=1)
         if sell_idx:
-            fig.add_trace(go.Scatter(x=x_ts.iloc[sell_idx], y=df_sel.loc[sell_idx, "strat_exec_px"], mode="markers", name=f"{selected_strategy} SELL", marker=dict(symbol="triangle-down", size=12)))
+            fig.add_trace(go.Scatter(x=x_ts.iloc[sell_idx], y=df_sel.loc[sell_idx, "strat_exec_px"], mode="markers", name=f"{selected_strategy} SELL", marker=dict(symbol="triangle-down", size=12)), row=1, col=1)
 
         shapes = []
         if timeframe != "1d" and show_day_separators:
@@ -1288,16 +1351,18 @@ with tabs[0]:
             starts = x_ts.loc[dates.ne(dates.shift())].tolist()
             shapes.extend(_make_shapes_day_separators_date(starts))
 
-        fig.update_layout(
-            uirevision=f"{symbol_for_chart}-{timeframe}-{x_mode}",
-            shapes=shapes,
-            xaxis=dict(type="date", rangebreaks=rb, rangeslider=dict(visible=not autoscale)),
-            height=700,
-            margin=dict(l=10, r=10, t=30, b=10),
-            yaxis=dict(title="Price", fixedrange=False),
-            yaxis2=dict(title="Volume", overlaying="y", side="right", showgrid=False, fixedrange=False),
-            legend=dict(orientation="h"),
-        )
+        fig.update_xaxes(row=2, col=1, type="date", rangebreaks=rb, rangeslider=dict(visible=not autoscale))
+        fig.update_xaxes(row=1, col=1, rangeslider=dict(visible=False))
+
+    fig.update_layout(
+        uirevision=f"{symbol_for_chart}-{timeframe}-{x_mode}",
+        shapes=shapes,
+        height=700,
+        margin=dict(l=10, r=10, t=30, b=10),
+        legend=dict(orientation="h"),
+    )
+    fig.update_yaxes(title_text="Price", row=1, col=1, fixedrange=False)
+    fig.update_yaxes(title_text="Volume", row=2, col=1, fixedrange=False, showgrid=False)
 
     st.plotly_chart(fig, width="stretch", config={"scrollZoom": True, "displaylogo": False})
 
@@ -1308,7 +1373,7 @@ with tabs[0]:
         leverage=float(leverage),
     )
 
-    st.markdown("### 策略历史统计（xx_months；胜率=胜/总(%)；本金余额；indicator + signal_price；全表无小数）")
+    st.markdown("### 策略历史统计（xx_span；胜率=胜/总(%)；本金余额；p0=H0:单笔盈亏均值=0 的p-value；indicator + signal_price；余额无小数）")
     if stats_df.empty:
         st.info("没有可用统计（数据不足或策略无交易信号）。")
     else:
