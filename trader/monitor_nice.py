@@ -14,11 +14,14 @@ trader/monitor_nice.py
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 import pandas as pd
 import plotly.graph_objects as go
