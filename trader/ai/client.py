@@ -262,20 +262,52 @@ class StubLLMClient:
 # 工厂
 # ---------------------------------------------------------------------------
 
+def _ollama_reachable(base_url: str, timeout: float = 2.0) -> bool:
+    """快速 ping Ollama /api/tags 端点，2s 内无响应视为不可达。"""
+    try:
+        import urllib.request as _ur
+        _ur.urlopen(f"{base_url.rstrip('/')}/api/tags", timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
 def make_client(provider: str = "", **kwargs) -> LLMClient:
     """
     provider: "ollama" | "anthropic" | "stub"
-    默认读 .env LLM_PROVIDER，没有则 ollama。
+    默认读 .env LLM_PROVIDER，没有则先尝试 ollama。
+
+    自动降级顺序（当 provider 未指定时）：
+      1. Ollama（本地，若可达）
+      2. Anthropic（若 ANTHROPIC_API_KEY 存在）
+      3. StubLLMClient（离线兜底，会返回 score=50 中性值）
     """
     provider = provider or os.getenv("LLM_PROVIDER", "ollama")
     if provider == "anthropic":
         return AnthropicClient(**kwargs)
     if provider == "stub":
         return StubLLMClient(**kwargs)
-    # Ollama：从 env 读端点和模型（可被 kwargs 覆盖）
+
+    # Ollama 路径：先做健康检查再返回
     base_url = kwargs.pop("base_url", None) or os.getenv("OLLAMA_BASE_URL", _DEFAULT_OLLAMA_URL)
     model = kwargs.pop("default_model", None) or os.getenv("OLLAMA_MODEL", _DEFAULT_OLLAMA_MODEL)
-    return OllamaClient(base_url=base_url, default_model=model, **kwargs)
+
+    if _ollama_reachable(base_url):
+        logger.info("LLM: Ollama @ %s  model=%s", base_url, model)
+        return OllamaClient(base_url=base_url, default_model=model, **kwargs)
+
+    # Ollama 不可达 → 尝试 Anthropic
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if anthropic_key:
+        logger.warning("Ollama 不可达 → 自动切换 AnthropicClient")
+        return AnthropicClient(api_key=anthropic_key)
+
+    # 最终兜底：Stub（所有分数返回 50，会记录明显警告）
+    logger.warning(
+        "⚠️  Ollama 不可达且无 ANTHROPIC_API_KEY → StubLLMClient（分数均为 50，仅供测试）"
+        "  设置 LLM_PROVIDER=anthropic 并配置 ANTHROPIC_API_KEY 可启用真实 LLM。"
+    )
+    return StubLLMClient()
 
 
 # ---------------------------------------------------------------------------

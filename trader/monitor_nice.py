@@ -779,20 +779,78 @@ def _render_cockpit():
         from trader.models import Candidate, utc_now as _now
 
         def _bg():
+            import pandas as pd
+            from trader.config import TradingConfig
+            from trader.contracts import AgentContext
+            from trader.data_cache import upsert_bars as _upsert
+            from trader.data_feed import AlpacaDataFeed
+            from trader.models import Candidate, utc_now as _now
+            from trader.selection import ConsensusSelector
+
             try:
                 now = _now()
-                candidates = [
-                    Candidate(symbol=s, score=50.0, rank=i + 1, reasons={}, as_of=now)
-                    for i, s in enumerate(symbols)
-                ]
+                cfg = TradingConfig()   # 读 .env 默认值（API key / timeframe 等）
+
+                # ① 先拉 K 线更新缓存，ConsensusSelector 依赖 data_cache
+                _cockpit_run["stage"] = "拉取 K 线…"
+                try:
+                    feed = AlpacaDataFeed(cfg)
+                    for sym in symbols:
+                        try:
+                            raw = feed.fetch_bars(sym, n_bars=cfg.bars_lookback)
+                            if raw:
+                                rows = [
+                                    {"timestamp_utc": b.timestamp,
+                                     "open": b.open, "high": b.high,
+                                     "low": b.low, "close": b.close,
+                                     "volume": b.volume}
+                                    for b in raw
+                                ]
+                                _upsert(sym, cfg.timeframe, pd.DataFrame(rows))
+                        except Exception as e:
+                            logger.warning("fetch_bars %s: %s", sym, e)
+                except Exception as e:
+                    logger.warning("AlpacaDataFeed 初始化失败 (离线?): %s", e)
+
+                # ② 用真实策略共识打分（0-100 多空票数比）
+                _cockpit_run["stage"] = "策略打分…"
+                candidates = []
+                try:
+                    selector = ConsensusSelector(strategies=cfg.strategies)
+                    candidates = selector.select(
+                        universe=symbols,
+                        timeframe=cfg.timeframe,
+                        as_of=now,
+                    )
+                    logger.info("Cockpit selection: %d scored", len(candidates))
+                except Exception as e:
+                    logger.warning("ConsensusSelector 失败: %s", e)
+
+                # ③ 对没有缓存数据的标的用 50 兜底（标注 no-data）
+                scored_syms = {c.symbol for c in candidates}
+                for i, s in enumerate(symbols):
+                    if s not in scored_syms:
+                        candidates.append(
+                            Candidate(symbol=s, score=50.0,
+                                      rank=len(candidates) + 1,
+                                      reasons={"note": "no bar data"}, as_of=now)
+                        )
+                candidates.sort(key=lambda c: c.score, reverse=True)
+                for i, c in enumerate(candidates):
+                    c.rank = i + 1
+
+                # ④ 运行 Agent Manager（LLM 层在真实 TA 分之上再做深度分析）
+                _cockpit_run["stage"] = "运行 Agent…"
                 ctx = AgentContext(
                     candidates=candidates, plans=[], news=[],
                     positions={}, equity=0.0, as_of=now, extra={},
                 )
                 mgr.run_cycle(ctx, _AI_DB)
                 _cockpit_run["last_run"] = _now()
+                _cockpit_run["stage"] = ""
             except Exception as exc:
                 logger.error("AgentManager run_cycle 失败: %s", exc)
+                _cockpit_run["stage"] = "错误"
             finally:
                 _cockpit_run["running"] = False
 
@@ -827,16 +885,22 @@ def _render_cockpit():
 
         # 更新运行状态 UI
         if _cockpit_run["running"]:
-            status_lbl.set_text("运行中…")
+            stage = _cockpit_run.get("stage", "运行中…") or "运行中…"
+            status_lbl.set_text(stage)
             status_lbl.style("color:var(--ai)")
             run_btn.props("disable")
         else:
             lr = _cockpit_run.get("last_run")
-            if lr:
+            stage = _cockpit_run.get("stage", "")
+            if stage == "错误":
+                status_lbl.set_text("运行出错，见日志")
+                status_lbl.style("color:var(--neg)")
+            elif lr:
                 status_lbl.set_text(f"完成 {lr.strftime('%H:%M:%S')}")
+                status_lbl.style("color:var(--fg3)")
             else:
                 status_lbl.set_text("空闲")
-            status_lbl.style("color:var(--fg3)")
+                status_lbl.style("color:var(--fg3)")
             run_btn.props(remove="disable")
 
         # 更新活动流
@@ -998,7 +1062,7 @@ def _feed_html(advisories: list) -> str:
 
 
 # 决策台运行状态（模块级，跨导航切换保持）
-_cockpit_run = {"running": False, "last_run": None}
+_cockpit_run = {"running": False, "last_run": None, "stage": ""}
 
 
 _RENDERERS = {
