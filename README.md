@@ -11,6 +11,7 @@
 - **Backfill** years of daily and minute OHLCV bars for any set of US stocks via the Alpaca historical data API.
 - **Stream** live minute bars over a WebSocket connection and persist them on the fly.
 - **Explore** your local data through an interactive Streamlit dashboard featuring candlestick charts, volume overlays, and selectable timeframes (1 m, 5 m, 30 m, 1 h, 1 d).
+- **Compare** multiple historical strategies and indicators in a dedicated backtest tab, with收益/胜率/回撤 summaries.
 
 All data is stored in a single [DuckDB](https://duckdb.org/) file, which means zero infrastructure — no separate database server required.
 
@@ -91,6 +92,8 @@ streamlit run app/ui.py
 
 Open the URL shown in your terminal (usually `http://localhost:8501`).
 
+The dashboard now includes a dedicated **历史回测** tab where you can compare multiple strategies on the same historical window, inspect equity curves, and view extra ta-based indicators like ADX, Stoch, Williams %R, and MFI.
+
 ### 3. Verify the database
 
 Quick sanity-check to confirm the date ranges stored in DuckDB:
@@ -121,3 +124,4 @@ stock-minute-ai/
 ## License
 
 This project is provided as-is for educational and personal use.
+
