@@ -736,6 +736,8 @@ def _render_cockpit():
             ).props("dark dense outlined").style("width:240px")
             sym_in.on_value_change(lambda e: _set_pref("cp_syms", e.value))
             run_btn = ui.button("▶ 运行一轮", color="primary").props("unelevated dense")
+            reset_btn = ui.button("✕ 重置", color="negative").props("unelevated dense flat")
+            reset_btn.set_visibility(False)
         picks_html = ui.html(
             '<div class="cp-pick-row">'
             '<span style="color:var(--fg3);font-size:12px">运行后显示推荐</span>'
@@ -766,9 +768,25 @@ def _render_cockpit():
             return
 
         _cockpit_run["running"] = True
+        _cockpit_run["start_time"] = datetime.now(tz=timezone.utc)
         run_btn.props("disable")
+        reset_btn.set_visibility(True)
         status_lbl.set_text("运行中…")
         status_lbl.style("color:var(--ai)")
+
+        def _force_reset():
+            _cockpit_run["running"] = False
+            _cockpit_run["stage"] = ""
+            _cockpit_run["start_time"] = None
+            reset_btn.set_visibility(False)
+            run_btn.props(remove="disable")
+            status_lbl.set_text("已重置")
+            status_lbl.style("color:var(--warn)")
+            logger.warning("Cockpit: 用户强制重置运行状态")
+            ui.notify("运行状态已重置", type="warning")
+
+        reset_btn.on_click(_force_reset)
+
         # 立即标记所有 real agent 为 running
         mgr._init_db(_AI_DB)
         for role in ("technical", "news", "web_research", "bull_bear"):
@@ -839,8 +857,7 @@ def _render_cockpit():
                 for i, c in enumerate(candidates):
                     c.rank = i + 1
 
-                # ④ 四路新闻拉取（WSCN + SEC 8-K + Finnhub + 价格异动）
-                _cockpit_run["stage"] = "拉取快讯…"
+                # ④ 四路新闻拉取（按源逐一更新 stage，方便用户知道卡在哪）
                 from datetime import timedelta
                 from trader.news import (
                     FinnhubSource, PriceMoveSource,
@@ -848,16 +865,17 @@ def _render_cockpit():
                 )
                 news_events = []
                 _news_cfg = [
-                    ("WSCN",    WallStreetCNSource(universe=symbols, channels=["global", "us"], num=30),
+                    ("WSCN 快讯 (1/4)",    WallStreetCNSource(universe=symbols, channels=["global", "us"], num=30),
                                 now - timedelta(hours=4)),
-                    ("SEC 8-K", SECEdgarSource(universe=symbols),
+                    ("SEC 8-K (2/4)",      SECEdgarSource(universe=symbols),
                                 now - timedelta(hours=20)),
-                    ("Finnhub", FinnhubSource(universe=symbols),
+                    ("Finnhub (3/4)",      FinnhubSource(universe=symbols),
                                 now - timedelta(hours=24)),
-                    ("价格异动", PriceMoveSource(universe=symbols),
+                    ("价格异动 (4/4)",     PriceMoveSource(universe=symbols),
                                 now - timedelta(hours=4)),
                 ]
                 for src_label, src_obj, src_since in _news_cfg:
+                    _cockpit_run["stage"] = f"拉取 {src_label}…"
                     try:
                         batch = src_obj.poll(since=src_since)
                         news_events.extend(batch)
@@ -867,7 +885,8 @@ def _render_cockpit():
                         logger.warning("Cockpit %s poll 失败: %s", src_label, e)
 
                 # ⑤ 运行 Agent Manager（LLM 层在真实 TA 分 + 多路快讯基础上分析）
-                _cockpit_run["stage"] = "运行 Agent…"
+                n_agents = len(mgr._agents)
+                _cockpit_run["stage"] = f"AI 分析中… (0/{n_agents})"
                 ctx = AgentContext(
                     candidates=candidates, plans=[], news=news_events,
                     positions={}, equity=0.0, as_of=now, extra={},
@@ -913,22 +932,40 @@ def _render_cockpit():
         # 更新运行状态 UI
         if _cockpit_run["running"]:
             stage = _cockpit_run.get("stage", "运行中…") or "运行中…"
-            status_lbl.set_text(stage)
+            start = _cockpit_run.get("start_time")
+            elapsed = ""
+            if start:
+                secs = int((datetime.now(tz=timezone.utc) - start).total_seconds())
+                elapsed = f" [{secs}s]" if secs < 60 else f" [{secs // 60}m{secs % 60:02d}s]"
+                if secs > 600:   # 10 分钟硬超时 → 自动重置
+                    _cockpit_run["running"] = False
+                    _cockpit_run["stage"] = "超时"
+                    _cockpit_run["start_time"] = None
+                    logger.warning("Cockpit 运行超时 (%ds)，已自动重置", secs)
+            status_lbl.set_text(f"{stage}{elapsed}")
             status_lbl.style("color:var(--ai)")
             run_btn.props("disable")
+            reset_btn.set_visibility(True)
         else:
             lr = _cockpit_run.get("last_run")
             stage = _cockpit_run.get("stage", "")
-            if stage == "错误":
+            if stage == "超时":
+                status_lbl.set_text("运行超时（已自动重置），见日志")
+                status_lbl.style("color:var(--warn)")
+            elif stage == "错误":
                 status_lbl.set_text("运行出错，见日志")
                 status_lbl.style("color:var(--neg)")
             elif lr:
+                elapsed = ""
+                start = _cockpit_run.get("start_time")
+                # start_time is cleared on reset, keep it if we got here via normal finish
                 status_lbl.set_text(f"完成 {lr.strftime('%H:%M:%S')}")
                 status_lbl.style("color:var(--fg3)")
             else:
                 status_lbl.set_text("空闲")
                 status_lbl.style("color:var(--fg3)")
             run_btn.props(remove="disable")
+            reset_btn.set_visibility(False)
 
         # 更新活动流
         feed_el.set_content(_feed_html(mgr.get_recent_advisories(_AI_DB, n=20)))
@@ -1089,7 +1126,7 @@ def _feed_html(advisories: list) -> str:
 
 
 # 决策台运行状态（模块级，跨导航切换保持）
-_cockpit_run = {"running": False, "last_run": None, "stage": ""}
+_cockpit_run = {"running": False, "last_run": None, "stage": "", "start_time": None}
 
 
 _RENDERERS = {
