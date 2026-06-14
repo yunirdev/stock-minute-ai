@@ -1,5 +1,6 @@
 # DuckDB database
 *.duckdb
+*.duckdb.wal
 
 # Data folders
 data/
@@ -19,3 +20,21 @@ venv/
 
 # Env file
 .env
+
+# Runtime / logs
+logs/
+sessions/*.log
+sessions/*.duckdb
+heartbeat.json
+trader_engine.pid
+conf/token.txt
+conf/ui_settings.json
+
+# Runtime / logs / temp (补充)
+*.log
+out.txt
+.engine.pid
+.pytest_cache/
+.nicegui/
+sessions/
+.last30days/

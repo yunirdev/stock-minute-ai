@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "monitor",
+      "runtimeExecutable": "D:\\stock-minute-ai\\.venv\\Scripts\\python.exe",
+      "runtimeArgs": ["D:\\stock-minute-ai\\trader\\monitor_nice.py", "--web"],
+      "port": 8080
+    }
+  ]
+}
