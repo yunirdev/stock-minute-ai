@@ -77,11 +77,15 @@ trader/
 ## 五、LLM 配置（决策台评分依赖）
 
 `make_client()` 自动降级顺序：
-1. **Ollama**（本地，`http://localhost:11434`，需先 `ollama serve`）
-2. **Anthropic**（需 `.env` 中 `ANTHROPIC_API_KEY`，设 `LLM_PROVIDER=anthropic`）
-3. **StubLLMClient**（兜底，所有评分返回 50，会打 ⚠️ 警告）
+1. **Ollama**（本地，`http://localhost:11434`）
+   - 自动发现已安装模型（不要求必须是 llama3.2）
+   - 优先选有 `tools` 能力的模型（如 qwen3.6、gemma4）
+   - 只需 `ollama serve` 在后台运行即可，无需额外配置
+2. **Anthropic**（Ollama 不可达时，若 `.env` 有 `ANTHROPIC_API_KEY`）
+3. **StubLLMClient**（最终兜底，所有评分返回 50，会打 ⚠️ 警告）
 
-> 决策台显示全 50 分 = StubLLMClient 在工作，LLM 未配置。
+> 决策台显示全 50 分 = Ollama 未运行 + 无 Anthropic Key → StubLLMClient 在工作。
+> 本机已有 `qwen3.6`（36B）和 `gemma4`（8B），`ollama serve` 即可。
 
 ---
 

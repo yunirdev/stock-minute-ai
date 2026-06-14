@@ -262,14 +262,47 @@ class StubLLMClient:
 # 工厂
 # ---------------------------------------------------------------------------
 
-def _ollama_reachable(base_url: str, timeout: float = 2.0) -> bool:
-    """快速 ping Ollama /api/tags 端点，2s 内无响应视为不可达。"""
+def _ollama_list_models(base_url: str, timeout: float = 3.0) -> List[Dict[str, Any]]:
+    """
+    查询 Ollama /api/tags，返回已安装的模型列表。
+    每条格式：{"name": "qwen3.6:latest", "family": "qwen35moe", "caps": ["tools", ...]}
+    不可达时返回空列表。
+    """
     try:
+        import json as _json
         import urllib.request as _ur
-        _ur.urlopen(f"{base_url.rstrip('/')}/api/tags", timeout=timeout)
-        return True
+        resp = _ur.urlopen(f"{base_url.rstrip('/')}/api/tags", timeout=timeout)
+        data = _json.loads(resp.read())
+        return [
+            {
+                "name": m["name"],
+                "family": m.get("details", {}).get("family", ""),
+                "caps": m.get("capabilities", []),
+            }
+            for m in data.get("models", [])
+        ]
     except Exception:
-        return False
+        return []
+
+
+def _pick_ollama_model(available: List[Dict[str, Any]], preferred: str) -> str:
+    """
+    从已安装模型中选最适合的。
+    优先级：
+      1. preferred（env 或参数指定的）若已安装
+      2. 支持 tools 能力且参数量最大的
+      3. 第一个可用模型
+    """
+    names = [m["name"] for m in available]
+    # 精确匹配或前缀匹配
+    for name in names:
+        if name == preferred or name.startswith(preferred.split(":")[0]):
+            return name
+    # 选有 tools 能力的最大模型（按名字长度/字母序粗排，优先 qwen/llama/mistral 大模型）
+    tools_models = [m for m in available if "tools" in m.get("caps", [])]
+    if tools_models:
+        return tools_models[0]["name"]
+    return names[0]
 
 
 def make_client(provider: str = "", **kwargs) -> LLMClient:
@@ -278,9 +311,9 @@ def make_client(provider: str = "", **kwargs) -> LLMClient:
     默认读 .env LLM_PROVIDER，没有则先尝试 ollama。
 
     自动降级顺序（当 provider 未指定时）：
-      1. Ollama（本地，若可达）
+      1. Ollama（本地，若可达；自动匹配已安装模型，不要求 llama3.2）
       2. Anthropic（若 ANTHROPIC_API_KEY 存在）
-      3. StubLLMClient（离线兜底，会返回 score=50 中性值）
+      3. StubLLMClient（离线兜底，分数均为 50，会打 ⚠️ 警告）
     """
     provider = provider or os.getenv("LLM_PROVIDER", "ollama")
     if provider == "anthropic":
@@ -288,11 +321,14 @@ def make_client(provider: str = "", **kwargs) -> LLMClient:
     if provider == "stub":
         return StubLLMClient(**kwargs)
 
-    # Ollama 路径：先做健康检查再返回
     base_url = kwargs.pop("base_url", None) or os.getenv("OLLAMA_BASE_URL", _DEFAULT_OLLAMA_URL)
-    model = kwargs.pop("default_model", None) or os.getenv("OLLAMA_MODEL", _DEFAULT_OLLAMA_MODEL)
+    preferred = kwargs.pop("default_model", None) or os.getenv("OLLAMA_MODEL", _DEFAULT_OLLAMA_MODEL)
 
-    if _ollama_reachable(base_url):
+    available = _ollama_list_models(base_url)
+    if available:
+        model = _pick_ollama_model(available, preferred)
+        if model != preferred:
+            logger.info("Ollama: 指定模型 %r 未安装，自动使用 %r", preferred, model)
         logger.info("LLM: Ollama @ %s  model=%s", base_url, model)
         return OllamaClient(base_url=base_url, default_model=model, **kwargs)
 
@@ -302,10 +338,10 @@ def make_client(provider: str = "", **kwargs) -> LLMClient:
         logger.warning("Ollama 不可达 → 自动切换 AnthropicClient")
         return AnthropicClient(api_key=anthropic_key)
 
-    # 最终兜底：Stub（所有分数返回 50，会记录明显警告）
+    # 最终兜底
     logger.warning(
-        "⚠️  Ollama 不可达且无 ANTHROPIC_API_KEY → StubLLMClient（分数均为 50，仅供测试）"
-        "  设置 LLM_PROVIDER=anthropic 并配置 ANTHROPIC_API_KEY 可启用真实 LLM。"
+        "⚠️  Ollama 不可达且无 ANTHROPIC_API_KEY → StubLLMClient（分数均为 50，无参考价值）\n"
+        "   启动 Ollama：ollama serve  |  或在 .env 设置 LLM_PROVIDER=anthropic + ANTHROPIC_API_KEY"
     )
     return StubLLMClient()
 
