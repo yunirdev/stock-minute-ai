@@ -770,6 +770,25 @@ def _render_cockpit():
             ui.notify("请填写至少一个标的")
             return
 
+        # 检查 LLM 可用性，每次运行时重建 client（保证 ollama serve 后立刻生效）
+        from trader.ai.client import (
+            _DEFAULT_OLLAMA_URL, _ollama_list_models, make_client, StubLLMClient,
+        )
+        fresh_client = make_client()
+        if isinstance(fresh_client, StubLLMClient):
+            import os
+            if not os.getenv("ANTHROPIC_API_KEY"):
+                ui.notify(
+                    "⚠️ Ollama 未运行且无 ANTHROPIC_API_KEY → 分数将全部为 50，无参考价值。"
+                    "请先在终端执行 ollama serve，再点运行。",
+                    type="warning", timeout=8000,
+                )
+        else:
+            # Ollama / Anthropic 可用 → 用新 client 重建 AgentManager
+            from trader.ai.manager import AgentManager
+            nonlocal mgr
+            mgr = AgentManager(client=fresh_client)
+
         _cockpit_run["running"] = True
         _cockpit_run["start_time"] = datetime.now(tz=timezone.utc)
         run_btn.props("disable")

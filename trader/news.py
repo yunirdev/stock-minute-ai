@@ -260,6 +260,12 @@ class SECEdgarSource:
         with _ur.urlopen(req, timeout=self._timeout) as resp:
             body = resp.read()
 
+        # EDGAR 找不到 ticker 时返回 HTML 而非 Atom XML
+        stripped = body.lstrip()
+        if not (stripped.startswith(b"<?xml") or stripped.startswith(b"<feed")):
+            logger.debug("SEC EDGAR [%s] 返回非 XML（ticker 不存在或限速），跳过", symbol)
+            return []
+
         root = _ET.fromstring(body)
         ns = {"a": self._ATOM}
 
