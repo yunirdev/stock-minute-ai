@@ -70,7 +70,7 @@ class OllamaClient:
         self,
         base_url: str = _DEFAULT_OLLAMA_URL,
         default_model: str = _DEFAULT_OLLAMA_MODEL,
-        timeout: int = 60,
+        timeout: int = 300,   # 36B 模型单次推理可能需要 2-3 分钟
     ) -> None:
         self._url = base_url.rstrip("/")
         self._model = default_model
@@ -148,8 +148,14 @@ class OllamaClient:
             content = body.get("message", {}).get("content", "")
             logger.debug("Ollama[%s] → %s…", model, content[:60])
             return content
-        except OSError:
-            logger.warning("Ollama 未运行（%s），返回空响应", self._url)
+        except ConnectionRefusedError:
+            logger.warning("Ollama 未运行（%s），连接被拒绝", self._url)
+            return ""
+        except TimeoutError:
+            logger.warning("Ollama 推理超时（%ds）model=%s，考虑换更小的模型", self._timeout, model)
+            return ""
+        except OSError as exc:
+            logger.warning("Ollama 网络错误: %s", exc)
             return ""
         except Exception as exc:
             logger.error("Ollama 调用失败: %s", exc)
