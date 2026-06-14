@@ -839,10 +839,24 @@ def _render_cockpit():
                 for i, c in enumerate(candidates):
                     c.rank = i + 1
 
-                # ④ 运行 Agent Manager（LLM 层在真实 TA 分之上再做深度分析）
+                # ④ 拉取华尔街见闻快讯，传给 NewsAgent
+                _cockpit_run["stage"] = "拉取快讯…"
+                news_events = []
+                try:
+                    from trader.news import WallStreetCNSource
+                    from datetime import timedelta
+                    wscn = WallStreetCNSource(
+                        universe=symbols, channels=["global", "us"], num=30
+                    )
+                    news_events = wscn.poll(since=now - timedelta(hours=4))
+                    logger.info("Cockpit WSCN: %d 条快讯", len(news_events))
+                except Exception as e:
+                    logger.warning("WSCN poll 失败: %s", e)
+
+                # ⑤ 运行 Agent Manager（LLM 层在真实 TA 分 + 快讯基础上分析）
                 _cockpit_run["stage"] = "运行 Agent…"
                 ctx = AgentContext(
-                    candidates=candidates, plans=[], news=[],
+                    candidates=candidates, plans=[], news=news_events,
                     positions={}, equity=0.0, as_of=now, extra={},
                 )
                 mgr.run_cycle(ctx, _AI_DB)

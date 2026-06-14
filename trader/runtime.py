@@ -41,7 +41,7 @@ from .models import (
     Bar, Notification, OrderIntent, OrderStatus,
     Position, Side, TradePlan, new_id, utc_now,
 )
-from .news import PriceMoveSource
+from .news import PriceMoveSource, WallStreetCNSource
 from .notify import DiscordNotifier
 from .plan import ATRPlanner
 from .portfolio import Portfolio
@@ -103,8 +103,12 @@ class Runtime:
         self._approver = AutoApprover(auto_approve=False)
         self._pos_monitor = StopTakeProfitMonitor()
         self._notifier = DiscordNotifier()
-        self._news_source = PriceMoveSource(
+        self._price_news = PriceMoveSource(
             universe=config.symbols, timeframe=config.timeframe
+        )
+        self._wscn = WallStreetCNSource(
+            universe=config.symbols,
+            channels=["global", "us"],
         )
         self._reviewer = SimpleReviewer(db_path=config.db_path)
 
@@ -231,14 +235,16 @@ class Runtime:
             self._audit.log_heartbeat(self._tick_count, equity)
             return
 
-        # 9. 新闻事件（仅记录，不阻断流程）
-        try:
-            news = self._news_source.poll(since=ts)
-            if news:
-                logger.info("新闻事件: %d 条", len(news))
-        except Exception as exc:
-            logger.warning("news.poll 失败: %s", exc)
-            news = []
+        # 9. 新闻事件：华尔街见闻快讯 + 本地价格异动（两路合并）
+        news = []
+        for src_name, src in [("wscn", self._wscn), ("price", self._price_news)]:
+            try:
+                batch = src.poll(since=ts)
+                news.extend(batch)
+                if batch:
+                    logger.info("新闻 [%s]: %d 条", src_name, len(batch))
+            except Exception as exc:
+                logger.warning("news.poll [%s] 失败: %s", src_name, exc)
 
         # 10. 持仓监控：止损/止盈触发 → 生成 CLOSE 计划并立即执行
         if self._live_plans and model_bars:
