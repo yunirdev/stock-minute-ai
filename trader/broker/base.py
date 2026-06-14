@@ -14,7 +14,7 @@ class BrokerAdapter(ABC):
     """
     Minimal interface for order execution adapters.
 
-    Concrete implementations: PaperBroker (and future IBKR, etc.)
+    Concrete implementations: AlpacaBroker (and future broker adapters).
     """
 
     @abstractmethod

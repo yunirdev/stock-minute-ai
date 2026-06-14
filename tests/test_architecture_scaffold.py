@@ -5,11 +5,11 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from trader.config import RiskConfig, TradingConfig
-from trader.models import Fill, Signal, Side, new_id, utc_now
+from trader.models import Fill, OrderStatus, Signal, Side, new_id, utc_now
 from trader.order_manager import OrderManager
 from trader.portfolio import Portfolio
 from trader.strategies.registry import build_default_registry
-from trader.strategy_core import compute_signals
+from trader.strategy_core import STRATEGY_OPTIONS, compute_signals
 
 
 def _sample_df(n: int = 140) -> pd.DataFrame:
@@ -30,9 +30,13 @@ def _sample_df(n: int = 140) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _strategy_containing(text: str) -> str:
+    return next(name for name in STRATEGY_OPTIONS if text in name)
+
+
 def test_default_strategy_registry_matches_existing_compute_signals() -> None:
     df = _sample_df()
-    strategy = "MACD零轴战法"
+    strategy = _strategy_containing("MACD")
     registry = build_default_registry()
 
     expected = compute_signals(df, strategy)
@@ -81,7 +85,7 @@ def test_exploration_strategy_wrapper_uses_shared_core() -> None:
     from app.exploration import _build_strategy_signals
 
     df = _sample_df()
-    strategy = "RSI震荡战法(60买40卖)"
+    strategy = _strategy_containing("RSI")
 
     expected = compute_signals(df, strategy)
     actual = _build_strategy_signals(df, strategy)
@@ -92,8 +96,13 @@ def test_exploration_strategy_wrapper_uses_shared_core() -> None:
     )
 
 
-def test_portfolio_equity_includes_position_market_value(tmp_path) -> None:
-    portfolio = Portfolio(TradingConfig(initial_capital=10_000.0, db_path=str(tmp_path / "trade.duckdb")))
+def test_portfolio_equity_includes_position_market_value() -> None:
+    import os
+    import tempfile
+
+    temp_dir = tempfile.mkdtemp()
+    db_path = os.path.join(temp_dir, "trade.duckdb")
+    portfolio = Portfolio(TradingConfig(initial_capital=10_000.0, db_path=db_path))
     portfolio.apply_fill(
         Fill(
             order_id="paper-1",
@@ -111,29 +120,76 @@ def test_portfolio_equity_includes_position_market_value(tmp_path) -> None:
     assert portfolio.get_equity({"AAPL": 110.0}) == 10_100.0
 
 
-def test_scheduler_direct_execution_fills_portfolio(tmp_path) -> None:
-    """The live path now routes signal → risk → fill via direct calls (no event
-    bus). A risk-approved BUY must land a real position in the portfolio."""
+def test_scheduler_alpaca_execution_polls_fill_into_portfolio(monkeypatch) -> None:
+    import os
+    import tempfile
+
+    import trader.scheduler as scheduler_mod
     from trader.scheduler import Scheduler
 
+    class FakeAlpacaBroker:
+        def __init__(self, api_key: str, secret_key: str, paper: bool = True) -> None:
+            self.orders = []
+
+        def place_order(self, intent):
+            self.orders.append(intent)
+            return "ALPACA-1"
+
+        def cancel_order(self, broker_order_id: str) -> bool:
+            return True
+
+        def get_order_status(self, broker_order_id: str):
+            return OrderStatus.FILLED
+
+        def get_fill(self, broker_order_id: str):
+            intent = self.orders[0]
+            return Fill(
+                order_id=broker_order_id,
+                intent_id=intent.intent_id,
+                symbol=intent.symbol,
+                side=intent.side,
+                filled_qty=intent.qty,
+                avg_price=100.0,
+                fill_time=utc_now(),
+            )
+
+        def get_positions(self):
+            return []
+
+        def get_account_equity(self) -> float:
+            return 10_000.0
+
+    monkeypatch.setattr(scheduler_mod, "AlpacaBroker", FakeAlpacaBroker)
+
+    temp_dir = tempfile.mkdtemp()
+    db_path = os.path.join(temp_dir, "trade.duckdb")
     cfg = TradingConfig(
         symbols=["AAPL"],
-        strategies=["全仓买入并持有"],
-        initial_capital=10_000.0,
+        strategies=[_strategy_containing("持")],
         order_type="MKT",
-        data_feed_type="alpaca",   # no network at construction time
-        db_path=str(tmp_path / "trade.duckdb"),
+        broker_type="alpaca_paper",
+        data_feed_type="alpaca",
+        alpaca_api_key="key",
+        alpaca_secret_key="secret",
+        db_path=db_path,
         risk=RiskConfig(max_position_pct=1.0, max_trade_risk_pct=1.0),
     )
     sched = Scheduler(cfg)
 
     signal = Signal(
-        signal_id=new_id(), symbol="AAPL", strategy="test", side=Side.BUY,
-        exec_price=100.0, timeframe="5m",
-        signal_time=datetime.now(timezone.utc), bar_close=100.0,
+        signal_id=new_id(),
+        symbol="AAPL",
+        strategy="test",
+        side=Side.BUY,
+        exec_price=100.0,
+        timeframe="5m",
+        signal_time=datetime.now(timezone.utc),
+        bar_close=100.0,
     )
-    sched._execute(signal, equity=10_000.0, prices={"AAPL": 100.0})
+    sched._execute(signal, equity=10_000.0, positions={})
+    assert list(sched._open_orders) == ["ALPACA-1"]
 
+    sched._poll_alpaca_orders()
     pos = sched.portfolio.positions.get("AAPL")
     assert pos is not None and pos.qty > 0
     assert sched.portfolio.cash < 10_000.0

@@ -28,7 +28,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT))
 
 from trader.monitor_data import (  # noqa: E402
-    equity_df, fills_df, heartbeat, orders_df, risk_events_df, signals_df,
+    equity_df, fills_df, heartbeat, live_alpaca_equity, orders_df, risk_events_df, signals_df,
 )
 
 if sys.platform == "win32":
@@ -38,6 +38,7 @@ _LOG_FILE = _ROOT / "trader_engine.log"
 _PID_FILE = _ROOT / ".engine.pid"
 _PREFS_PATH = _ROOT / "conf" / "ui_settings.json"
 _REFRESH_SEC = 5.0
+_AI_DB = str(_ROOT / "ai_states.duckdb")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 持久化用户偏好 (纯 JSON，跨重启)
@@ -92,7 +93,7 @@ def _engine_running() -> bool:
         return False
 
 
-def _start_engine(symbols: str, strategies: str, tf: str, interval, capital) -> str:
+def _start_engine(symbols: str, strategies: str, tf: str, interval) -> str:
     if _engine_running():
         return "引擎已在运行"
     syms = ",".join(s.strip().upper() for s in symbols.split(",") if s.strip())
@@ -100,8 +101,7 @@ def _start_engine(symbols: str, strategies: str, tf: str, interval, capital) -> 
     if not syms or not strats:
         return "❌ 请填写标的与策略"
     cmd = [sys.executable, "-m", "trader.main", "--symbols", syms,
-           "--strategies", strats, "--tf", tf, "--interval", str(int(interval)),
-           "--capital", str(float(capital))]
+           "--strategies", strats, "--tf", tf, "--interval", str(int(interval))]
     try:
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
@@ -248,6 +248,25 @@ body{background:var(--bg);color:var(--fg);
 .qa-code{font-family:var(--mono);font-size:13px;background:var(--bg);
   border:1px solid var(--border);border-radius:8px;padding:12px 14px;color:var(--ai);
   white-space:pre-wrap;word-break:break-all;}
+
+/* 决策台 */
+.cp-agent-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;width:100%;}
+@keyframes cp-pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.cp-mgr{background:var(--panel);border:1px solid rgba(88,166,255,.4);
+  border-radius:12px;padding:18px;width:100%;}
+.cp-pick-row{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px;}
+.cp-pick{padding:9px 14px;border-radius:8px;min-width:88px;text-align:center;}
+.cp-pick.buy{background:rgba(63,185,80,.12);border:1px solid rgba(63,185,80,.35);}
+.cp-pick.watch{background:rgba(210,153,34,.1);border:1px solid rgba(210,153,34,.3);}
+.cp-pick.avoid{background:rgba(248,81,73,.1);border:1px solid rgba(248,81,73,.25);}
+.cp-feed{background:var(--panel);border:1px solid var(--border);
+  border-radius:12px;padding:14px 16px;width:100%;}
+.cp-feed-row{display:flex;align-items:baseline;gap:9px;padding:5px 0;
+  border-bottom:1px solid #21262d;font-size:12.5px;}
+.cp-feed-row:last-child{border:none;}
+.cp-ts{color:var(--fg3);font-size:11px;min-width:65px;
+  font-family:var(--mono);flex-shrink:0;}
+.cp-tag{font-size:10px;font-weight:700;padding:2px 7px;border-radius:999px;flex-shrink:0;}
 """
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -294,11 +313,11 @@ with ui.element("div").classes("qa-body"):
         _nav_group("实况")
         _nav_item("overview", "📊", "总览")
         _nav_item("activity", "🧾", "交易记录")
+        _nav_item("cockpit", "🤖", "决策台")
         _nav_item("system", "⚙️", "系统")
         _nav_group("研究")
         _nav_item("research", "🔬", "研究")
         _nav_group("规划中 · 示例")
-        _nav_item("cockpit", "🎯", "决策台")
         _nav_item("universe", "🔭", "选股池")
         _nav_item("models", "🧠", "模型")
 
@@ -404,9 +423,30 @@ def _render_overview():
         ft_empty = ui.element("div")
 
     def update():
+        live = live_alpaca_equity()
         eq = equity_df(24)
         has = not eq.empty and "total_equity" in eq.columns
-        if has:
+
+        if live is not None:
+            # Alpaca API 实时权益为主：总资产 + 现金来自 API
+            k_total.set_text(_money(live["equity"]))
+            k_cash.set_text(_money(live["cash"]))
+            # 近 24h 盈亏：用 API 现值减 DuckDB 历史起点
+            if has:
+                pnl = live["equity"] - float(eq["total_equity"].iloc[0])
+                k_pnl.set_text(f"{pnl:+,.0f}")
+                k_pnl.classes(remove="pos neg", add="pos" if pnl >= 0 else "neg")
+            else:
+                k_pnl.set_text("—")
+            unreal = (
+                float(eq["unrealized_pnl"].iloc[-1])
+                if has and "unrealized_pnl" in eq.columns else None
+            )
+            k_unreal.set_text(f"{unreal:+,.0f}" if unreal is not None else "—")
+            if unreal is not None:
+                k_unreal.classes(remove="pos neg", add="pos" if unreal >= 0 else "neg")
+        elif has:
+            # 降级到 DuckDB 历史数据
             total = float(eq["total_equity"].iloc[-1])
             pnl = total - float(eq["total_equity"].iloc[0])
             cash = float(eq["cash"].iloc[-1]) if "cash" in eq.columns else None
@@ -416,10 +456,12 @@ def _render_overview():
             k_pnl.classes(remove="pos neg", add="pos" if pnl >= 0 else "neg")
             k_cash.set_text(_money(cash) if cash is not None else "—")
             k_unreal.set_text(f"{unreal:+,.0f}" if unreal is not None else "—")
-            k_unreal.classes(remove="pos neg", add="pos" if (unreal or 0) >= 0 else "neg")
+            if unreal is not None:
+                k_unreal.classes(remove="pos neg", add="pos" if unreal >= 0 else "neg")
         else:
             for k in (k_total, k_pnl, k_cash, k_unreal):
                 k.set_text("—")
+
         eq_plot.figure = _equity_fig(eq, "ov-eq")
         eq_plot.update()
         eq_plot.set_visibility(has)
@@ -505,12 +547,12 @@ def _render_system():
             sym_in = _persist(ui.input("标的", value=_pref("sys_sym", "QQQ")).props("dark dense outlined").style("width:120px"), "sys_sym")
             strat_in = _persist(ui.input("策略", value=_pref("sys_strat", "上周高低点(周K突破)")).props("dark dense outlined").style("width:220px"), "sys_strat")
             tf_in = _persist(ui.select(["5m", "30m", "1h", "1d"], value=_pref("sys_tf", "30m"), label="周期").props("dark dense outlined").style("width:90px"), "sys_tf")
-            cap_in = _persist(ui.number("本金", value=_pref("sys_cap", 10000), format="%.0f").props("dark dense outlined").style("width:120px"), "sys_cap")
             int_in = _persist(ui.number("间隔(秒)", value=_pref("sys_int", 30)).props("dark dense outlined").style("width:110px"), "sys_int")
+        ui.html('<div class="qa-note">总资产、现金、持仓全部以 Alpaca 账户为准；系统不会在本地覆盖账户权益。</div>')
 
         with ui.row().classes("gap-3").style("margin-top:14px"):
             def _do_start():
-                ui.notify(_start_engine(sym_in.value, strat_in.value, tf_in.value, int_in.value, cap_in.value))
+                ui.notify(_start_engine(sym_in.value, strat_in.value, tf_in.value, int_in.value))
             def _do_stop():
                 ui.notify(_stop_engine())
             ui.button("▶ 启动引擎", on_click=_do_start, color="positive").props("unelevated")
@@ -668,23 +710,140 @@ def _render_research():
 
 
 def _render_cockpit():
-    _page_head("决策台", "选股层接入后将展示真实 AI 排名与调仓建议", badge="demo")
-    ui.html('<div class="qa-note">⚠ 以下为占位示例，用于演示界面结构。'
-            '数据非真实，<b>不构成任何投资建议</b>。选股层 (selection.py) 接入后自动替换。</div>')
-    with ui.element("div").classes("qa-card"):
-        ui.label("AI 评分排名（示例）").classes("qa-card-title")
-        ui.label("评分 = 多信号融合，0–100").classes("qa-card-sub")
-        cols = [("rank", "#", "center"), ("code", "标的", "left"), ("score", "评分", "right"),
-                ("trend", "趋势", "center"), ("note", "说明", "left")]
-        t = _make_table(cols)
-        _fill_table(t, pd.DataFrame([
-            {"rank": 1, "code": "示例-A", "score": 92, "trend": "强", "note": "动量领先"},
-            {"rank": 2, "code": "示例-B", "score": 87, "trend": "强", "note": "质量稳健"},
-            {"rank": 3, "code": "示例-C", "score": 78, "trend": "中", "note": "估值偏高"},
-            {"rank": 4, "code": "示例-D", "score": 64, "trend": "中", "note": "波动放大"},
-            {"rank": 5, "code": "示例-E", "score": 41, "trend": "弱", "note": "趋势转弱"},
-        ]), cols)
-    return None
+    _page_head("决策台", "多 Agent 并行分析 · ThreadPoolExecutor + DuckDB 持久化")
+
+    ui.html('<div class="qa-note">'
+            'AI 只产出 Advisory / TradePlan(DRAFT)；执行需通过风控层并人工审批。'
+            '点击「运行一轮」触发 4 个 agent 并行分析（需 Ollama 在线）。'
+            '</div>')
+
+    try:
+        from trader.ai.manager import get_manager
+        mgr = get_manager()
+    except Exception as exc:
+        _empty(f"无法加载 AgentManager: {exc}", "⚠️")
+        return None
+
+    # ── ① Manager 决策区 ────────────────────────────────────────────────────
+    with ui.element("div").classes("cp-mgr"):
+        with ui.row().classes("items-center gap-3").style("margin:0;flex-wrap:wrap"):
+            ui.label("Manager 决策区").classes("qa-card-title").style("color:var(--ai)")
+            status_lbl = ui.label("空闲").style("font-size:12px;color:var(--fg3)")
+            ui.element("div").style("flex:1")
+            sym_in = ui.input(
+                "分析标的 (逗号分隔)",
+                value=_pref("cp_syms", "SPY,AAPL,NVDA,MSFT"),
+            ).props("dark dense outlined").style("width:240px")
+            sym_in.on_value_change(lambda e: _set_pref("cp_syms", e.value))
+            run_btn = ui.button("▶ 运行一轮", color="primary").props("unelevated dense")
+        picks_html = ui.html(
+            '<div class="cp-pick-row">'
+            '<span style="color:var(--fg3);font-size:12px">运行后显示推荐</span>'
+            '</div>'
+        )
+
+    # ── ② Agent 状态面板（6 blocks）───────────────────────────────────────
+    ui.label("Agent 状态").classes("qa-card-title").style("margin-top:4px")
+    agent_cards: dict = {}
+    with ui.element("div").classes("cp-agent-grid"):
+        for role in _AGENT_META:
+            agent_cards[role] = ui.html(_agent_card_html(role, None))
+
+    # ── ③ 活动流 ─────────────────────────────────────────────────────────
+    ui.label("实时活动流").classes("qa-card-title").style("margin-top:4px")
+    feed_el = ui.html(_feed_html([]))
+
+    # ── 运行按钮逻辑 ─────────────────────────────────────────────────────
+    def _do_run():
+        if _cockpit_run["running"]:
+            ui.notify("Agent 正在运行，请稍候")
+            return
+
+        raw_syms = (sym_in.value or "SPY,AAPL,NVDA").strip()
+        symbols = [s.strip().upper() for s in raw_syms.split(",") if s.strip()]
+        if not symbols:
+            ui.notify("请填写至少一个标的")
+            return
+
+        _cockpit_run["running"] = True
+        run_btn.props("disable")
+        status_lbl.set_text("运行中…")
+        status_lbl.style("color:var(--ai)")
+        # 立即标记所有 real agent 为 running
+        mgr._init_db(_AI_DB)
+        for role in ("technical", "news", "web_research", "bull_bear"):
+            mgr._write_state(_AI_DB, role, "running", 0.0, None, {})
+
+        import threading
+        from trader.contracts import AgentContext
+        from trader.models import Candidate, utc_now as _now
+
+        def _bg():
+            try:
+                now = _now()
+                candidates = [
+                    Candidate(symbol=s, score=50.0, rank=i + 1, reasons={}, as_of=now)
+                    for i, s in enumerate(symbols)
+                ]
+                ctx = AgentContext(
+                    candidates=candidates, plans=[], news=[],
+                    positions={}, equity=0.0, as_of=now, extra={},
+                )
+                mgr.run_cycle(ctx, _AI_DB)
+                _cockpit_run["last_run"] = _now()
+            except Exception as exc:
+                logger.error("AgentManager run_cycle 失败: %s", exc)
+            finally:
+                _cockpit_run["running"] = False
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    run_btn.on_click(_do_run)
+
+    # ── 增量更新函数（每 5s 由定时器调用）─────────────────────────────────
+    def update():
+        # 更新 agent 状态卡片
+        states = mgr.get_agent_states(_AI_DB)
+        by_role = {s["role"]: s for s in states}
+        for role in _AGENT_META:
+            agent_cards[role].set_content(_agent_card_html(role, by_role.get(role)))
+
+        # 更新 Manager 决策区 picks
+        scores = mgr.get_composite_scores(_AI_DB)
+        if scores:
+            inner = ""
+            for s in scores[:6]:
+                v = s["verdict"].lower()
+                cls = "buy" if v == "buy" else ("avoid" if v == "avoid" else "watch")
+                vc = {"buy": "var(--pos)", "avoid": "var(--neg)", "watch": "var(--warn)"}.get(cls, "var(--fg2)")
+                inner += (
+                    f'<div class="cp-pick {cls}">'
+                    f'<div style="font-size:15px;font-weight:800;color:var(--fg)">{s["symbol"]}</div>'
+                    f'<div style="font-size:10.5px;font-weight:700;margin:2px 0;color:{vc}">{s["verdict"]}</div>'
+                    f'<div style="font-size:11px;color:var(--fg3)">综合 {s["composite_score"]:.0f}</div>'
+                    f'</div>'
+                )
+            picks_html.set_content(f'<div class="cp-pick-row">{inner}</div>')
+
+        # 更新运行状态 UI
+        if _cockpit_run["running"]:
+            status_lbl.set_text("运行中…")
+            status_lbl.style("color:var(--ai)")
+            run_btn.props("disable")
+        else:
+            lr = _cockpit_run.get("last_run")
+            if lr:
+                status_lbl.set_text(f"完成 {lr.strftime('%H:%M:%S')}")
+            else:
+                status_lbl.set_text("空闲")
+            status_lbl.style("color:var(--fg3)")
+            run_btn.props(remove="disable")
+
+        # 更新活动流
+        feed_el.set_content(_feed_html(mgr.get_recent_advisories(_AI_DB, n=20)))
+
+    update()
+    return update
 
 
 def _render_universe():
@@ -723,6 +882,123 @@ def _render_models():
             {"name": "其余 20 个策略", "w": "0.55", "acc": "~55%", "sharpe": "~1.12"},
         ]), cols)
     return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 决策台辅助函数
+# ═══════════════════════════════════════════════════════════════════════════
+
+_AGENT_META = {
+    "technical":    ("📈", "Technical Agent",  "bars + TA 指标 → LLM 打分", False),
+    "news":         ("📰", "News Agent",       "RSS + yfinance → 情绪评分", False),
+    "web_research": ("🌐", "WebResearch",      "Agent-Reach + LLM → 热点报告", False),
+    "bull_bear":    ("⚖️",  "Bull/Bear Debate", "LLM 三轮辩论 → 最终裁决", False),
+    "fundamental":  ("📊", "Fundamental",      "yfinance P/E EPS → 基本面", True),
+    "sentiment":    ("💬", "Sentiment Agent",  "Reddit/Twitter → 社区情绪", True),
+}
+
+_TAG_COLOR = {
+    "technical": "#3fb950", "news": "#58a6ff", "web_research": "#79c0ff",
+    "bull_bear": "#d29922", "orchestrator": "#9370db",
+    "fundamental": "#f0883e", "sentiment": "#ea4aaa",
+}
+
+
+def _agent_card_html(role: str, state: dict | None) -> str:
+    icon, name, desc, stub = _AGENT_META.get(role, ("?", role, "", False))
+    if state is None:
+        status, score, last_run_str, summary = "idle", 0.0, "—", {}
+    else:
+        status = state.get("status", "idle")
+        score = float(state.get("last_score") or 0)
+        lr = state.get("last_run")
+        last_run_str = lr.strftime("%H:%M:%S") if hasattr(lr, "strftime") else (str(lr)[:8] if lr else "—")
+        summary = state.get("summary") or {}
+
+    color = {
+        "done": "#3fb950", "running": "#58a6ff",
+        "error": "#f85149", "timeout": "#d29922",
+    }.get(status, "#6e7681")
+    border = color if status not in ("idle",) else "var(--border)"
+    pulse = "animation:cp-pulse 1.2s infinite" if status == "running" else ""
+
+    bar_w = min(int(score), 100)
+    sym = summary.get("symbol", "")
+    if sym:
+        score_key = next(
+            (k for k in ("technical_score", "news_score", "hotspot_score", "final_score") if k in summary),
+            "",
+        )
+        score_val = summary.get(score_key, "")
+        trend = summary.get("trend", summary.get("sentiment", summary.get("verdict", "")))
+        label = score_key.replace("_score", "")
+        summary_txt = f"{sym}: {label}={score_val}{f' {trend}' if trend else ''}"[:48]
+    else:
+        summary_txt = "🔧 待实现" if stub else ("待运行" if status == "idle" else status)
+
+    stub_note = '<div style="color:#d29922;font-size:10px;margin-bottom:5px">🔧 本轮待实现</div>' if stub else ""
+
+    return (
+        f'<div style="background:var(--panel);border:1px solid {border};'
+        f'border-radius:12px;padding:15px;min-height:148px;box-sizing:border-box">'
+        f'<div style="display:flex;align-items:center;gap:7px;margin-bottom:8px">'
+        f'<span style="font-size:16px">{icon}</span>'
+        f'<span style="font-size:12.5px;font-weight:700;color:var(--fg)">{name}</span>'
+        f'<span style="width:7px;height:7px;border-radius:50%;background:{color};'
+        f'display:inline-block;margin-left:auto;{pulse}"></span>'
+        f'</div>'
+        f'<div style="font-size:11px;color:var(--fg3);margin-bottom:8px;line-height:1.4">{desc}</div>'
+        f'{stub_note}'
+        f'<div style="font-size:11.5px;color:var(--fg2);margin-bottom:8px;word-break:break-all">{summary_txt}</div>'
+        f'<div style="background:var(--border);border-radius:3px;height:3px;margin-bottom:7px">'
+        f'<div style="background:{color};border-radius:3px;height:3px;width:{bar_w}%;transition:width .5s"></div>'
+        f'</div>'
+        f'<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--fg3)">'
+        f'<span>{status}</span><span>{last_run_str}</span>'
+        f'</div>'
+        f'</div>'
+    )
+
+
+def _feed_html(advisories: list) -> str:
+    if not advisories:
+        return ('<div class="cp-feed">'
+                '<span style="color:var(--fg3);font-size:12px">运行后显示活动记录</span>'
+                '</div>')
+    items = ""
+    for a in advisories:
+        ts = a["created_at"]
+        ts_str = ts.strftime("%H:%M:%S") if hasattr(ts, "strftime") else (str(ts)[:8] if ts else "—")
+        agent = a["agent"]
+        p = a["payload"]
+        sym = p.get("symbol", "")
+        k = a["kind"]
+        if k == "technical":
+            text = f"{sym} 技术分={p.get('technical_score','?')} {p.get('trend','')}"
+        elif k == "news":
+            text = f"{sym} 新闻分={p.get('news_score','?')} ({p.get('sentiment','?')})"
+        elif k == "bull_bear_debate":
+            text = f"{sym} → {p.get('verdict','?')} score={p.get('final_score','?')}"
+        elif k == "web_research":
+            text = f"{sym} 热点分={p.get('hotspot_score','?')} {p.get('sentiment','')}"
+        elif k == "orchestrator_summary":
+            top = p.get("top_pick") or {}
+            text = f"汇总 {p.get('sub_advisory_count',0)} 条 top={top.get('symbol','—')}"
+        else:
+            text = str(p)[:70]
+        color = _TAG_COLOR.get(agent, "#8b949e")
+        items += (
+            f'<div class="cp-feed-row">'
+            f'<span class="cp-ts">{ts_str}</span>'
+            f'<span class="cp-tag" style="background:{color}22;color:{color}">{agent}</span>'
+            f'<span style="color:var(--fg)">{text[:80]}</span>'
+            f'</div>'
+        )
+    return f'<div class="cp-feed">{items}</div>'
+
+
+# 决策台运行状态（模块级，跨导航切换保持）
+_cockpit_run = {"running": False, "last_run": None}
 
 
 _RENDERERS = {
@@ -765,16 +1041,28 @@ def _update_topbar():
         top_hb.set_text(f"{secs:.0f}s" if secs < 120 else f"{secs/60:.0f}m")
     else:
         top_hb.set_text("—")
-    eq = equity_df(24)
-    if not eq.empty and "total_equity" in eq.columns:
-        total = float(eq["total_equity"].iloc[-1])
-        pnl = total - float(eq["total_equity"].iloc[0])
-        top_total.set_text(_money(total))
-        top_pnl.set_text(f"{pnl:+,.0f}")
-        top_pnl.classes(remove="pos neg", add="pos" if pnl >= 0 else "neg")
+    # 优先用 Alpaca API 实时权益；DuckDB 仅提供 24h 盈亏起点
+    live = live_alpaca_equity()
+    if live is not None:
+        top_total.set_text(_money(live["equity"]))
+        eq = equity_df(24)
+        if not eq.empty and "total_equity" in eq.columns:
+            pnl = live["equity"] - float(eq["total_equity"].iloc[0])
+            top_pnl.set_text(f"{pnl:+,.0f}")
+            top_pnl.classes(remove="pos neg", add="pos" if pnl >= 0 else "neg")
+        else:
+            top_pnl.set_text("—")
     else:
-        top_total.set_text("—")
-        top_pnl.set_text("—")
+        eq = equity_df(24)
+        if not eq.empty and "total_equity" in eq.columns:
+            total = float(eq["total_equity"].iloc[-1])
+            pnl = total - float(eq["total_equity"].iloc[0])
+            top_total.set_text(_money(total))
+            top_pnl.set_text(f"{pnl:+,.0f}")
+            top_pnl.classes(remove="pos neg", add="pos" if pnl >= 0 else "neg")
+        else:
+            top_total.set_text("—")
+            top_pnl.set_text("—")
 
 
 def _tick():

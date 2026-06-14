@@ -161,6 +161,23 @@ class Portfolio:
             conn.close()
         return equity
 
+    def snapshot_external_equity(self, equity: float, cash: float = 0.0,
+                                 unrealized: float = 0.0, realized: float = 0.0) -> float:
+        """写入由外部 broker（如 Alpaca）报告的权益快照。
+
+        Alpaca 模式下账本以 broker 为准，本地不自算权益，但仍写 equity_snapshots
+        表，让 monitor / 审计照常读取。"""
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO equity_snapshots VALUES (?,?,?,?,?)",
+                [utc_now(), cash, equity, unrealized, realized],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return equity
+
     @property
     def cash(self) -> float:
         return self._cash

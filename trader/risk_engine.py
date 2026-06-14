@@ -13,7 +13,7 @@ import logging
 from typing import Dict
 
 from .config import TradingConfig
-from .models import Position, RiskVerdict, Side, Signal
+from .models import Position, RiskVerdict, Side, Signal, TradePlan
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +126,52 @@ class RiskEngine:
             )
 
         return RiskVerdict(True, "通过", suggested_qty=float(qty))
+
+    def evaluate_plan(
+        self,
+        plan: TradePlan,
+        current_equity: float,
+        positions: Dict[str, Position],
+    ) -> RiskVerdict:
+        """Plan-level pre-trade checks（用于 runtime.py 计划驱动管道）。"""
+        if self._halted:
+            return RiskVerdict(False, "系统熔断中: " + self._halt_reason)
+
+        if plan.stop_loss <= 0:
+            return RiskVerdict(False, "计划缺少有效止损")
+        if plan.entry_price <= 0:
+            return RiskVerdict(False, f"入场价无效: {plan.entry_price}")
+        if plan.qty <= 0:
+            return RiskVerdict(False, f"数量无效: {plan.qty}")
+
+        if plan.side == Side.BUY and plan.entry_price <= plan.stop_loss:
+            return RiskVerdict(
+                False,
+                f"BUY: 入场价({plan.entry_price:.2f}) ≤ 止损({plan.stop_loss:.2f})",
+            )
+        if plan.side == Side.SELL and plan.entry_price >= plan.stop_loss:
+            return RiskVerdict(
+                False,
+                f"SELL: 入场价({plan.entry_price:.2f}) ≥ 止损({plan.stop_loss:.2f})",
+            )
+
+        cost = plan.entry_price * plan.qty
+        max_cost = current_equity * self._cfg.risk.max_position_pct
+        if cost > max_cost:
+            return RiskVerdict(
+                False,
+                f"仓位成本 ${cost:,.0f} 超上限 ${max_cost:,.0f} "
+                f"({self._cfg.risk.max_position_pct * 100:.0f}% 资产)",
+            )
+
+        if plan.action == "OPEN" and plan.symbol in positions:
+            pos = positions[plan.symbol]
+            if pos is not None and pos.qty > 0:
+                return RiskVerdict(
+                    False, f"{plan.symbol} 已有持仓 {pos.qty:.0f} 股，OPEN 计划被拒"
+                )
+
+        return RiskVerdict(True, "通过", suggested_qty=float(plan.qty))
 
     # ------------------------------------------------------------------
     # Properties

@@ -29,8 +29,8 @@ class Settings(BaseSettings):
     """Single typed source for .env-driven configuration."""
     model_config = SettingsConfigDict(env_file=str(_ENV_PATH), extra="ignore", case_sensitive=False)
 
-    broker_type: str = Field("local_paper", validation_alias=AliasChoices("BROKER_TYPE"))
-    data_feed_type: str = Field("yfinance", validation_alias=AliasChoices("DATA_FEED_TYPE"))
+    broker_type: str = Field("alpaca_paper", validation_alias=AliasChoices("BROKER_TYPE"))
+    data_feed_type: str = Field("alpaca", validation_alias=AliasChoices("DATA_FEED_TYPE"))
     alpaca_api_key: str = Field("", validation_alias=AliasChoices("ALPACA_API_KEY"))
     alpaca_secret_key: str = Field(
         "", validation_alias=AliasChoices("ALPACA_API_SECRET", "ALPACA_SECRET_KEY"))
@@ -60,13 +60,12 @@ class TradingConfig(BaseModel):
     strategies: List[str] = Field(default_factory=lambda: ["5/20均线金叉死叉"])
     timeframe: str = "5m"                    # "1m" | "5m" | "30m" | "1h" | "1d"
 
-    # ---- Capital ------------------------------------------------------------
+    # ---- Research/backtest capital -----------------------------------------
     initial_capital: float = 10_000.0
     leverage: float = 1.0
     order_type: str = "LMT"                  # "LMT" | "MKT"
 
     # ---- Mode ---------------------------------------------------------------
-    paper_mode: bool = True                  # MUST explicitly set False for live trading
     broker_type: str = Field(default_factory=lambda: settings.broker_type)
 
     # ---- Risk ---------------------------------------------------------------
@@ -87,3 +86,6 @@ class TradingConfig(BaseModel):
 
     # ---- Pending-order / gap-fill -------------------------------------------
     pending_order_max_bars: int = 10
+
+    # ---- Execution gate (红线：默认关；只挂 LMT；需人工确认后再开) -----------
+    execution_enabled: bool = False
