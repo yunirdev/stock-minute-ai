@@ -959,7 +959,7 @@ def _render_cockpit():
             if start:
                 secs = int((datetime.now(tz=timezone.utc) - start).total_seconds())
                 elapsed = f" [{secs}s]" if secs < 60 else f" [{secs // 60}m{secs % 60:02d}s]"
-                if secs > 600:   # 10 分钟硬超时 → 自动重置
+                if secs > 900:   # 15 分钟硬超时 → 自动重置
                     _cockpit_run["running"] = False
                     _cockpit_run["stage"] = "超时"
                     _cockpit_run["start_time"] = None
