@@ -839,21 +839,34 @@ def _render_cockpit():
                 for i, c in enumerate(candidates):
                     c.rank = i + 1
 
-                # ④ 拉取华尔街见闻快讯，传给 NewsAgent
+                # ④ 四路新闻拉取（WSCN + SEC 8-K + Finnhub + 价格异动）
                 _cockpit_run["stage"] = "拉取快讯…"
+                from datetime import timedelta
+                from trader.news import (
+                    FinnhubSource, PriceMoveSource,
+                    SECEdgarSource, WallStreetCNSource,
+                )
                 news_events = []
-                try:
-                    from trader.news import WallStreetCNSource
-                    from datetime import timedelta
-                    wscn = WallStreetCNSource(
-                        universe=symbols, channels=["global", "us"], num=30
-                    )
-                    news_events = wscn.poll(since=now - timedelta(hours=4))
-                    logger.info("Cockpit WSCN: %d 条快讯", len(news_events))
-                except Exception as e:
-                    logger.warning("WSCN poll 失败: %s", e)
+                _news_cfg = [
+                    ("WSCN",    WallStreetCNSource(universe=symbols, channels=["global", "us"], num=30),
+                                now - timedelta(hours=4)),
+                    ("SEC 8-K", SECEdgarSource(universe=symbols),
+                                now - timedelta(hours=20)),
+                    ("Finnhub", FinnhubSource(universe=symbols),
+                                now - timedelta(hours=24)),
+                    ("价格异动", PriceMoveSource(universe=symbols),
+                                now - timedelta(hours=4)),
+                ]
+                for src_label, src_obj, src_since in _news_cfg:
+                    try:
+                        batch = src_obj.poll(since=src_since)
+                        news_events.extend(batch)
+                        if batch:
+                            logger.info("Cockpit %s: %d 条", src_label, len(batch))
+                    except Exception as e:
+                        logger.warning("Cockpit %s poll 失败: %s", src_label, e)
 
-                # ⑤ 运行 Agent Manager（LLM 层在真实 TA 分 + 快讯基础上分析）
+                # ⑤ 运行 Agent Manager（LLM 层在真实 TA 分 + 多路快讯基础上分析）
                 _cockpit_run["stage"] = "运行 Agent…"
                 ctx = AgentContext(
                     candidates=candidates, plans=[], news=news_events,

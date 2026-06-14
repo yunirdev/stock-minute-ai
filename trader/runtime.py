@@ -41,7 +41,7 @@ from .models import (
     Bar, Notification, OrderIntent, OrderStatus,
     Position, Side, TradePlan, new_id, utc_now,
 )
-from .news import PriceMoveSource, WallStreetCNSource
+from .news import FinnhubSource, PriceMoveSource, SECEdgarSource, WallStreetCNSource
 from .notify import DiscordNotifier
 from .plan import ATRPlanner
 from .portfolio import Portfolio
@@ -107,9 +107,10 @@ class Runtime:
             universe=config.symbols, timeframe=config.timeframe
         )
         self._wscn = WallStreetCNSource(
-            universe=config.symbols,
-            channels=["global", "us"],
+            universe=config.symbols, channels=["global", "us"],
         )
+        self._sec = SECEdgarSource(universe=config.symbols)
+        self._finnhub = FinnhubSource(universe=config.symbols)
         self._reviewer = SimpleReviewer(db_path=config.db_path)
 
         self._running = False
@@ -235,11 +236,18 @@ class Runtime:
             self._audit.log_heartbeat(self._tick_count, equity)
             return
 
-        # 9. 新闻事件：华尔街见闻快讯 + 本地价格异动（两路合并）
+        # 9. 新闻事件：四路合并（WSCN + SEC 8-K + Finnhub + 价格异动）
+        from datetime import timedelta
         news = []
-        for src_name, src in [("wscn", self._wscn), ("price", self._price_news)]:
+        _news_sources = [
+            ("wscn",    self._wscn,       ts),
+            ("sec",     self._sec,        ts - timedelta(hours=20)),  # 8-K 可能盘前发
+            ("finnhub", self._finnhub,    ts - timedelta(hours=4)),
+            ("price",   self._price_news, ts),
+        ]
+        for src_name, src, since_dt in _news_sources:
             try:
-                batch = src.poll(since=ts)
+                batch = src.poll(since=since_dt)
                 news.extend(batch)
                 if batch:
                     logger.info("新闻 [%s]: %d 条", src_name, len(batch))

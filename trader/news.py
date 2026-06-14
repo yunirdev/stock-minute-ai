@@ -3,13 +3,18 @@ news.py
 新闻/异动模块：
   - PriceMoveSource：从本地 bars 计算涨跌幅异动，生成 price_move 类 NewsEvent。
   - WallStreetCNSource：华尔街见闻 7x24 快讯 API（全球/外汇/黄金等频道）。
+  - SECEdgarSource：SEC EDGAR 8-K 实时申报流（无需 API key）。
+  - FinnhubSource：Finnhub 公司新闻 API（需 FINNHUB_API_KEY，无 key 则静默跳过）。
   - NewsSourceStub：占位，返回空列表。
 """
 from __future__ import annotations
 
 import json as _json
 import logging
+import os
+import time as _time
 import urllib.request as _ur
+import xml.etree.ElementTree as _ET
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set
 
@@ -202,6 +207,180 @@ class WallStreetCNSource:
             severity=min(score / 3.0, 1.0),   # score=3 → severity=1.0
             ts=ts,
             source="wallstreetcn",
+        )
+
+
+class SECEdgarSource:
+    """
+    SEC EDGAR 8-K 实时申报流。
+
+    轮询各 ticker 最新 8-K 申报（Atom feed），信噪比极高：
+    8-K = 重大事件（盈利预警、并购重组、高管变动、诉讼等）。
+
+    完全免费，无需 API key。EDGAR 要求 User-Agent 含联系方式。
+    配置：SEC_USER_AGENT=CompanyName your@email.com  （.env 可选）
+    """
+
+    _BASE = "https://www.sec.gov/cgi-bin/browse-edgar"
+    _ATOM = "http://www.w3.org/2005/Atom"
+
+    def __init__(
+        self,
+        universe: Optional[List[str]] = None,
+        count: int = 5,
+        timeout: float = 10.0,
+    ) -> None:
+        self._universe = [s.upper() for s in (universe or [])]
+        self._count = count
+        self._timeout = timeout
+        self._seen_ids: Set[str] = set()
+        ua = os.getenv("SEC_USER_AGENT", "stock-minute-ai/1.0 bot@example.com")
+        self._headers = {"User-Agent": ua, "Accept-Encoding": "gzip, deflate"}
+
+    def poll(self, since: datetime) -> List[NewsEvent]:
+        since_ts = since.timestamp()
+        events: List[NewsEvent] = []
+        for symbol in self._universe:
+            try:
+                batch = self._fetch(symbol, since_ts)
+                events.extend(batch)
+                _time.sleep(0.15)       # EDGAR 限速：max 10 req/sec
+            except Exception as exc:
+                logger.warning("SEC EDGAR [%s] 失败: %s", symbol, exc)
+        if events:
+            logger.info("SEC EDGAR: +%d 条 8-K 申报", len(events))
+        return events
+
+    def _fetch(self, symbol: str, since_ts: float) -> List[NewsEvent]:
+        url = (
+            f"{self._BASE}?action=getcompany&CIK={symbol}"
+            f"&type=8-K&dateb=&owner=include&count={self._count}&output=atom"
+        )
+        req = _ur.Request(url, headers=self._headers)
+        with _ur.urlopen(req, timeout=self._timeout) as resp:
+            body = resp.read()
+
+        root = _ET.fromstring(body)
+        ns = {"a": self._ATOM}
+
+        # 尝试从 company-info（非 Atom 命名空间）提取公司名
+        ci = root.find("company-info")
+        company = (
+            ci.findtext("conformed-name", default=symbol)
+            if ci is not None else symbol
+        )
+
+        events: List[NewsEvent] = []
+        for entry in root.findall("a:entry", ns):
+            entry_id = entry.findtext("a:id", namespaces=ns) or ""
+            updated_str = entry.findtext("a:updated", namespaces=ns) or ""
+            link_el = entry.find("a:link", ns)
+            link_url = link_el.get("href", "") if link_el is not None else ""
+
+            if not entry_id or entry_id in self._seen_ids:
+                continue
+            try:
+                ts = datetime.fromisoformat(updated_str.replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                ts_utc = ts.astimezone(timezone.utc)
+            except Exception:
+                continue
+            if ts_utc.timestamp() < since_ts:
+                continue
+
+            self._seen_ids.add(entry_id)
+            events.append(NewsEvent(
+                event_id=new_id(),
+                kind="sec_8k",
+                symbol=symbol,
+                title=f"{company} 提交 8-K（重大事件申报）",
+                summary=(
+                    f"{symbol} ({company}) 向 SEC 提交 8-K 申报。"
+                    "8-K 涵盖：盈利预警、并购重组、高管变动、诉讼等重大事件。"
+                    f"申报时间: {ts_utc.strftime('%Y-%m-%d %H:%M UTC')}"
+                ),
+                url=link_url,
+                severity=0.8,
+                ts=ts_utc,
+                source="sec_edgar",
+            ))
+        return events
+
+
+class FinnhubSource:
+    """
+    Finnhub 公司新闻 API（免费 tier：60 req/min）。
+
+    需在 .env 配置 FINNHUB_API_KEY（注册 finnhub.io 免费获取）。
+    无 key 时静默跳过，不报错，系统其他新闻源正常工作。
+    """
+
+    _BASE = "https://finnhub.io/api/v1"
+
+    def __init__(
+        self,
+        universe: Optional[List[str]] = None,
+        api_key: Optional[str] = None,
+        timeout: float = 8.0,
+    ) -> None:
+        self._key = api_key or os.getenv("FINNHUB_API_KEY", "")
+        self._universe = [s.upper() for s in (universe or [])]
+        self._timeout = timeout
+        self._seen_ids: Set[int] = set()
+        if not self._key:
+            logger.debug("FinnhubSource: 未设置 FINNHUB_API_KEY，已跳过")
+
+    def poll(self, since: datetime) -> List[NewsEvent]:
+        if not self._key:
+            return []
+        since_ts = since.timestamp()
+        from_date = since.strftime("%Y-%m-%d")
+        to_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        events: List[NewsEvent] = []
+        for symbol in self._universe:
+            try:
+                items = self._fetch(symbol, from_date, to_date)
+                for item in items:
+                    ev = self._to_event(item, since_ts, symbol)
+                    if ev:
+                        events.append(ev)
+                _time.sleep(0.05)       # 60 req/min 充裕
+            except Exception as exc:
+                logger.warning("Finnhub [%s] 失败: %s", symbol, exc)
+        if events:
+            logger.info("Finnhub: +%d 条公司新闻", len(events))
+        return events
+
+    def _fetch(self, symbol: str, from_date: str, to_date: str) -> List[Dict]:
+        url = (
+            f"{self._BASE}/company-news"
+            f"?symbol={symbol}&from={from_date}&to={to_date}&token={self._key}"
+        )
+        req = _ur.Request(url, headers={"Accept": "application/json"})
+        with _ur.urlopen(req, timeout=self._timeout) as resp:
+            return _json.loads(resp.read()) or []
+
+    def _to_event(self, item: Dict, since_ts: float, symbol: str) -> Optional[NewsEvent]:
+        item_id = int(item.get("id", 0))
+        dt = item.get("datetime", 0)
+        if dt < since_ts or item_id in self._seen_ids:
+            return None
+        headline = (item.get("headline") or "").strip()
+        if not headline:
+            return None
+        self._seen_ids.add(item_id)
+        return NewsEvent(
+            event_id=new_id(),
+            kind="news",
+            symbol=symbol,
+            title=headline,
+            summary=(item.get("summary") or headline)[:300],
+            url=item.get("url", ""),
+            severity=0.5,
+            ts=datetime.fromtimestamp(dt, tz=timezone.utc),
+            source=f"finnhub/{item.get('source', 'unknown')}",
         )
 
 
