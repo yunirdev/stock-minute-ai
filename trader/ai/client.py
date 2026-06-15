@@ -70,7 +70,7 @@ class OllamaClient:
         self,
         base_url: str = _DEFAULT_OLLAMA_URL,
         default_model: str = _DEFAULT_OLLAMA_MODEL,
-        timeout: int = 300,   # 36B 模型单次推理可能需要 2-3 分钟
+        timeout: int = 600,   # 36B 模型单次推理最长约 5-8 分钟，留足余量
     ) -> None:
         self._url = base_url.rstrip("/")
         self._model = default_model
@@ -95,7 +95,10 @@ class OllamaClient:
         model: str = "",
         temperature: float = 0.1,
     ) -> Dict[str, Any]:
-        """调用 LLM 并强制解析 JSON。重试最多 _JSON_RETRY 次。"""
+        """调用 LLM 并强制解析 JSON。
+        - 超时/连接失败（空响应）：直接返回 {}，不重试（重试也会超时）
+        - 响应非空但不是合法 JSON：最多重试 _JSON_RETRY 次
+        """
         sys_json = (
             system + "\n\nIMPORTANT: Respond ONLY with valid JSON. "
             "No markdown, no explanation, just the JSON object."
@@ -103,6 +106,10 @@ class OllamaClient:
         for attempt in range(_JSON_RETRY):
             raw = self._call(sys_json, user, model or self._model,
                              temperature, json_mode=True)
+            if not raw:
+                # 空响应 = 超时或连接失败，继续重试无意义
+                logger.warning("Ollama 返回空响应（超时或连接失败），放弃重试")
+                return {}
             parsed = _try_parse_json(raw)
             if parsed is not None:
                 return parsed
@@ -130,6 +137,7 @@ class OllamaClient:
                 {"role": "user", "content": user},
             ],
             "stream": False,
+            "think": False,         # 禁用 CoT 思考链（qwen/gemma thinking 模式会让响应时间翻倍）
             "options": {"temperature": temperature},
         }
         if json_mode:

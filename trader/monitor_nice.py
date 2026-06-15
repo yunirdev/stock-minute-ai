@@ -827,15 +827,50 @@ def _render_cockpit():
             from trader.models import Candidate, utc_now as _now
             from trader.selection import ConsensusSelector
 
+            import time as _time
+            import threading as _th
+
+            _ROLE_CN = {
+                "technical":   "技术分析",
+                "news":        "新闻情绪",
+                "web_research": "热点研究",
+                "bull_bear":   "多空辩论",
+            }
+
+            def _agent_watcher():
+                """后台监控线程：每 4s 读 DuckDB，把哪个 agent 在跑同步到 stage。"""
+                while _cockpit_run.get("running"):
+                    try:
+                        states = mgr.get_agent_states(_AI_DB)
+                        done_roles  = [s["role"] for s in states if s["status"] == "done"]
+                        run_roles   = [s["role"] for s in states if s["status"] == "running"]
+                        err_roles   = [s["role"] for s in states if s["status"] == "error"]
+                        total = len(states)
+                        n_done = len(done_roles)
+                        if run_roles:
+                            cur_cn = _ROLE_CN.get(run_roles[0], run_roles[0])
+                            extras = ""
+                            if err_roles:
+                                extras = f"  ⚠ {len(err_roles)} 个出错"
+                            _cockpit_run["stage"] = (
+                                f"AI: {cur_cn} 推理中…  已完成 {n_done}/{total}{extras}"
+                            )
+                        elif n_done + len(err_roles) == total and total > 0:
+                            _cockpit_run["stage"] = f"AI: 全部完成 ({n_done}/{total})，汇总中…"
+                    except Exception:
+                        pass
+                    _time.sleep(4)
+
             try:
                 now = _now()
-                cfg = TradingConfig()   # 读 .env 默认值（API key / timeframe 等）
+                cfg = TradingConfig()
 
-                # ① 先拉 K 线更新缓存，ConsensusSelector 依赖 data_cache
-                _cockpit_run["stage"] = "拉取 K 线…"
+                # ① K 线拉取：每个 symbol 独立更新 stage
+                n_sym = len(symbols)
                 try:
                     feed = AlpacaDataFeed(cfg)
-                    for sym in symbols:
+                    for idx, sym in enumerate(symbols, 1):
+                        _cockpit_run["stage"] = f"拉取 K 线 {sym} ({idx}/{n_sym})…"
                         try:
                             raw = feed.fetch_bars(sym, n_bars=cfg.bars_lookback)
                             if raw:
@@ -852,8 +887,8 @@ def _render_cockpit():
                 except Exception as e:
                     logger.warning("AlpacaDataFeed 初始化失败 (离线?): %s", e)
 
-                # ② 用真实策略共识打分（0-100 多空票数比）
-                _cockpit_run["stage"] = "策略打分…"
+                # ② 策略打分
+                _cockpit_run["stage"] = f"策略打分… ({n_sym} 个标的)"
                 candidates = []
                 try:
                     selector = ConsensusSelector(strategies=cfg.strategies)
@@ -866,9 +901,9 @@ def _render_cockpit():
                 except Exception as e:
                     logger.warning("ConsensusSelector 失败: %s", e)
 
-                # ③ 对没有缓存数据的标的用 50 兜底（标注 no-data）
+                # ③ 无数据标的 50 兜底
                 scored_syms = {c.symbol for c in candidates}
-                for i, s in enumerate(symbols):
+                for s in symbols:
                     if s not in scored_syms:
                         candidates.append(
                             Candidate(symbol=s, score=50.0,
@@ -879,7 +914,7 @@ def _render_cockpit():
                 for i, c in enumerate(candidates):
                     c.rank = i + 1
 
-                # ④ 四路新闻拉取（按源逐一更新 stage，方便用户知道卡在哪）
+                # ④ 四路新闻（按源逐一显示进度）
                 from datetime import timedelta
                 from trader.news import (
                     FinnhubSource, PriceMoveSource,
@@ -887,35 +922,41 @@ def _render_cockpit():
                 )
                 news_events = []
                 _news_cfg = [
-                    ("WSCN 快讯 (1/4)",    WallStreetCNSource(universe=symbols, channels=["global", "us"], num=30),
-                                now - timedelta(hours=4)),
-                    ("SEC 8-K (2/4)",      SECEdgarSource(universe=symbols),
-                                now - timedelta(hours=20)),
-                    ("Finnhub (3/4)",      FinnhubSource(universe=symbols),
-                                now - timedelta(hours=24)),
-                    ("价格异动 (4/4)",     PriceMoveSource(universe=symbols),
-                                now - timedelta(hours=4)),
+                    ("华尔街见闻 (1/4)", WallStreetCNSource(universe=symbols, channels=["global", "us"], num=30),
+                                         now - timedelta(hours=4)),
+                    ("SEC 8-K   (2/4)",  SECEdgarSource(universe=symbols),
+                                         now - timedelta(hours=20)),
+                    ("Finnhub   (3/4)",  FinnhubSource(universe=symbols),
+                                         now - timedelta(hours=24)),
+                    ("价格异动  (4/4)",  PriceMoveSource(universe=symbols),
+                                         now - timedelta(hours=4)),
                 ]
                 for src_label, src_obj, src_since in _news_cfg:
-                    _cockpit_run["stage"] = f"拉取 {src_label}…"
+                    _cockpit_run["stage"] = f"拉取新闻：{src_label}…"
                     try:
                         batch = src_obj.poll(since=src_since)
                         news_events.extend(batch)
-                        if batch:
-                            logger.info("Cockpit %s: %d 条", src_label, len(batch))
+                        logger.info("Cockpit %s: %d 条", src_label, len(batch))
                     except Exception as e:
                         logger.warning("Cockpit %s poll 失败: %s", src_label, e)
 
-                # ⑤ 运行 Agent Manager（LLM 层在真实 TA 分 + 多路快讯基础上分析）
+                # ⑤ AI Agent 分析（启动监控线程实时更新 stage）
                 n_agents = len(mgr._agents)
-                _cockpit_run["stage"] = f"AI 分析中… (0/{n_agents})"
+                _cockpit_run["stage"] = f"AI: 准备分析 {n_agents} 个 agent…"
                 ctx = AgentContext(
                     candidates=candidates, plans=[], news=news_events,
                     positions={}, equity=0.0, as_of=now, extra={},
                 )
+                watcher = _th.Thread(target=_agent_watcher, daemon=True)
+                watcher.start()
                 mgr.run_cycle(ctx, _AI_DB)
+
+                n_news = len(news_events)
+                n_cand = len(candidates)
                 _cockpit_run["last_run"] = _now()
-                _cockpit_run["stage"] = ""
+                _cockpit_run["stage"] = (
+                    f"完成  标的 {n_cand} 个 · 新闻 {n_news} 条 · Agent {n_agents} 个"
+                )
             except Exception as exc:
                 logger.error("AgentManager run_cycle 失败: %s", exc)
                 _cockpit_run["stage"] = "错误"
@@ -959,7 +1000,7 @@ def _render_cockpit():
             if start:
                 secs = int((datetime.now(tz=timezone.utc) - start).total_seconds())
                 elapsed = f" [{secs}s]" if secs < 60 else f" [{secs // 60}m{secs % 60:02d}s]"
-                if secs > 900:   # 15 分钟硬超时 → 自动重置
+                if secs > 1800:  # 30 分钟硬超时（串行 4 agent × 最多 7min）→ 自动重置
                     _cockpit_run["running"] = False
                     _cockpit_run["stage"] = "超时"
                     _cockpit_run["start_time"] = None

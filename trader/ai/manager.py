@@ -24,8 +24,8 @@ from trader.models import Advisory, utc_now
 
 logger = logging.getLogger(__name__)
 
-_AGENT_TIMEOUT = 360   # 36B 模型单次推理最多约 3 分钟，留足余量
-_MAX_WORKERS = 4
+_AGENT_TIMEOUT = 720   # 36B 模型单次调用最长 10 分钟，留足余量不中断
+_MAX_WORKERS = 1       # 本地模型串行：避免多请求争抢 GPU
 
 
 class AgentManager:
