@@ -137,7 +137,7 @@ class OllamaClient:
                 {"role": "user", "content": user},
             ],
             "stream": False,
-            "think": False,         # 禁用 CoT 思考链（qwen/gemma thinking 模式会让响应时间翻倍）
+            "think": os.getenv("OLLAMA_THINK", "false").lower() == "true",  # .env: OLLAMA_THINK=true 开启思考链
             "options": {"temperature": temperature},
         }
         if json_mode:
