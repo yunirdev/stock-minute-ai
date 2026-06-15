@@ -63,7 +63,7 @@ class TechnicalAgent(AgentBase):
 
         # 运行多个策略，收集最新信号
         signals: dict = {}
-        for strat in list(STRATEGY_OPTIONS.keys())[:6]:  # 最多6个策略
+        for strat in STRATEGY_OPTIONS[:6]:  # 最多6个策略
             try:
                 result = compute_signals(df.copy(), strat)
                 last = result.iloc[-1]
