@@ -78,14 +78,25 @@ trader/
 
 `make_client()` 自动降级顺序：
 1. **Ollama**（本地，`http://localhost:11434`）
-   - 自动发现已安装模型（不要求必须是 llama3.2）
-   - 优先选有 `tools` 能力的模型（如 qwen3.6、gemma4）
-   - 只需 `ollama serve` 在后台运行即可，无需额外配置
+   - 自动发现已安装模型，读 `.env` 的 `OLLAMA_MODEL` 优先
+   - Agent 串行执行（`_MAX_WORKERS=1`），避免本地 GPU 争抢
+   - 思考链默认关闭，可在 `.env` 设 `OLLAMA_THINK=true` 开启
 2. **Anthropic**（Ollama 不可达时，若 `.env` 有 `ANTHROPIC_API_KEY`）
 3. **StubLLMClient**（最终兜底，所有评分返回 50，会打 ⚠️ 警告）
 
-> 决策台显示全 50 分 = Ollama 未运行 + 无 Anthropic Key → StubLLMClient 在工作。
-> 本机已有 `qwen3.6`（36B）和 `gemma4`（8B），`ollama serve` 即可。
+### 本机配置（RTX 5070 Ti · 16GB VRAM）
+
+| 模型 | VRAM | 速度 | 推荐 |
+|------|------|------|------|
+| `qwen2.5:14b` | 8.9GB | 30-60s/次 | **当前使用，首选** |
+| `phi4` | 9.1GB | 30-60s/次 | 备选 |
+| `gemma4` | 9.6GB | 20-40s/次 | 已安装，可切换 |
+| `qwen3.6` | 24GB（溢出 CPU）| 5-15min/次 | 不推荐日常使用 |
+
+切换模型：`.env` 改 `OLLAMA_MODEL=<模型名>`，重启 UI 即生效。
+
+> 决策台显示全 50 分 = Ollama 未运行 或 LLM 超时 → StubLLMClient 在工作。
+> 确认 Ollama 在跑：`curl http://localhost:11434/api/tags`
 
 ---
 
@@ -107,7 +118,7 @@ trader/
 - [ ] `uv run python -m pytest tests/` — 44 tests 全绿
 - [ ] `git status` — 当前在 `main` 分支，无意外修改
 - [ ] `.env` 含 `ALPACA_API_KEY` / `ALPACA_API_SECRET` / `BROKER_TYPE=alpaca_paper`
-- [ ] 决策台要真实评分 → 确认 `.env` 有 `ANTHROPIC_API_KEY` 或本地 Ollama 运行中
+- [ ] 决策台要真实评分 → 确认 Ollama 在跑（`curl http://localhost:11434/api/tags`）且 `OLLAMA_MODEL=qwen2.5:14b`
 - [ ] `execution_enabled=False`（默认）→ 修改为 `True` 前需人工确认
 
 ---
