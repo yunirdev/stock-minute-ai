@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     alpaca_secret_key: str = Field(
         "", validation_alias=AliasChoices("ALPACA_API_SECRET", "ALPACA_SECRET_KEY"))
     alpaca_feed: str = Field(
-        "iex", validation_alias=AliasChoices("ALPACA_DATA_FEED", "ALPACA_FEED"))
+        "sip", validation_alias=AliasChoices("ALPACA_DATA_FEED", "ALPACA_FEED"))
 
 
 # Loaded once at import — the one place .env is parsed for engine config.
