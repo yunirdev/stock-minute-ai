@@ -1,24 +1,9 @@
 """
 trader/runtime.py
-M1 计划驱动管道 Runtime。
+唯一生产交易循环：Candidate → TradePlan → allocation → AI safety → risk → DRY_RUN/LMT。
 
-与 scheduler.py 的区别
-  scheduler.py  = 信号驱动（TA Signal → risk → order）用于实时策略回路。
-  runtime.py    = 计划驱动（Candidate → TradePlan → allocate → AI safety → risk → LMT）
-                  用于 AI 辅助决策流程。
-
-每轮（tick）流程
-  kill_switch → watchdog → equity/positions → risk.check_equity
-  → poll_orders → market_session → fetch_bars → news
-  → pos_monitor → selection → plan → allocate → evaluate_plan
-  → AI safety → risk → execute/DRY_RUN → portfolio.snapshot → heartbeat → daily_review
-
-安全红线（必须，不得绕过）
-  - AI agent 不直连 broker：只产出 Advisory/TradePlan，由 Runtime 统一执行。
-  - 仅 auto_trade_paper=True 且 broker_type=alpaca_paper 时自动下单。
-  - 只挂 LMT：绝不下 market order（AlpacaBroker 也有防护，双重保险）。
-  - AI 评分、确定性风控、kill switch、幂等与启动对账均不得绕过。
-  - 密钥不入库：日志中不打印 API Key / Secret。
+每轮负责 kill switch、watchdog、启动对账、行情、订单轮询、组合与审计持久化。
+Agent/LLM 不直接调用 broker；自动执行仅允许 Alpaca Paper 限价单。
 """
 from __future__ import annotations
 

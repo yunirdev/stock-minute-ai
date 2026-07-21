@@ -1,4 +1,4 @@
-﻿"""
+"""
 conftest.py
 M0 公共测试 fixtures —— 提供数据模型和 stub 模块实例。
 """
@@ -11,7 +11,7 @@ from typing import Dict
 import pandas as pd
 import pytest
 
-from trader.contracts import AgentContext
+from trader.models import AgentContext
 from trader.models import (
     Alert,
     Bar,
@@ -155,20 +155,11 @@ def file_kill_switch():
         pass
 
 
-@pytest.fixture
-def orchestrator():
-    from trader.ai.agents.orchestrator import OrchestratorAgent
-
-    # 测试用 stub 模式，不需要 Ollama 在线
-    return OrchestratorAgent(use_real_agents=False)
-
 
 @pytest.fixture
 def agent_context(
     sample_candidate, sample_trade_plan, sample_news_event, sample_positions
 ) -> "AgentContext":
-    from trader.contracts import AgentContext
-
     return AgentContext(
         candidates=[sample_candidate],
         plans=[sample_trade_plan],

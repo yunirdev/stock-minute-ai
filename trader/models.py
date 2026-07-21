@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -105,34 +105,6 @@ class Fill:
     broker_payload: Dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
-class PendingOrder:
-    """
-    A limit order waiting for price to pull back to the trigger level.
-
-    Created when the strategy fires a signal but the bar has already
-    gapped past exec_price (i.e. the price is unreachable on this bar).
-
-    Lifecycle:
-        WAITING  → price pulls back into [low, high] that contains limit_price
-                   → FILLED (OrderIntent is submitted to broker)
-        WAITING  → bars_alive >= max_bars_alive
-                   → EXPIRED (order cancelled, no fill)
-        WAITING  → strategy fires opposite-direction signal (TP/SL triggered)
-                   → CANCELLED
-    """
-    pending_id: str
-    signal: "Signal"                # original signal that triggered this order
-    limit_price: float              # the price we want to buy/sell at
-    side: Side
-    symbol: str
-    created_at: datetime
-    max_bars_alive: int = 10        # cancel after this many ticks without fill
-    bars_alive: int = 0             # incremented each tick
-    status: str = "WAITING"         # WAITING | FILLED | EXPIRED | CANCELLED
-    tp_price: Optional[float] = None
-    sl_price: Optional[float] = None
-
 
 @dataclass
 class Position:
@@ -146,7 +118,7 @@ class Position:
 
 
 # ---------------------------------------------------------------------------
-# M0 新增数据模型（PLAN.md §4，M0 冻结）
+# Decision and reporting models
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -234,3 +206,15 @@ class Notification:
     kind: str = "info"                  # selection | plan | review | news | alert | info
     fields: Dict[str, Any] = field(default_factory=dict)
     plan_id: Optional[str] = None       # 若是计划推送，带 plan_id 支持审计追踪
+
+
+@dataclass
+class AgentContext:
+    """Read-only-by-convention input shared with analysis agents."""
+    candidates: List[Candidate] = field(default_factory=list)
+    plans: List[TradePlan] = field(default_factory=list)
+    news: List[NewsEvent] = field(default_factory=list)
+    positions: Dict[str, Position] = field(default_factory=dict)
+    equity: float = 0.0
+    as_of: Optional[datetime] = None
+    extra: Dict[str, Any] = field(default_factory=dict)

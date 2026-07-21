@@ -1,4 +1,4 @@
-﻿"""
+"""
 broker/alpaca.py
 Alpaca 执行适配器（默认 paper 虚拟盘）。
 
@@ -6,7 +6,7 @@ Alpaca 执行适配器（默认 paper 虚拟盘）。
 （虚拟盘、真实行情、不碰真钱）；实盘需显式 `paper=False`（且 broker_type=alpaca_live）。
 
 Alpaca order fills are asynchronous.
-place_order 只提交订单并返回 broker order id；是否成交由 scheduler 轮询
+place_order 只提交订单并返回 broker order id；是否成交由 Runtime 轮询
 get_order_status / get_fill 获取（Alpaca 用真实行情撮合，可能排队、部分成交）。
 """
 from __future__ import annotations

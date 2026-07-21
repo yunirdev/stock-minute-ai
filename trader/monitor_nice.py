@@ -2899,7 +2899,7 @@ def _render_cockpit():
         def _bg():
             import pandas as pd  # noqa: E402
             from trader.config import TradingConfig
-            from trader.contracts import AgentContext
+            from trader.models import AgentContext
             from trader.data_cache import upsert_bars as _upsert
             from trader.data_feed import AlpacaDataFeed
             from trader.models import Candidate, utc_now as _now
@@ -3748,7 +3748,6 @@ _TAG_COLOR = {
     "news": "#58a6ff",
     "web_research": "#79c0ff",
     "bull_bear": "#d29922",
-    "orchestrator": "#9370db",
     "retail": "#ea4aaa",
 }
 
@@ -3900,11 +3899,6 @@ def _feed_html(advisories: list) -> str:
             text = (
                 f"{sym} 大咖分={p.get('elite_score', '?')} "
                 f"{p.get('stance', '?')}" + (f" ({sigs})" if sigs else "")
-            )
-        elif k == "orchestrator_summary":
-            top = p.get("top_pick") or {}
-            text = (
-                f"汇总 {p.get('sub_advisory_count', 0)} 条 top={top.get('symbol', '—')}"
             )
         else:
             text = str(p)[:120]

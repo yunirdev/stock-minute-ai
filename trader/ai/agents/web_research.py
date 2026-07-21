@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from typing import Dict, List
 
-from trader.contracts import AgentContext
+from trader.models import AgentContext
 from trader.models import Advisory
 from trader.ai.web_research import AgentReachClient, get_web_research_client
 from .base import AgentBase

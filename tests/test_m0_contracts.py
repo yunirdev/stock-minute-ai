@@ -65,7 +65,7 @@ class TestContractsImport:
         pass
 
     def test_agent_context_creation(self, agent_context):
-        from trader.contracts import AgentContext
+        from trader.models import AgentContext
         assert isinstance(agent_context, AgentContext)
         assert len(agent_context.candidates) == 1
 
@@ -247,16 +247,10 @@ class TestPositionMonitor:
 
 
 # ---------------------------------------------------------------------------
-# 10. ai/agents — orchestrator + stub
+# 10. ai/agents
 # ---------------------------------------------------------------------------
 
 class TestAgents:
-    def test_orchestrator_returns_advisory(self, orchestrator, agent_context):
-        result = orchestrator.run(agent_context)
-        assert len(result) >= 1
-        # summary advisory 始终是第一个，agent 为 "orchestrator"
-        assert result[0].agent == "orchestrator"
-
     def test_stub_agent_returns_empty(self, agent_context):
         from trader.ai.agents.base import StubAgent
         stub = StubAgent("scout")
@@ -287,11 +281,3 @@ class TestAgents:
         for line in imports:
             assert "broker" not in line, f"agent base imports broker: {line}"
             assert "order_manager" not in line, f"agent base imports order_manager: {line}"
-
-    def test_orchestrator_does_not_import_broker_or_scheduler(self):
-        import inspect
-        import trader.ai.agents.orchestrator as orch_mod
-        imports = self._import_lines(inspect.getsource(orch_mod))
-        for line in imports:
-            assert "broker" not in line, f"orchestrator imports broker: {line}"
-            assert "scheduler" not in line, f"orchestrator imports scheduler: {line}"

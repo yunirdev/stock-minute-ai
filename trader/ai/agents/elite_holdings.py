@@ -34,7 +34,7 @@ import json
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from trader.contracts import AgentContext
+from trader.models import AgentContext
 from trader.models import Advisory
 from .base import AgentBase
 

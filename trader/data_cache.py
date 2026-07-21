@@ -432,7 +432,7 @@ def _alpaca_fetch_full(symbol: str, timeframe: str) -> pd.DataFrame:
 
 def upsert_bars(symbol: str, timeframe: str, df: pd.DataFrame) -> None:
     """Merge a fresh DataFrame from the live data feed into the in-memory cache
-    and flush to the local Parquet file.  Called by the Scheduler after each tick
+    and flush to the local Parquet file.  Called by the Runtime after each tick
     so that exploration/backtest panels always see the latest live bars."""
     if df is None or df.empty:
         return

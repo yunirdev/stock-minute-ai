@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-from trader.contracts import AgentContext
+from trader.models import AgentContext
 from trader.models import Advisory
 from .base import AgentBase
 

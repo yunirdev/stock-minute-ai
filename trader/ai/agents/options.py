@@ -24,7 +24,7 @@ import logging
 import math
 from typing import List, Optional, Tuple
 
-from trader.contracts import AgentContext
+from trader.models import AgentContext
 from trader.models import Advisory
 from .base import AgentBase
 

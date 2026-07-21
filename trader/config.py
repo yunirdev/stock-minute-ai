@@ -1,4 +1,4 @@
-﻿"""
+"""
 config.py
 Typed configuration.
 
@@ -22,7 +22,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 # Keep python-dotenv loading too, so plain os.getenv(...) elsewhere still works.
-# override=True: .env 是本项目唯一权威配置源（见 CLAUDE.md）。不加 override 时
+# override=True: .env 是本项目唯一权威配置源。不加 override 时
 # python-dotenv 默认让已存在的 OS/用户级环境变量"赢"，曾导致一个误设的系统级
 # FINNHUB_API_KEY（实际是粘错的 OpenAI key）静默覆盖 .env 里正确的值，且无任何报错提示。
 load_dotenv(_ENV_PATH, override=True)

@@ -1,8 +1,8 @@
-﻿"""
+"""
 trader/ai/manager.py
 AgentManager: 调度 agent，写入 DuckDB，返回 Advisory 列表。
 
-红线：只产出 Advisory；绝不调用 broker / order_manager / scheduler。
+红线：只产出 Advisory；绝不调用 broker / order execution。
 
 执行架构（双轨并行）：
   轨道 A（算法 agents，可并行）：quant / etf_flow / options / elite_holdings
@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from trader.contracts import AgentContext
+from trader.models import AgentContext
 from trader.models import Advisory, utc_now
 
 logger = logging.getLogger(__name__)

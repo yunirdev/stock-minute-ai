@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from typing import List
 
-from trader.contracts import AgentContext
+from trader.models import AgentContext
 from trader.data_cache import get_bars
 from trader.models import Advisory
 from trader.strategy_core import STRATEGY_OPTIONS, compute_signals

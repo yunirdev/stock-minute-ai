@@ -3,7 +3,7 @@ base.py
 Agent 基类 + StubAgent（通用空实现）。
 
 红线：agent 只产出 Advisory（status=DRAFT 的 TradePlan 包在 Advisory.payload 里）。
-      绝不 import broker / order_manager / scheduler。
+      绝不 import broker / order execution。
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from trader.contracts import AgentContext
+from trader.models import AgentContext
 from trader.models import Advisory, new_id, utc_now
 
 if TYPE_CHECKING:
