@@ -16,7 +16,7 @@ Web Research Agent：AI 自主生成搜索词 → 调 Agent-Reach CLI 抓取 →
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+from typing import Dict, List
 
 from trader.contracts import AgentContext
 from trader.models import Advisory
@@ -106,6 +106,12 @@ class WebResearchAgent(AgentBase):
         all_content += self._web.read_symbol_news(symbol, max_items=5)
         all_content += self._web.read_financial_rss(max_items_per_feed=3)
 
+        # Fintwit 大V 提及（优先级最高，放最前）
+        if self._use_twitter and self._web.has_twitter():
+            influencer_tweets = self._web.search_influencer_mentions(symbol, n_per_batch=3)
+            if influencer_tweets:
+                all_content = influencer_tweets + all_content
+
         for q in queries:
             query_str = q.get("query", "")
             purpose = q.get("purpose", "")
@@ -193,6 +199,7 @@ class WebResearchAgent(AgentBase):
             symbol, score, result.get("sentiment", "?"),
         )
 
+        fintwit_count = sum(1 for c in content_lines if c.startswith("[Fintwit]"))
         return self._advisory(
             kind="web_research",
             payload={
@@ -203,6 +210,8 @@ class WebResearchAgent(AgentBase):
                 "risk_flags": result.get("risk_flags", []),
                 "summary": result.get("summary", ""),
                 "sources_count": len(content_lines),
+                "fintwit_mentions": fintwit_count,
+                "fintwit_accounts": len(self._web.FINTWIT_INFLUENCERS),
                 "twitter_available": self._web.has_twitter(),
                 "reddit_available": self._web.has_reddit(),
             },

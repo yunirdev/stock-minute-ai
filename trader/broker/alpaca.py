@@ -1,13 +1,13 @@
-"""
+﻿"""
 broker/alpaca.py
-Alpaca æ‰§è¡Œé€‚é…å™¨ï¼ˆé»˜è®¤ paper è™šæ‹Ÿç›˜ï¼‰ã€‚
+Alpaca 执行适配器（默认 paper 虚拟盘）。
 
-å°è£… alpaca-py çš„ TradingClientã€‚`paper=True` ç”± SDK é”å®šåˆ° paper-api.alpaca.markets
-ï¼ˆè™šæ‹Ÿç›˜ã€çœŸå®žè¡Œæƒ…ã€ä¸ç¢°çœŸé’±ï¼‰ï¼›å®žç›˜éœ€æ˜¾å¼ `paper=False`ï¼ˆä¸” broker_type=alpaca_liveï¼‰ã€‚
+封装 alpaca-py 的 TradingClient。`paper=True` 由 SDK 锁定到 paper-api.alpaca.markets
+（虚拟盘、真实行情、不碰真钱）；实盘需显式 `paper=False`（且 broker_type=alpaca_live）。
 
 Alpaca order fills are asynchronous.
-place_order åªæäº¤è®¢å•å¹¶è¿”å›ž broker order idï¼›æ˜¯å¦æˆäº¤ç”± scheduler è½®è¯¢
-get_order_status / get_fill èŽ·å–ï¼ˆAlpaca ç”¨çœŸå®žè¡Œæƒ…æ’®åˆï¼Œå¯èƒ½æŽ’é˜Ÿã€éƒ¨åˆ†æˆäº¤ï¼‰ã€‚
+place_order 只提交订单并返回 broker order id；是否成交由 scheduler 轮询
+get_order_status / get_fill 获取（Alpaca 用真实行情撮合，可能排队、部分成交）。
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from .base import BrokerAdapter
 
 logger = logging.getLogger(__name__)
 
-# Alpaca è®¢å•çŠ¶æ€ â†’ å¹³å°ç»Ÿä¸€ OrderStatus
+# Alpaca 订单状态 → 平台统一 OrderStatus
 _STATUS_MAP = {
     "filled": OrderStatus.FILLED,
     "partially_filled": OrderStatus.PARTIAL,
@@ -49,16 +49,16 @@ def _side_of(raw) -> Side:
 
 
 class AlpacaBroker(BrokerAdapter):
-    """Alpaca æ‰§è¡Œé€‚é…å™¨ã€‚é»˜è®¤ paperï¼ˆè™šæ‹Ÿç›˜ï¼‰ã€‚å®žçŽ° BrokerAdapter å…¨éƒ¨æŽ¥å£ã€‚"""
+    """Alpaca 执行适配器。默认 paper（虚拟盘）。实现 BrokerAdapter 全部接口。"""
 
     def __init__(self, api_key: str, secret_key: str, paper: bool = True) -> None:
         if not api_key or not secret_key:
             raise ValueError(
-                "AlpacaBroker éœ€è¦ ALPACA_API_KEY / ALPACA_API_SECRETï¼ˆè¯·å¡«å…¥ .envï¼‰")
-        from alpaca.trading.client import TradingClient  # å»¶è¿Ÿå¯¼å…¥ï¼Œæœªè£…æ—¶ä¸å½±å“å…¶å®ƒ broker
+                "AlpacaBroker 需要 ALPACA_API_KEY / ALPACA_API_SECRET（请填入 .env）")
+        from alpaca.trading.client import TradingClient  # 延迟导入，未装时不影响其它 broker
         self._client = TradingClient(api_key, secret_key, paper=paper)
         self._paper = paper
-        logger.info("AlpacaBroker å·²è¿žæŽ¥ (%s)", "PAPER è™šæ‹Ÿç›˜" if paper else "LIVE å®žç›˜")
+        logger.info("AlpacaBroker 已连接 (%s)", "PAPER 虚拟盘" if paper else "LIVE 实盘")
 
     # ------------------------------------------------------------------
     # BrokerAdapter implementation
@@ -72,19 +72,19 @@ class AlpacaBroker(BrokerAdapter):
         qty = max(int(intent.qty), 1)
         tif = TimeInForce.DAY
 
-        # çº¢çº¿ï¼šé»˜è®¤åªä¸‹ LMTï¼›MKT ä»…åœ¨ intent æ˜Žç¡®è¦æ±‚ä¸”æ— é™ä»·æ—¶
+        # 红线：默认只下 LMT；MKT 仅在 intent 明确要求且无限价时
         if intent.order_type == "MKT" and intent.limit_price is None:
-            req = MarketOrderRequest(symbol=intent.symbol, qty=qty, side=side, time_in_force=tif)
+            req = MarketOrderRequest(symbol=intent.symbol, qty=qty, side=side, time_in_force=tif, client_order_id=intent.client_order_id or None)
         else:
             px = intent.limit_price if intent.limit_price else intent.reference_price
             if not px or px <= 0:
-                raise ValueError(f"LMT å•éœ€è¦æœ‰æ•ˆ limit_price: {intent.symbol}")
+                raise ValueError(f"LMT 单需要有效 limit_price: {intent.symbol}")
             req = LimitOrderRequest(symbol=intent.symbol, qty=qty, side=side,
-                                    time_in_force=tif, limit_price=round(float(px), 2))
+                                    time_in_force=tif, limit_price=round(float(px), 2), client_order_id=intent.client_order_id or None)
 
         order = self._client.submit_order(req)
         bid = str(order.id)
-        logger.info("ðŸ“¨ ALPACA æäº¤ %s %s qty=%d type=%s id=%s",
+        logger.info("📨 ALPACA 提交 %s %s qty=%d type=%s id=%s",
                     intent.side.value, intent.symbol, qty, intent.order_type, bid)
         return bid
 
@@ -93,7 +93,7 @@ class AlpacaBroker(BrokerAdapter):
             self._client.cancel_order_by_id(broker_order_id)
             return True
         except Exception as exc:
-            logger.warning("ALPACA æ’¤å•å¤±è´¥ %s: %s", broker_order_id, exc)
+            logger.warning("ALPACA 撤单失败 %s: %s", broker_order_id, exc)
             return False
 
     def get_order_status(self, broker_order_id: str) -> OrderStatus:
@@ -101,14 +101,14 @@ class AlpacaBroker(BrokerAdapter):
             o = self._client.get_order_by_id(broker_order_id)
             return _map_status(o.status)
         except Exception as exc:
-            logger.warning("ALPACA æŸ¥è¯¢è®¢å•å¤±è´¥ %s: %s", broker_order_id, exc)
+            logger.warning("ALPACA 查询订单失败 %s: %s", broker_order_id, exc)
             return OrderStatus.FAILED
 
     def get_fill(self, broker_order_id: str) -> Optional[Fill]:
         try:
             o = self._client.get_order_by_id(broker_order_id)
         except Exception as exc:
-            logger.warning("ALPACA æŸ¥è¯¢æˆäº¤å¤±è´¥ %s: %s", broker_order_id, exc)
+            logger.warning("ALPACA 查询成交失败 %s: %s", broker_order_id, exc)
             return None
         filled_qty = float(o.filled_qty or 0)
         if filled_qty <= 0:
@@ -120,6 +120,28 @@ class AlpacaBroker(BrokerAdapter):
             broker_payload={"alpaca_status": str(getattr(o.status, "value", o.status))},
         )
 
+    def get_open_orders(self) -> List[dict]:
+        try:
+            orders = self._client.get_orders()
+            return [{"id": str(o.id), "client_order_id": getattr(o, "client_order_id", None), "status": str(getattr(o.status, "value", o.status))} for o in orders]
+        except Exception as exc:
+            logger.warning("ALPACA open order reconciliation failed: %s", type(exc).__name__)
+            raise
+
+    def get_recent_fills(self) -> List[Fill]:
+        try:
+            orders = self._client.get_orders()
+            fills = []
+            for o in orders:
+                if float(getattr(o, "filled_qty", 0) or 0) > 0:
+                    fill = self.get_fill(str(o.id))
+                    if fill:
+                        fills.append(fill)
+            return fills
+        except Exception as exc:
+            logger.warning("ALPACA fill reconciliation failed: %s", type(exc).__name__)
+            raise
+
     def get_positions(self) -> List[Position]:
         out: List[Position] = []
         try:
@@ -130,7 +152,7 @@ class AlpacaBroker(BrokerAdapter):
                     unrealized_pnl=float(getattr(p, "unrealized_pl", 0) or 0),
                 ))
         except Exception as exc:
-            logger.warning("ALPACA æŸ¥è¯¢æŒä»“å¤±è´¥: %s", exc)
+            logger.warning("ALPACA 查询持仓失败: %s", exc)
         return out
 
     def get_account_equity(self) -> float:
@@ -138,6 +160,5 @@ class AlpacaBroker(BrokerAdapter):
             acct = self._client.get_account()
             return float(acct.equity)
         except Exception as exc:
-            logger.warning("ALPACA æŸ¥è¯¢æƒç›Šå¤±è´¥: %s", exc)
+            logger.warning("ALPACA 查询权益失败: %s", exc)
             return 0.0
-

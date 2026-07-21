@@ -1,4 +1,4 @@
-"""
+﻿"""
 config.py
 Typed configuration.
 
@@ -22,7 +22,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 # Keep python-dotenv loading too, so plain os.getenv(...) elsewhere still works.
-load_dotenv(_ENV_PATH)
+# override=True: .env 是本项目唯一权威配置源（见 CLAUDE.md）。不加 override 时
+# python-dotenv 默认让已存在的 OS/用户级环境变量"赢"，曾导致一个误设的系统级
+# FINNHUB_API_KEY（实际是粘错的 OpenAI key）静默覆盖 .env 里正确的值，且无任何报错提示。
+load_dotenv(_ENV_PATH, override=True)
 
 
 class Settings(BaseSettings):
@@ -87,5 +90,24 @@ class TradingConfig(BaseModel):
     # ---- Pending-order / gap-fill -------------------------------------------
     pending_order_max_bars: int = 10
 
-    # ---- Execution gate (红线：默认关；只挂 LMT；需人工确认后再开) -----------
-    execution_enabled: bool = False
+    # ---- AI 自动虚拟盘交易 -------------------------------------------------------
+    # auto_trade_paper=True：
+    #   · 从 ai_score_db 读取最新 AI 综合分（0-100）
+    #   · 分数 ≥ min_ai_score 且确定性风控通过后下 LMT 单到 Alpaca paper
+    #   · 分数 < min_ai_score 或 DB 无数据 → REJECTED（不执行）
+    auto_trade_paper: bool = False
+    min_ai_score: int = 65               # AI 综合分达标线（≥ 此分才下单）
+    ai_score_db: str = "ai_states.duckdb"  # AI 评分来源（monitor 写，runtime 读）
+
+
+    ai_score_max_age_minutes: float = 30.0
+    paper_decision_enabled: bool = False
+    paper_decision_shadow_mode: bool = True
+    allow_quant_without_ai: bool = False
+    strategy_statistics_path: str = "conf/strategy_statistics.json"
+    universe_max_symbols: int = 20
+    universe_max_age_minutes: int = 1440
+
+    def model_post_init(self, __context: object) -> None:
+        if self.auto_trade_paper and self.broker_type != 'alpaca_paper':
+            raise ValueError('AUTO_TRADE_REQUIRES_ALPACA_PAPER')

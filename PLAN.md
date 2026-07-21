@@ -17,13 +17,13 @@
 
 一个**本地优先、决策优先、AI 辅助**的个人美股交易平台。核心价值不是"更多策略/指标"，而是：
 
-> **把多个信号源（TA 策略 + 未来 AI 模型）收敛成少量「可审核的交易计划」**，常驻运行、定时+异动推送到 Discord，人审核（或按开关自动）后执行；最终走向自动量化 + 自动实盘。
+> **把多个信号源（TA 策略 + AI 模型）收敛成少量可执行交易计划**，常驻运行、定时+异动推送到 Discord，并在 Alpaca Paper 中自动执行。
 
 关键特征：
 1. **决策优先**：第一屏是"今天买什么/卖什么/为什么"，不是引擎状态。
-2. **收敛而非叠加**：多策略 → 共识 → 少量计划。解决"单指标太多、审核不过来"。
+2. **收敛而非叠加**：多策略 → 共识 → 少量计划，减少噪声与重复交易。
 3. **纪律化下单**：核心产物是 `TradePlan`（入手价/止损/止盈/持有），**不下 market order**。
-4. **人在回路 → 自动**：先 paper + 人工审核，信任建立后逐步放开自动实盘。
+4. **自动模拟盘**：只在 Alpaca Paper 自动执行；实盘不在当前范围。
 5. **AI 是旁路**：AI 产出建议/计划/复盘，**永不直接下单**，必须过确定性的风控层。
 
 ---
@@ -43,7 +43,7 @@ data   select strat   plan       allocator    risk        exec   monitor
 AI 旁路: 多 agent (ai/agents) ──────┘    产出 Advisory / TradePlan(DRAFT)
 
 输出:    Discord 推送 (notify) · UI 审阅 (monitor) · 账本审计 (portfolio/audit)
-复盘:    review (盘后归因) · watchdog (健康看门狗) · 人在回路确认 (approval)
+复盘:    review (盘后归因) · watchdog (健康看门狗) · kill_switch (急停)
 驱动:    runtime (定时 + 异动触发 + 交易日历时段)
 ```
 
@@ -104,7 +104,7 @@ class TradePlan:
     confidence: float = 1.0
     rationale: str = ""                # 为什么：哪些信号/agent/新闻
     source: str = "consensus"          # consensus | ai | manual
-    status: str = "DRAFT"              # DRAFT | APPROVED | REJECTED | LIVE | CLOSED
+    status: str = "DRAFT"              # DRAFT | READY | DRY_RUN | REJECTED | SHADOW | LIVE | CLOSED
     created_at: datetime = field(default_factory=utc_now)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -158,7 +158,7 @@ class Notification:
     body: str
     kind: str = "info"                 # selection | plan | review | news | alert | info
     fields: Dict[str, Any] = field(default_factory=dict)
-    plan_id: Optional[str] = None      # 若是计划，带上以支持 Discord/UI 一键审批
+    plan_id: Optional[str] = None      # 若是计划，带上以支持审计追踪
 ```
 
 **数据流串联**（agent 必须遵守的产物链）：
@@ -167,8 +167,8 @@ NewsEvent ─┐
            ├─> Candidate ─> Signal ─> TradePlan(DRAFT)
 Bar ───────┘                              │
                                           ├─ allocator 填 target_weight/qty
-                                          ├─ RiskEngine 审 → status=APPROVED/REJECTED
-                                          ├─ approval(人/开关) → status=APPROVED
+                                          ├─ AI safety + RiskEngine → READY/REJECTED
+                                          ├─ 未开自动交易 → DRY_RUN
                                           └─ order_manager → OrderIntent(LMT) → Broker → Fill
 Advisory  ── 旁路，喂 selection/plan/review/notify，不进执行
 ```
@@ -244,9 +244,9 @@ def check_portfolio(self, positions: dict[str, Position], equity: float) -> Opti
 
 ### 5.7 `execution` — 执行（🟡 强化现有 order_manager + broker）
 - 文件：`trader/order_manager.py`（强化）
-- 职责：APPROVED 的 TradePlan → `OrderIntent(order_type="LMT")` → Broker；管理订单状态机（未成交/超时/改撤），复用现有 `PendingOrder`。
-- 红线：**只下 LMT**，不下 MKT；`live` 模式需 `config` 开关开启。
-- 验收：APPROVED 计划生成 LMT OrderIntent；超时挂单按 `PendingOrder.max_bars_alive` 撤销。
+- 职责：AI 安全门与风控通过的 READY TradePlan → `OrderIntent(order_type="LMT")` → Broker；管理订单状态机（未成交/超时/改撤），复用现有 `PendingOrder`。
+- 红线：**只下 LMT**，不下 MKT；自动执行仅允许 Alpaca Paper。
+- 验收：READY 计划生成 LMT OrderIntent；超时挂单按 `PendingOrder.max_bars_alive` 撤销。
 
 ### 5.8 `notify` — 推送（🟡 基础版）
 - 文件：`trader/notify.py`
@@ -310,20 +310,11 @@ class KillSwitch(Protocol):
 - 职责：常驻循环；按 calendar 时段 + 定时 + news 异动**触发**一轮 pipeline：
 ```
 每轮: kill_switch?→ watchdog → news.poll → (盘前)selection → plan → allocator
-      → portfolio_manager → risk → approval(人/开关) → execution → portfolio
+      → portfolio_manager → AI safety → risk → execution/DRY_RUN → portfolio
       → (盘中)position_monitor → (盘后)review → notify
 ```
-- 红线：execution 仅在 `config.execution.enabled` 且 `not kill_switch.engaged()` 时进行；默认 paper。
+- 红线：仅 `auto_trade_paper=True`、Alpaca Paper 且 `not kill_switch.engaged()` 时执行。
 - 验收：能在本地跑通一轮（paper），各阶段有日志 + 关键产物落审计；kill_switch/halt 时跳过下单。
-
-### 5.15 `approval` — 人在回路（🟡 基础版）
-- 文件：`trader/approval.py`
-```python
-class Approver(Protocol):
-    def decide(self, plan: TradePlan) -> str: ...   # APPROVED | REJECTED | PENDING
-```
-- 基础版：`AutoApprover`（按 config 开关：关=全部 PENDING 等人审；开=按规则自动 APPROVED）+ 记录到审计。Discord/UI 一键审批后续接入。
-- 验收：开关关闭时计划停在 PENDING（不下单）；开启时按规则放行。
 
 ---
 
@@ -346,7 +337,7 @@ class Approver(Protocol):
 
 批次 1（全并行，只依赖契约）：
   selection · plan · allocator · notify · news · review
-  · universe · market_calendar · watchdog · ai/agents · approval
+  · universe · market_calendar · watchdog · ai/agents
 
 批次 2（依赖批次1接口）：
   portfolio_manager · position_monitor · execution(order_manager 强化) · risk(扩展)
@@ -355,7 +346,7 @@ class Approver(Protocol):
   runtime 编排串联 · UI 决策台/选股池接 selection/plan · kill_switch 接入
 
 批次 4（未来）：
-  实盘 broker 适配器 · Discord/UI 交互式审批 · 多源数据(基本面/情绪/期权)
+  自动模拟盘恢复/回放 · 多源数据(基本面/情绪/期权)
 ```
 
 ### 6.3 Agent 工单模板
@@ -381,18 +372,18 @@ class Approver(Protocol):
 | **M1** | 主链 paper 跑通：selection→plan→allocator→risk→execution→portfolio | runtime 在本地跑完一轮，审计有记录（paper） |
 | **M2** | 组合与盯盘：allocator 真分配 + position_monitor 止损止盈 + 多层 risk | 构造行情能触发止损平仓 |
 | **M3** | 旁路：notify(Discord) + news(异动) + review(复盘) + ai/orchestrator | 一轮结束推送选股/计划/复盘到 console/Discord |
-| **M4** | 人在回路：approval + watchdog + kill_switch + UI 接真实决策数据 | 计划默认 PENDING 待审；急停可跳过下单；UI 决策台显示真实 Candidate/TradePlan |
-| **M5** | 自动实盘（未来）：实盘 broker 适配器 + 交互式审批 + 自动开关分级放开 | 实盘适配器通过 paper↔live 切换测试；默认仍 paper |
+| **M4** | AI 自动模拟盘：AI safety + watchdog + kill_switch + UI 接真实决策数据 | 达标计划自动执行；急停可跳过下单；UI 显示真实 Candidate/TradePlan |
+| **M5** | 自动模拟盘强化：恢复、对账、回放和风险参数校准 | 故障恢复与订单对账测试通过；仍严格限制为 paper |
 
 ---
 
 ## 8. 安全护栏（红线，写进每个相关模块）
 
 1. **AI 不下单**：agent/LLM 只产出 `Advisory` 或 `TradePlan(status=DRAFT)`；任何下单路径都不得从 ai/ 直接发起。
-2. **执行需开关 + 非急停**：`execution` 仅在 `config.execution.enabled and not kill_switch.engaged()` 时进行；默认 paper broker。
+2. **仅自动模拟盘 + 非急停**：仅 `auto_trade_paper`、paper broker 且未触发 kill switch 时执行。
 3. **只挂 LMT**：不下 market order（用户要求 + 更稳）。
 4. **多层风控前置**：pre-trade + 计划级 + 组合级 + 日内回撤 + 连败熔断，任一拒绝即不执行。
-5. **人在回路默认开**：`approval` 默认让计划停在 PENDING；自动放行需显式配置并分级。
+5. **AI 安全门**：评分缺失、过期或不足时直接拒绝，不能进入订单路径。
 6. **paper/live 隔离**：环境通过 config 明确切换，UI 显著标识当前环境，防误操作。
 7. **密钥不入库**：webhook/broker key 只从 `.env`/config 读；`.env` 已 gitignore；日志/推送不打印密钥。
 8. **审计可追溯**：每个 TradePlan 落审计时记录 rationale（哪些信号/agent/新闻）。
@@ -415,7 +406,6 @@ trader/
   risk_engine.py       # 多层风控（扩展）
   order_manager.py  broker/           # 执行层
   position_monitor.py  # 盯盘
-  approval.py          # 人在回路
   notify.py            # 推送
   news.py              # 新闻/异动
   review.py            # 复盘
@@ -454,15 +444,14 @@ PLAN.md                # 本文件
 - [ ] plan 产出 entry/stop/tp 齐全的 TradePlan
 - [ ] allocator 等权+上限分配，总权重 ≤ 1
 - [ ] risk 计划级 + 组合级审查可拒绝不合理计划
-- [ ] execution 只下 LMT，受开关+急停控制
+- [ ] execution 只下 LMT，仅允许 AI 自动模拟盘且受急停控制
 - [ ] position_monitor 能触发止损/止盈平仓计划
 - [ ] notify 推送到 console，Discord 无 URL 时降级
 - [ ] news PriceMove 源从 bars 产异动事件
 - [ ] review 产出复盘报告
 - [ ] ai/orchestrator 跑通、只产 Advisory、零下单调用
 - [ ] watchdog + kill_switch：异常告警 + 急停阻断执行
-- [ ] approval 默认 PENDING（不自动下单）
-- [ ] runtime 串联跑通一轮（paper），审计有记录
+- [ ] runtime 串联 AI safety → risk → READY/DRY_RUN → LMT（paper），审计有记录
 - [ ] UI 决策台/选股池接真实 selection/plan
 - [ ] 安全护栏 §8 全部生效
 ```

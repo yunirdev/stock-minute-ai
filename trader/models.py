@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -85,6 +85,10 @@ class OrderIntent:
     tif: str = "DAY"
     risk_tag: str = ""
     created_at: datetime = field(default_factory=utc_now)
+    idempotency_key: str = ""
+    client_order_id: str = ""
+    decision_id: str = ""
+    plan_id: str = ""
 
 
 @dataclass
@@ -170,7 +174,7 @@ class TradePlan:
     confidence: float = 1.0
     rationale: str = ""                 # 为什么：哪些信号/agent/新闻
     source: str = "consensus"           # consensus | ai | manual
-    status: str = "DRAFT"              # DRAFT | APPROVED | REJECTED | LIVE | CLOSED
+    status: str = "DRAFT"              # DRAFT | READY | DRY_RUN | REJECTED | SHADOW | LIVE | CLOSED
     created_at: datetime = field(default_factory=utc_now)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -229,4 +233,4 @@ class Notification:
     body: str
     kind: str = "info"                  # selection | plan | review | news | alert | info
     fields: Dict[str, Any] = field(default_factory=dict)
-    plan_id: Optional[str] = None       # 若是计划推送，带 plan_id 支持一键审批
+    plan_id: Optional[str] = None       # 若是计划推送，带 plan_id 支持审计追踪

@@ -1,4 +1,4 @@
-"""
+﻿"""
 portfolio.py
 In-memory portfolio state with DuckDB-backed persistence.
 
@@ -74,7 +74,16 @@ class Portfolio:
     # ------------------------------------------------------------------
 
     def apply_fill(self, fill: Fill) -> None:
-        """Update cash and position based on a confirmed fill."""
+        """Apply only the newly observed cumulative fill quantity."""
+        conn = self._connect()
+        try:
+            prior = conn.execute("SELECT COALESCE(SUM(filled_qty), 0) FROM fills WHERE order_id=?", [fill.order_id]).fetchone()[0]
+        finally:
+            conn.close()
+        delta = max(0.0, float(fill.filled_qty) - float(prior))
+        if delta <= 0:
+            return
+        fill.filled_qty = delta
         qty = fill.filled_qty
         px = fill.avg_price
         symbol = fill.symbol

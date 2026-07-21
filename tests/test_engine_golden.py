@@ -84,3 +84,18 @@ def test_engine_next_open_vs_close():
     r_open = simulate(d, capital=CAPITAL, fill="next_open")
     r_close = simulate(d, capital=CAPITAL, fill="close")
     assert r_open.final_equity > 0 and r_close.final_equity > 0
+
+
+def test_engine_slippage_is_adverse_on_both_legs():
+    from trader.engine import simulate
+
+    df = make_synthetic_bars(n=3)
+    df['strat_signal'] = [1, -1, 0]
+    df['strat_exec_px'] = np.nan
+
+    clean = simulate(df, capital=CAPITAL)
+    slipped = simulate(df, capital=CAPITAL, slippage_bps=10)
+
+    assert slipped.trades[0].price > clean.trades[0].price
+    assert slipped.trades[1].price < clean.trades[1].price
+    assert slipped.final_equity < clean.final_equity

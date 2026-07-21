@@ -25,7 +25,6 @@ from .models import (
     Position,
     ReviewReport,
     RiskVerdict,
-    Signal,
     TradePlan,
 )
 
@@ -227,13 +226,3 @@ class UniverseProvider(Protocol):
 class MarketCalendar(Protocol):
     """返回当前美股交易时段。"""
     def session_now(self) -> str: ...   # "pre" | "open" | "post" | "closed"
-
-
-# ---------------------------------------------------------------------------
-# 5.15  approval — 人在回路
-# ---------------------------------------------------------------------------
-
-@runtime_checkable
-class Approver(Protocol):
-    """判断 TradePlan 是否放行；默认 PENDING（不下单）。"""
-    def decide(self, plan: TradePlan) -> str: ...  # APPROVED | REJECTED | PENDING

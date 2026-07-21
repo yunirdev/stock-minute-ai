@@ -1,4 +1,4 @@
-"""
+﻿"""
 broker/base.py
 Abstract interface that all broker adapters must implement.
 """
@@ -43,6 +43,14 @@ class BrokerAdapter(ABC):
     @abstractmethod
     def get_fill(self, broker_order_id: str) -> Optional[Fill]:
         """Return fill details once an order is filled/partially filled."""
+
+    def get_open_orders(self) -> List[dict]:
+        """Return broker open orders when supported; empty keeps old adapters compatible."""
+        return []
+
+    def get_recent_fills(self) -> List[Fill]:
+        """Return recent broker fills when supported."""
+        return []
 
     @abstractmethod
     def get_positions(self) -> List[Position]:

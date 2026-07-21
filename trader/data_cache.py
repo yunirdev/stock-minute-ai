@@ -21,7 +21,6 @@ trader/data_cache.py
 from __future__ import annotations
 
 import logging
-import os
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -93,6 +92,45 @@ def _parquet_path(symbol: str, timeframe: str) -> Path:
     return _BARS_DIR / f"{symbol}_{timeframe}.parquet"
 
 
+def _write_parquet(path: Path, df: pd.DataFrame) -> None:
+    try:
+        df.to_parquet(path, index=False, engine="pyarrow")
+        return
+    except ImportError:
+        pass
+
+    import duckdb
+
+    con = duckdb.connect(":memory:")
+    try:
+        con.register("bars_df", df)
+        target = path.as_posix().replace("'", "''")
+        con.execute(f"COPY bars_df TO '{target}' (FORMAT PARQUET)")
+    finally:
+        con.close()
+
+
+def _read_parquet(path: Path, columns: Optional[list[str]] = None) -> pd.DataFrame:
+    try:
+        return pd.read_parquet(path, engine="pyarrow", columns=columns)
+    except ImportError:
+        pass
+
+    import duckdb
+
+    col_sql = "*"
+    if columns:
+        col_sql = ", ".join(f'"{col}"' for col in columns)
+    con = duckdb.connect(":memory:")
+    try:
+        return con.execute(
+            f"SELECT {col_sql} FROM read_parquet(?)",
+            [str(path)],
+        ).df()
+    finally:
+        con.close()
+
+
 def _save_to_disk(symbol: str, timeframe: str, df: pd.DataFrame) -> None:
     """保存 DataFrame 到本地 Parquet 文件。"""
     if df.empty:
@@ -102,7 +140,7 @@ def _save_to_disk(symbol: str, timeframe: str, df: pd.DataFrame) -> None:
         out = df.copy()
         out["timestamp_utc"] = pd.to_datetime(out["timestamp_utc"], utc=True)
         out["timestamp"] = out["timestamp_utc"]
-        out.to_parquet(path, index=False, engine="pyarrow")
+        _write_parquet(path, out)
         logger.info("data_cache saved %s %s → %s (%d rows)", symbol, timeframe, path.name, len(out))
     except Exception as exc:
         logger.warning("data_cache save_disk %s %s: %s", symbol, timeframe, exc)
@@ -114,7 +152,7 @@ def _load_from_disk(symbol: str, timeframe: str) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
     try:
-        df = pd.read_parquet(path, engine="pyarrow")
+        df = _read_parquet(path)
         df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
         df["timestamp"] = df["timestamp_utc"]
         logger.info("data_cache load_disk %s %s ← %s (%d rows)", symbol, timeframe, path.name, len(df))
@@ -300,7 +338,7 @@ def list_cached_files() -> list:
     result = []
     for f in sorted(_BARS_DIR.glob("*.parquet")):
         try:
-            df = pd.read_parquet(f, engine="pyarrow", columns=["timestamp_utc"])
+            df = _read_parquet(f, columns=["timestamp_utc"])
             df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
             mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
             result.append({
@@ -315,6 +353,11 @@ def list_cached_files() -> list:
             result.append({"文件": f.name, "行数": "?", "起始": "?",
                            "截止": "?", "更新时间": "?", "大小(KB)": "?"})
     return result
+
+
+def list_cached_names() -> list[str]:
+    """只列缓存文件名，不读取 Parquet 内容。"""
+    return sorted(path.name for path in _BARS_DIR.glob("*.parquet"))
 
 
 # Timeframes Alpaca supports for bar history (1m excluded — free plan too shallow).

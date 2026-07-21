@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List
 
@@ -38,7 +38,7 @@ class HeartbeatWatchdog:
             import duckdb
             conn = duckdb.connect(self._db_path, read_only=True)
             row = conn.execute(
-                "SELECT MAX(ts) FROM audit_heartbeats"
+                "SELECT MAX(ts) FROM heartbeat"
             ).fetchone()
             conn.close()
             if row and row[0]:
@@ -59,7 +59,7 @@ class HeartbeatWatchdog:
                 alerts.append(Alert(
                     level="warn",
                     source="watchdog",
-                    message="audit_heartbeats 表为空或不存在",
+                    message="heartbeat 表为空或不存在",
                 ))
         except Exception as exc:
             logger.warning("watchdog 检查失败: %s", exc)

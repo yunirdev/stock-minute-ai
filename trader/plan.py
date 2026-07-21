@@ -11,7 +11,7 @@ plan.py
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import numpy as np
 
@@ -54,14 +54,24 @@ class ATRPlanner:
         latest_bar: Bar,
         params: Dict[str, Any] | None = None,
         current_qty: float = 0.0,
+        bars_history: "list[Bar] | None" = None,
     ) -> TradePlan:
         p = {**self._params, **(params or {})}
         k = float(p.get("atr_multiplier", 1.5))
         rr = float(p.get("rr_ratio", 2.0))
         atr_period = int(p.get("atr_period", 14))
 
-        # 用单 bar 的 range 做简化 ATR（无历史 bars 时 fallback）
-        atr = max(latest_bar.high - latest_bar.low, latest_bar.close * 0.01)
+        # 有足够历史 bar 时算真正的 ATR(atr_period)；否则退化为单 bar range
+        # （之前 atr_period 这个配置项读了却完全没用上，stop/tp 一直是用单
+        #   bar 的 high-low 估的，比真实 ATR14 噪声大很多）。
+        if bars_history and len(bars_history) >= 2:
+            closes = [b.close for b in bars_history] + [latest_bar.close]
+            highs  = [b.high  for b in bars_history] + [latest_bar.high]
+            lows   = [b.low   for b in bars_history] + [latest_bar.low]
+            atr = _atr(closes, highs, lows, period=atr_period)
+        else:
+            # 用单 bar 的 range 做简化 ATR（无历史 bars 时 fallback）
+            atr = max(latest_bar.high - latest_bar.low, latest_bar.close * 0.01)
 
         side = Side.BUY if cand.score >= 50 else Side.SELL
         entry = latest_bar.close

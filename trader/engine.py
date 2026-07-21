@@ -121,6 +121,7 @@ def simulate(
     leverage: float = 1.0,
     allow_short: bool = False,
     fee_bps: float = 0.0,
+    slippage_bps: float = 0.0,
     max_position_pct: float = 1.0,
     fill: str = "next_open",        # "next_open"(诚实,默认) | "close"(对照旧引擎)
     risk_halt: bool = False,        # 是否启用日内回撤熔断
@@ -150,6 +151,7 @@ def simulate(
 
     L = max(float(leverage), 1.0)
     fee_rate = max(float(fee_bps), 0.0) / 10_000.0
+    slippage_rate = max(float(slippage_bps), 0.0) / 10_000.0
     use_next_open = (fill != "close")
 
     cash = capital
@@ -173,6 +175,10 @@ def simulate(
         nonlocal cash, pos_qty, avg_entry, realized_total
         px = _finite_px(price)
         if px is None:
+            return
+        # Adverse single-leg slippage: buys pay more, sells receive less.
+        px *= 1.0 + slippage_rate if direction > 0 else 1.0 - slippage_rate
+        if px <= 0:
             return
         # 目标仓位规模: max_position_pct * equity / price * leverage(整股)
         equity_now = _equity_at(px)

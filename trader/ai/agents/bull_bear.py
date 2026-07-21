@@ -87,30 +87,53 @@ class BullBearDebate(AgentBase):
                         self._min_score)
             return []
 
-        # 聚合 advisory 信号作为辩论上下文
-        tech_payload = {
-            a.payload["symbol"]: a.payload
-            for a in ctx.extra.get("technical_advisories", [])
-            if "symbol" in a.payload
-        } if ctx.extra else {}
-        news_payload = {
-            a.payload["symbol"]: a.payload
-            for a in ctx.extra.get("news_advisories", [])
-            if "symbol" in a.payload
-        } if ctx.extra else {}
+        # 聚合全部 Phase 1 advisory 信号作为辩论上下文
+        def _by_sym(key: str) -> Dict[str, Any]:
+            return {
+                a.payload["symbol"]: a.payload
+                for a in ctx.extra.get(key, [])
+                if "symbol" in a.payload
+            } if ctx.extra else {}
+
+        tech_payload      = _by_sym("technical_advisories")
+        news_payload      = _by_sym("news_advisories")
+        macro_payload     = _by_sym("macro_advisories")
+        fundamental_payload = _by_sym("fundamental_advisories")
+        quant_payload     = _by_sym("quant_advisories")
+        etf_payload       = _by_sym("etf_flow_advisories")
+        options_payload   = _by_sym("options_advisories")
+        elite_payload     = _by_sym("elite_advisories")
 
         advisories: List[Advisory] = []
         for cand in top:
             try:
-                adv = self._debate(cand, tech_payload, news_payload)
+                adv = self._debate(
+                    cand,
+                    tech=tech_payload, news=news_payload,
+                    macro=macro_payload, fundamental=fundamental_payload,
+                    quant=quant_payload, etf=etf_payload,
+                    options=options_payload, elite=elite_payload,
+                )
                 advisories.append(adv)
             except Exception as exc:
                 logger.warning("BullBearDebate 跳过 %s: %s", cand.symbol, exc)
         return advisories
 
-    def _debate(self, cand, tech: Dict, news: Dict) -> Advisory:
+    def _debate(
+        self, cand,
+        tech: Dict, news: Dict,
+        macro: Dict = None, fundamental: Dict = None,
+        quant: Dict = None, etf: Dict = None,
+        options: Dict = None, elite: Dict = None,
+    ) -> Advisory:
         sym = cand.symbol
-        context = self._build_context(sym, cand, tech.get(sym, {}), news.get(sym, {}))
+        context = self._build_context(
+            sym, cand,
+            tech.get(sym, {}), news.get(sym, {}),
+            (macro or {}).get(sym, {}), (fundamental or {}).get(sym, {}),
+            (quant or {}).get(sym, {}), (etf or {}).get(sym, {}),
+            (options or {}).get(sym, {}), (elite or {}).get(sym, {}),
+        )
 
         bull = self._llm_json(
             self._client, _BULL_SYSTEM, f"Analyze {sym}:\n{context}",
@@ -192,8 +215,53 @@ class BullBearDebate(AgentBase):
         )
 
     @staticmethod
-    def _build_context(sym: str, cand, tech: Dict, news: Dict) -> str:
+    def _build_context(
+        sym: str, cand,
+        tech: Dict, news: Dict,
+        macro: Dict, fundamental: Dict,
+        quant: Dict, etf: Dict,
+        options: Dict, elite: Dict,
+    ) -> str:
         lines = [f"Symbol: {sym}", f"Consensus score: {cand.score:.1f}/100"]
+
+        if macro:
+            lines.append(
+                f"Macro: regime={macro.get('regime','?')} "
+                f"vix={macro.get('vix_level','?')} "
+                f"score={macro.get('macro_score','?')}"
+            )
+        if fundamental:
+            lines.append(
+                f"Fundamental: valuation={fundamental.get('valuation','?')} "
+                f"growth={fundamental.get('growth_quality','?')} "
+                f"score={fundamental.get('fundamental_score','?')}"
+            )
+        if quant:
+            lines.append(
+                f"Quant: mom_1m={quant.get('momentum_1m_pct','?')}% "
+                f"mom_3m={quant.get('momentum_3m_pct','?')}% "
+                f"rsi={quant.get('rsi','?')} "
+                f"score={quant.get('quant_score','?')}"
+            )
+        if options:
+            lines.append(
+                f"Options: pcr={options.get('pcr_vol','?')} "
+                f"iv={options.get('atm_iv_pct','?')}% "
+                f"sentiment={options.get('sentiment','?')} "
+                f"score={options.get('options_score','?')}"
+            )
+        if etf:
+            lines.append(
+                f"ETF Flow: market={etf.get('market_flow','?')} "
+                f"sector_flow={etf.get('sector_flow','?')} "
+                f"score={etf.get('etf_score','?')}"
+            )
+        if elite:
+            lines.append(
+                f"Elite Holdings: stance={elite.get('stance','?')} "
+                f"signals={elite.get('signals',[])} "
+                f"score={elite.get('elite_score','?')}"
+            )
         if tech:
             lines.append(
                 f"Technical: trend={tech.get('trend','?')} "
@@ -206,6 +274,7 @@ class BullBearDebate(AgentBase):
                 f"score={news.get('news_score','?')} "
                 f"catalysts={news.get('catalysts',[])}"
             )
+
         votes = cand.reasons.get("votes", {})
         if votes:
             lines.append(

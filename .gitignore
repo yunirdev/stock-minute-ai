@@ -38,3 +38,23 @@ out.txt
 .nicegui/
 sessions/
 .last30days/
+archive/
+.tmp/
+
+# Local tooling / generated package metadata
+.serena/
+*.egg-info/
+
+# External downloaded projects and binaries
+/github/
+
+# Generated research and decision snapshots
+conf/daily_candidates.json
+conf/decision_pool_report.json
+conf/decision_trade_plans.json
+conf/hot_universe.json
+conf/index_universe.json
+conf/market_regime.json
+conf/market_scan_report.json
+conf/selection_pools.json
+conf/symbol_master.json

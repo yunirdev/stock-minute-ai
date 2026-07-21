@@ -9,11 +9,10 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Dict, List
 
-from .contracts import Selector
 from .data_cache import get_bars
-from .models import Candidate, new_id, utc_now
+from .models import Candidate, utc_now
 from .strategy_core import STRATEGY_OPTIONS, compute_signals
 
 logger = logging.getLogger(__name__)
@@ -27,7 +26,12 @@ class ConsensusSelector:
         strategies: List[str] | None = None,
         min_bars: int = 60,
     ) -> None:
-        self._strategies = strategies or list(STRATEGY_OPTIONS.keys())
+        default_strategies = (
+            list(STRATEGY_OPTIONS.keys())
+            if hasattr(STRATEGY_OPTIONS, "keys")
+            else list(STRATEGY_OPTIONS)
+        )
+        self._strategies = strategies or default_strategies
         self._min_bars = min_bars
 
     def select(

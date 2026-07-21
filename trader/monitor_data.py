@@ -19,7 +19,7 @@ import pandas as pd
 from dotenv import load_dotenv
 
 _ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(_ROOT / ".env")
+load_dotenv(_ROOT / ".env", override=True)  # .env 优先于已存在的 OS 环境变量，见 config.py 注释
 
 DB_PATH = str(_ROOT / os.getenv("TRADE_DB_PATH", "trade.duckdb"))
 HEARTBEAT_JSON = _ROOT / "logs" / "heartbeat.json"
@@ -81,10 +81,104 @@ def risk_events_df(hours: int, db_path: str = DB_PATH) -> pd.DataFrame:
                     [_since(hours)], db_path)
 
 
+def latest_reconciliation(db_path: str = DB_PATH) -> dict | None:
+    """Return the newest startup reconciliation report, if the schema exists."""
+    df = db_query(
+        "SELECT * FROM reconciliation_reports ORDER BY ts DESC LIMIT 1",
+        db_path=db_path,
+    )
+    return None if df.empty else df.iloc[0].to_dict()
+
+
+def bug_issues_df(status: str = "OPEN", db_path: str = DB_PATH) -> pd.DataFrame:
+    """Return deduplicated backend issues for monitoring and triage."""
+    return db_query(
+        "SELECT * FROM bug_issues WHERE status=? ORDER BY last_seen DESC",
+        [status],
+        db_path,
+    )
+
+
+def bug_events_df(limit: int = 100, db_path: str = DB_PATH) -> pd.DataFrame:
+    """Return recent sanitized error occurrences."""
+    return db_query(
+        "SELECT * FROM bug_events ORDER BY ts DESC LIMIT ?",
+        [limit],
+        db_path,
+    )
+
+def all_plans_df(hours: int = 48, db_path: str = DB_PATH) -> pd.DataFrame:
+    """返回最近 N 小时所有计划（如 READY/DRY_RUN/REJECTED/SHADOW）。"""
+    return db_query(
+        "SELECT * FROM trade_plans WHERE created_at >= ? ORDER BY created_at DESC",
+        [_since(hours)], db_path,
+    )
+
+
 # ── Alpaca 实时账户权益（绕过 DuckDB，用于 monitor 总览）────────────────────────
 
 _ALPACA_CACHE: dict = {"ts": None, "data": None}
 _ALPACA_CACHE_TTL = 30   # seconds
+
+
+_POS_CACHE: dict = {"ts": None, "data": None}
+_POS_CACHE_TTL = 30
+
+
+def live_alpaca_positions() -> list[dict]:
+    """直接调 Alpaca REST API 获取当前持仓列表，缓存 30 秒。
+    返回 [{"symbol", "side", "qty", "avg_entry_price", "current_price",
+            "market_value", "unrealized_pl", "unrealized_plpc"}, ...]
+    或 []（未配置 / 网络超时）。
+    """
+    import json as _json
+    import urllib.request as _urllib
+
+    now = datetime.now(timezone.utc)
+    if (
+        _POS_CACHE["ts"] is not None
+        and (now - _POS_CACHE["ts"]).total_seconds() < _POS_CACHE_TTL
+    ):
+        return _POS_CACHE["data"] or []
+
+    api_key = os.getenv("ALPACA_API_KEY", "")
+    secret  = os.getenv("ALPACA_API_SECRET", "") or os.getenv("ALPACA_SECRET_KEY", "")
+    broker_type = os.getenv("BROKER_TYPE", "alpaca_paper")
+
+    if not api_key or not secret:
+        _POS_CACHE.update(ts=now, data=[])
+        return []
+
+    base = (
+        "https://api.alpaca.markets"
+        if broker_type == "alpaca_live"
+        else "https://paper-api.alpaca.markets"
+    )
+    try:
+        req = _urllib.Request(
+            f"{base}/v2/positions",
+            headers={"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret},
+        )
+        with _urllib.urlopen(req, timeout=5) as resp:
+            raw = _json.loads(resp.read())
+        result = [
+            {
+                "symbol":          p.get("symbol", ""),
+                "side":            p.get("side", ""),
+                "qty":             float(p.get("qty", 0)),
+                "avg_entry_price": float(p.get("avg_entry_price", 0)),
+                "current_price":   float(p.get("current_price", 0)),
+                "market_value":    float(p.get("market_value", 0)),
+                "unrealized_pl":   float(p.get("unrealized_pl", 0)),
+                "unrealized_plpc": float(p.get("unrealized_plpc", 0)),
+            }
+            for p in (raw if isinstance(raw, list) else [])
+        ]
+        _POS_CACHE.update(ts=now, data=result)
+        return result
+    except Exception:
+        _POS_CACHE.update(ts=now, data=[])
+        return []
 
 
 def live_alpaca_equity() -> Optional[dict]:

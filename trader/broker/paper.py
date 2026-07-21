@@ -9,7 +9,7 @@ import logging
 import uuid
 from typing import Dict, List, Optional
 
-from ..models import Fill, OrderIntent, OrderStatus, Position, Side, utc_now
+from ..models import Fill, OrderIntent, OrderStatus, Position, utc_now
 from .base import BrokerAdapter
 
 logger = logging.getLogger(__name__)

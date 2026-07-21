@@ -334,11 +334,13 @@ class FinnhubSource:
         self._universe = [s.upper() for s in (universe or [])]
         self._timeout = timeout
         self._seen_ids: Set[int] = set()
+        self._disabled = False
+        self._auth_warning_logged = False
         if not self._key:
             logger.debug("FinnhubSource: 未设置 FINNHUB_API_KEY，已跳过")
 
     def poll(self, since: datetime) -> List[NewsEvent]:
-        if not self._key:
+        if not self._key or self._disabled:
             return []
         since_ts = since.timestamp()
         from_date = since.strftime("%Y-%m-%d")
@@ -354,6 +356,14 @@ class FinnhubSource:
                         events.append(ev)
                 _time.sleep(0.05)       # 60 req/min 充裕
             except Exception as exc:
+                if getattr(exc, "code", None) in (401, 403):
+                    if not self._auth_warning_logged:
+                        logger.warning(
+                            "Finnhub API key is unauthorized; disabling Finnhub news source for this process"
+                        )
+                        self._auth_warning_logged = True
+                    self._disabled = True
+                    break
                 logger.warning("Finnhub [%s] 失败: %s", symbol, exc)
         if events:
             logger.info("Finnhub: +%d 条公司新闻", len(events))

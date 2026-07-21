@@ -52,7 +52,7 @@ class StopTakeProfitMonitor:
                     rationale=f"{reason}触发 price={price:.2f} "
                               f"stop={plan.stop_loss:.2f} tp={plan.take_profit:.2f}",
                     source="position_monitor",
-                    status="APPROVED",  # 止损/止盈直接自动 APPROVED
+                    status="READY",  # 止损/止盈由 Runtime 立即执行
                     created_at=utc_now(),
                     metadata={"trigger": reason, "original_plan_id": plan.plan_id},
                 )

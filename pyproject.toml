@@ -1,26 +1,31 @@
 [project]
 name = "stock-minute-ai"
 version = "0.1.0"
-description = "Real-time and historical US stock minute-bar data pipeline with DuckDB storage and an interactive Streamlit candlestick dashboard powered by Alpaca Markets."
+description = "AI-driven US equities minute-bar paper-trading system (Alpaca data, DuckDB persistence, NiceGUI dashboard)."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "duckdb>=1.4.4",
     "marimo>=0.9.0",
-    "nicegui>=1.4.0",
+    "nicegui[native]>=1.4.0",
     "numpy>=2.4.2",
     "pandas>=2.3.3",
     "plotly>=6.5.2",
     "pydantic>=2.12.5",
     "pydantic-settings>=2.6.0",
-    "quantstats>=0.0.64",
     "pytest>=9.0.2",
     "scipy>=1.16.0",
     "python-dotenv>=1.2.1",
     "requests>=2.32.0",
     "ruff>=0.15.2",
-    "streamlit>=1.54.0",
     "ta>=0.11.0",
     "yfinance>=1.2.0",
     "alpaca-py>=0.43.4",
+    "feedparser>=6.0.12",
 ]
+
+[tool.setuptools.packages.find]
+include = ['trader*']
+
+[tool.pytest.ini_options]
+cache_dir = ".tmp/pytest-cache"

@@ -11,7 +11,6 @@ import socket
 from datetime import datetime, timezone
 from typing import Dict, List
 
-import pandas as pd
 
 from .config import TradingConfig
 from .models import Bar

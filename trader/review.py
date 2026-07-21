@@ -5,8 +5,8 @@ review.py
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from datetime import datetime, timedelta
+from typing import Any, Dict
 
 import duckdb
 

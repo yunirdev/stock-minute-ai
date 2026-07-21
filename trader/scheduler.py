@@ -6,7 +6,7 @@ Every poll interval:
   1. Fetch latest prices and broker account state.
   2. Poll previously submitted Alpaca orders.
   3. For each symbol and strategy, fetch bars, compute signals, run risk checks,
-     and submit approved orders to Alpaca.
+     and submit risk-cleared orders to Alpaca.
   4. Persist account snapshots and audit events to DuckDB.
 """
 from __future__ import annotations
