@@ -22,7 +22,7 @@ _HEARTBEAT_MAX_STALE_SECS = 120   # 2 分钟无心跳则告警
 
 
 class HeartbeatWatchdog:
-    """实现 Watchdog Protocol —— 检查 heartbeat 新鲜度与数据缺口。"""
+    """实现 Watchdog —— 检查 heartbeat 新鲜度与数据缺口。"""
 
     def __init__(
         self,
@@ -69,7 +69,7 @@ class HeartbeatWatchdog:
 
 
 class FileKillSwitch:
-    """实现 KillSwitch Protocol —— 用 JSON 状态文件控制急停。"""
+    """实现 KillSwitch —— 用 JSON 状态文件控制急停。"""
 
     def __init__(self, path: Path | str = _KILL_SWITCH_PATH) -> None:
         self._path = Path(path)

@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 class StopTakeProfitMonitor:
-    """实现 PositionMonitor Protocol —— 止损/止盈触发生成 CLOSE 计划。"""
+    """实现 PositionMonitor —— 止损/止盈触发生成 CLOSE 计划。"""
 
     def check(
         self,

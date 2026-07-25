@@ -1,10 +1,9 @@
 """
-test_m0_contracts.py
-M0 契约层验收测试。
+test_models_and_services.py
+共享模型与服务验收测试。
 
 覆盖：
 - 所有新数据模型可 import + 实例化
-- contracts.py 中所有 Protocol 可 import
 - 各 stub 模块实例化 + 主路径 + 空数据/异常
 """
 from __future__ import annotations
@@ -57,13 +56,10 @@ class TestNewModels:
 
 
 # ---------------------------------------------------------------------------
-# 2. contracts.py —— 所有 Protocol 可 import
+# 2. Agent context
 # ---------------------------------------------------------------------------
 
-class TestContractsImport:
-    def test_all_protocols_importable(self):
-        pass
-
+class TestAgentContext:
     def test_agent_context_creation(self, agent_context):
         from trader.models import AgentContext
         assert isinstance(agent_context, AgentContext)

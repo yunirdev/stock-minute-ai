@@ -1,102 +1,76 @@
 @echo off
-chcp 65001 >nul 2>&1
 setlocal EnableExtensions DisableDelayedExpansion
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 
 echo.
-echo ╔══════════════════════════════════════════════════════╗
-echo ║         stock-minute-ai  一键安装 / 修复环境         ║
-echo ╚══════════════════════════════════════════════════════╝
+echo stock-minute-ai environment setup
 echo.
 
-:: ── 1. 检查 Python ───────────────────────────────────────────────────────────
-echo [1/5] 检查 Python...
-python --version >nul 2>&1
+echo [1/5] Checking Python 3.13 or newer...
+python --version
 if errorlevel 1 (
-    echo      ✗ 未找到 Python。
-    echo      请先安装 Python 3.13+: https://www.python.org/downloads/
-    echo      安装时勾选 "Add Python to PATH"
-    pause
+    echo ERROR: Python was not found. Install Python 3.13 or newer and add it to PATH.
     exit /b 1
 )
-for /f "tokens=2" %%v in ('python --version 2^>^&1') do set PY_VER=%%v
-echo      ✓ Python %PY_VER%
-
-:: ── 2. 安装 / 检查 uv ────────────────────────────────────────────────────────
-echo.
-echo [2/5] 检查 uv 包管理器...
-uv --version >nul 2>&1
+python -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 13) else 1)"
 if errorlevel 1 (
-    echo      未找到 uv，正在安装...
-    powershell -ExecutionPolicy Bypass -Command "irm https://astral.sh/uv/install.ps1 | iex"
-    :: 刷新 PATH
-    set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
-    set "PATH=%LOCALAPPDATA%\Programs\uv;%PATH%"
-    uv --version >nul 2>&1
+    echo ERROR: Python 3.13 or newer is required.
+    exit /b 1
+)
+
+echo.
+echo [2/5] Checking uv...
+uv --version
+if errorlevel 1 (
+    echo uv was not found. Installing it now...
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "irm https://astral.sh/uv/install.ps1 | iex"
+    set "PATH=%USERPROFILE%\.cargo\bin;%LOCALAPPDATA%\Programs\uv;%PATH%"
+    uv --version
     if errorlevel 1 (
-        echo      ✗ uv 安装失败，请手动安装: https://docs.astral.sh/uv/getting-started/installation/
-        pause
+        echo ERROR: uv installation failed. See https://docs.astral.sh/uv/
         exit /b 1
     )
 )
-for /f "tokens=2" %%v in ('uv --version 2^>^&1') do set UV_VER=%%v
-echo      ✓ uv %UV_VER%
 
-:: ── 3. 创建虚拟环境并安装依赖 ────────────────────────────────────────────────
 echo.
-echo [3/5] 安装 Python 依赖（根据 uv.lock，首次约 2-5 分钟）...
+echo [3/5] Syncing locked dependencies and checking core imports...
 uv sync
 if errorlevel 1 (
-    echo      ✗ 依赖安装失败，请检查网络或查看上方错误。
-    pause
+    echo ERROR: Dependency installation failed.
     exit /b 1
 )
-echo      ✓ 依赖安装完成
-
-:: ── 4. 创建 .env（如果不存在） ───────────────────────────────────────────────
-echo.
-echo [4/5] 检查配置文件...
-if not exist ".env" (
-    if exist ".env.example" (
-        copy ".env.example" ".env" >nul
-        echo      ✓ 已从 .env.example 创建 .env
-        echo      ★ 请用记事本打开 .env，填入你的 API Key！
-    ) else (
-        echo      ⚠ 未找到 .env.example，请手动创建 .env
-    )
-) else (
-    echo      ✓ .env 已存在
+.venv\Scripts\python.exe -c "import trader.main, trader.runtime, trader.paper_decision"
+if errorlevel 1 (
+    echo ERROR: Core module import failed.
+    exit /b 1
 )
 
-:: ── 5. 检查 Ollama ────────────────────────────────────────────────────────────
 echo.
-echo [5/5] 检查 Ollama（本地 AI）...
+echo [4/5] Checking local configuration...
+if not exist ".env" (
+    if not exist ".env.example" (
+        echo ERROR: .env.example is missing.
+        exit /b 1
+    )
+    copy /y ".env.example" ".env" >nul
+    echo Created .env from .env.example. Add your API keys before starting the engine.
+) else (
+    echo Existing .env preserved.
+)
+
+echo.
+echo [5/5] Checking optional Ollama installation...
 ollama --version >nul 2>&1
 if errorlevel 1 (
-    echo      ⚠ 未找到 Ollama。
-    echo        如需本地 AI 评分，请安装: https://ollama.com/download
-    echo        安装后用 ollama pull 拉取任意模型即可，系统会自动选择。
-    echo        （无 Ollama 也能运行，AI 评分会显示 50 / StubLLM）
+    echo Ollama is optional and was not found.
 ) else (
-    echo      ✓ Ollama 已安装
-    echo      已安装的模型：
-    for /f "skip=1 tokens=1" %%m in ('ollama list 2^>nul') do (
-        echo        · %%m
-    )
-    echo      系统启动时会自动选择最合适的模型（优先 .env 中的 OLLAMA_MODEL）。
+    ollama --version
 )
 
-:: ── 完成 ──────────────────────────────────────────────────────────────────────
 echo.
-echo ════════════════════════════════════════════════════════
-echo   安装完成！启动命令：
-echo.
-echo     监控 UI：  uv run python -m nicegui trader/monitor_nice.py
-echo     运行引擎： uv run python -m trader.main
-echo     跑测试：   uv run python -m pytest tests/ -v
-echo ════════════════════════════════════════════════════════
-echo.
-echo ★ 首次运行前请确认 .env 已填入 ALPACA_API_KEY / ALPACA_API_SECRET
-echo.
-pause
+echo Setup completed successfully.
+echo Monitor UI: uv run python -m trader.monitor_nice
+echo Trading engine: uv run python -m trader.main
+echo Tests: uv run python -m pytest tests -q
+exit /b 0

@@ -1,72 +1,57 @@
 # stock-minute-ai
 
-美股分钟级 AI 自动模拟交易系统：Alpaca 行情与 Paper Trading、多 Agent 分析、确定性风控、DuckDB 审计、NiceGUI 控制台。
+AI-assisted minute-bar Alpaca Paper trading with multi-agent analysis, verified strategy statistics, deterministic risk controls, DuckDB audit, and a NiceGUI monitor.
 
-> AI 自动交易只允许 Alpaca Paper 模拟盘，不逐笔请求批准。系统明确禁止自动实盘交易。
+Automatic trading is Paper-only. It never requests per-trade approval and never submits automatic live orders.
 
-## 快速开始
+## Start
 
-要求 Python 3.13+ 和 [uv](https://github.com/astral-sh/uv)。
+Python 3.13+ and uv are required.
 
-```powershell
-setup.bat
-# 在 .env 中填写 Alpaca Paper API Key
-启动监控台.bat
-```
+    setup.bat
+    # Fill Alpaca Paper keys in .env
+    启动监控台.bat
 
-手动运行：
+Before automated trading, download enough local bar history in the UI and generate statistics:
 
-```powershell
-uv run python trader/monitor_nice.py
-uv run python -m trader.main
-uv run python -m trader.main --symbols AAPL,MSFT --auto-trade --min-ai-score 70
-```
+    uv run python -m trader.strategy_statistics --symbols AAPL,MSFT --timeframe 5m
+    uv run python -m trader.main --symbols AAPL,MSFT
+    uv run python -m trader.main --symbols AAPL,MSFT --auto-trade --min-ai-score 70
 
-未传 `--auto-trade` 时，交易计划只记录为 `DRY_RUN`；开启后，符合全部条件的计划自动提交 Alpaca Paper 限价单。
+Without --auto-trade, plans are recorded as DRY_RUN. With it, qualifying plans are submitted as idempotent Alpaca Paper limit orders.
 
-## 用户侧流程
+## Runtime flow
 
-1. 启动 NiceGUI 决策台，配置并启动 AI Agent。
-2. Agent 分析技术面、基本面、宏观、新闻、期权、ETF 流向等信息，将评分写入 `ai_states.duckdb`。
-3. Runtime 依次执行选股、ATR 计划、AI 评分门、仓位分配和确定性风控。
-4. 未开启自动交易时只保存 `DRY_RUN`；开启时提交耐久化、幂等的 Alpaca Paper `LMT` 订单。
-5. Runtime 轮询成交、更新组合与审计记录；kill switch 或启动对账异常会阻止新订单。
+1. Runtime reads market data and candidates, then runs agents in the background.
+2. AgentManager writes analyses to ai_states.duckdb. The UI is optional.
+3. PaperDecision requires a current strategy signal, reliable holdout statistics for the current market regime, and valid AI evidence.
+4. Runtime creates ATR plans, allocates positions, applies deterministic risk controls, then records DRY_RUN or submits Paper LMT orders.
+5. Reconciliation failures and the kill switch block new orders.
 
-## 安全红线
+## Safety
 
-- Agent/LLM 不直接调用 broker，只产出分析结果。
-- 自动下单要求 `auto_trade_paper=True` 且 `broker_type=alpaca_paper`。
-- 自动实盘配置会被拒绝；自动执行只提交 `LMT` 限价单。
-- AI 评分缺失、过期或不足，以及任一风控失败，计划都会被拒绝。
-- kill switch、幂等检查和启动对账不可绕过。
-- API Key/Secret 不写日志、不进 Git。
+- Agents never call the broker.
+- Automatic submission requires auto_trade_paper and alpaca_paper.
+- Only LMT orders are submitted.
+- Missing, stale, untrusted, or insufficient AI evidence rejects a plan.
+- Missing valid strategy statistics produces no decision.
+- Kill switch, reconciliation, durable order records, idempotency, and risk controls cannot be bypassed.
 
-## 主要入口
+## Entrypoints
 
-- `trader.monitor_nice`：NiceGUI 用户界面
-- `trader.main`：唯一生产交易引擎入口
-- `trader.runtime.Runtime`：唯一生产交易循环
-- `trader.ai.manager.AgentManager`：Agent 调度与 AI 状态持久化
-- `notebooks/research.py`：Marimo 研究工具
+- python -m trader.monitor_nice: NiceGUI monitor
+- python -m trader.main: production Runtime with background AgentManager
+- python -m trader.strategy_statistics: build statistics from local cached bars
+- notebooks/research.py: Marimo research notebook
 
-代码结构、当前基线、验证命令和 Agent 工作协议以 [AGENTS.md](AGENTS.md) 为唯一权威来源。
+Anthropic fallback is optional: run uv sync --extra anthropic before setting its key.
 
-## 数据与迁移
+README is the user guide. AGENTS.md is the only engineering baseline.
 
-以下文件不进 Git：`.env`、`trade.duckdb`、`ai_states.duckdb`、`conf/ui_settings.json`、行情缓存、市场快照和运行日志。数据库是用户历史，不应作为缓存删除。
+## Verification
 
-## 验证
+    .venv\Scripts\python.exe -m pytest tests -q
+    .venv\Scripts\python.exe -m compileall -q trader tests
+    .venv\Scripts\python.exe -m ruff check trader tests
 
-```powershell
-.venv\Scripts\python.exe -m pytest tests -q
-.venv\Scripts\python.exe -m compileall -q trader tests
-.venv\Scripts\python.exe -m ruff check trader tests
-```
-
-## 已知局限
-
-- 部分 Agent 使用 yfinance 免费数据，可能滞后或缺字段。
-- Ollama 不可用时会降级为 Stub 评分；持续显示 50 分通常代表本地模型未运行或超时。
-- 自动交易仅为模拟盘，不代表策略在实盘中可盈利。
-
-本项目仅供个人学习与研究，不构成投资建议。
+This project is for research and learning, not investment advice.

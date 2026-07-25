@@ -16,7 +16,7 @@ _DEFAULT_MAX_OPEN_PLANS = 10       # 最多同时处理计划数（保护）
 
 
 class EqualWeightAllocator:
-    """实现 Allocator Protocol —— 等权分配，满足总权重 ≤ 1、单标的 ≤ 上限。"""
+    """实现 Allocator —— 等权分配，满足总权重 ≤ 1、单标的 ≤ 上限。"""
 
     def __init__(
         self,

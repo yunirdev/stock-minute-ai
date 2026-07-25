@@ -90,29 +90,9 @@ def latest_reconciliation(db_path: str = DB_PATH) -> dict | None:
     return None if df.empty else df.iloc[0].to_dict()
 
 
-def bug_issues_df(status: str = "OPEN", db_path: str = DB_PATH) -> pd.DataFrame:
-    """Return deduplicated backend issues for monitoring and triage."""
-    return db_query(
-        "SELECT * FROM bug_issues WHERE status=? ORDER BY last_seen DESC",
-        [status],
-        db_path,
-    )
 
 
-def bug_events_df(limit: int = 100, db_path: str = DB_PATH) -> pd.DataFrame:
-    """Return recent sanitized error occurrences."""
-    return db_query(
-        "SELECT * FROM bug_events ORDER BY ts DESC LIMIT ?",
-        [limit],
-        db_path,
-    )
 
-def all_plans_df(hours: int = 48, db_path: str = DB_PATH) -> pd.DataFrame:
-    """返回最近 N 小时所有计划（如 READY/DRY_RUN/REJECTED/SHADOW）。"""
-    return db_query(
-        "SELECT * FROM trade_plans WHERE created_at >= ? ORDER BY created_at DESC",
-        [_since(hours)], db_path,
-    )
 
 
 # ── Alpaca 实时账户权益（绕过 DuckDB，用于 monitor 总览）────────────────────────

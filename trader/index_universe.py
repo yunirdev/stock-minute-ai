@@ -87,9 +87,6 @@ def save_index_universe(snapshot: IndexUniverse, path: Path | str = _STORE) -> N
     out.write_text(json.dumps(asdict(snapshot), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def core_index_symbols(snapshot: Optional[IndexUniverse] = None) -> list[str]:
-    snapshot = snapshot or load_index_universe()
-    return snapshot.core_symbols
 
 
 def _fetch_index(name: str, url: str, fetch: Callable[[str], str], parser, statuses: list[SourceStatus]) -> list[str]:

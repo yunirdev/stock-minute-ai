@@ -25,7 +25,7 @@ _DISCORD_API = "https://discord.com/api/v10"
 
 
 class ConsoleNotifier:
-    """实现 Notifier Protocol —— 打印到控制台/日志（始终成功）。"""
+    """实现 Notifier —— 打印到控制台/日志（始终成功）。"""
 
     def send(self, note: Notification) -> bool:
         logger.info("[NOTIFY] [%s] %s — %s", note.kind.upper(), note.title, note.body)
@@ -36,7 +36,7 @@ class ConsoleNotifier:
 
 class DiscordNotifier:
     """
-    实现 Notifier Protocol。
+    实现 Notifier。
     优先使用 Bot Token + Channel ID；无 token 时退回 Webhook URL；两者都没有降级 console。
     """
 

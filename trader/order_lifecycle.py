@@ -1,4 +1,4 @@
-﻿"""Durable order identity, lifecycle state, and startup reconciliation helpers."""
+"""Durable order identity, lifecycle state, and startup reconciliation helpers."""
 from __future__ import annotations
 
 import hashlib
@@ -140,17 +140,3 @@ def reconcile_broker(broker, local_intents: Iterable[dict[str, Any]], local_posi
     report.unexplained_positions.extend(sorted(broker_symbols - local_symbols))
     report.ok = not report.unexplained_orders and not report.unexplained_positions and not report.errors
     return report
-
-
-
-
-def resolve_unknown(store: OrderIntentStore, key: str, broker_order_exists: bool) -> bool:
-    """Resolve UNKNOWN only after an explicit broker lookup; return whether retry is allowed."""
-    row = store.get_by_key(key)
-    if not row or row.get("state") != OrderLifecycle.UNKNOWN.value:
-        return False
-    if broker_order_exists:
-        store.update(key, state=OrderLifecycle.OPEN.value)
-        return False
-    store.update(key, state=OrderLifecycle.PERSISTED.value, retry_count=int(row.get("retry_count") or 0) + 1)
-    return True

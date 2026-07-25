@@ -15,7 +15,6 @@ import logging
 from typing import List, Optional
 
 from ..models import Fill, OrderIntent, OrderStatus, Position, Side, utc_now
-from .base import BrokerAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +47,8 @@ def _side_of(raw) -> Side:
     return Side.BUY if str(getattr(raw, "value", raw)).lower() == "buy" else Side.SELL
 
 
-class AlpacaBroker(BrokerAdapter):
-    """Alpaca 执行适配器。默认 paper（虚拟盘）。实现 BrokerAdapter 全部接口。"""
+class AlpacaBroker:
+    """Alpaca 执行适配器。默认 paper（虚拟盘）。"""
 
     def __init__(self, api_key: str, secret_key: str, paper: bool = True) -> None:
         if not api_key or not secret_key:
@@ -61,7 +60,7 @@ class AlpacaBroker(BrokerAdapter):
         logger.info("AlpacaBroker 已连接 (%s)", "PAPER 虚拟盘" if paper else "LIVE 实盘")
 
     # ------------------------------------------------------------------
-    # BrokerAdapter implementation
+    # Order execution
     # ------------------------------------------------------------------
 
     def place_order(self, intent: OrderIntent) -> str:

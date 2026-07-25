@@ -312,25 +312,8 @@ def get_bars(symbol: str, timeframe: str) -> pd.DataFrame:
     return df.copy() if df is not None else pd.DataFrame()
 
 
-def refresh_bars(symbol: str, timeframe: str) -> pd.DataFrame:
-    """
-    增量更新并返回最新 DataFrame。
-    - 本地文件存在 → 读取本地 + 追加最近几根 bar（yfinance 增量）
-    - 本地文件不存在 → 直接返回空 DataFrame，不联网
-    """
-    _ensure_loaded(symbol, timeframe)          # 本地文件 → 内存
-    _incremental_update(symbol, timeframe)     # 仅在本地文件存在时才追加新 bar
-    return get_bars(symbol, timeframe)
 
 
-def is_warm(symbol: str, timeframe: str) -> bool:
-    """True 表示该 (symbol, timeframe) 已有数据（内存或本地文件均算）。"""
-    key = (symbol, timeframe)
-    with _CACHE_LOCK:
-        df = _CACHE.get(key)
-    if df is not None and not df.empty:
-        return True
-    return _parquet_path(symbol, timeframe).exists()
 
 
 def list_cached_files() -> list:

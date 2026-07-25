@@ -27,7 +27,7 @@ _DEFAULT_THRESHOLD = 0.03   # 3% 涨跌幅触发异动
 
 
 class PriceMoveSource:
-    """实现 NewsSource Protocol —— 基于本地 bars 的价格异动侦测。"""
+    """实现 NewsSource —— 基于本地 bars 的价格异动侦测。"""
 
     def __init__(
         self,

@@ -57,4 +57,5 @@ conf/index_universe.json
 conf/market_regime.json
 conf/market_scan_report.json
 conf/selection_pools.json
+conf/strategy_statistics.json
 conf/symbol_master.json

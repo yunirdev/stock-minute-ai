@@ -7,7 +7,6 @@ The project has a local backend error platform backed by the existing
 
 Runtime tick failures, startup reconciliation failures, and broker submission
 exceptions are captured by `BugReporter`. Other Python services can attach
-`BugLoggingHandler` to their logger. Collection is best effort: a failure in the
 reporter never recursively crashes the trading process.
 
 Every occurrence is sanitized before storage. Known credential fields are

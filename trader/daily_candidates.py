@@ -124,18 +124,6 @@ def daily_candidate_symbols(
     return [row.symbol for row in rows[:limit]]
 
 
-def format_daily_candidates(candidates: list[DailyCandidate], max_rows: int = 10) -> str:
-    if not candidates:
-        return "今日候选池为空。"
-    lines = []
-    for row in candidates[:max_rows]:
-        reason = "；".join(row.reasons[:2]) if row.reasons else "无明确理由"
-        risk = f" 风险：{'；'.join(row.risk_flags[:2])}" if row.risk_flags else ""
-        lines.append(
-            f"{row.rank}. {row.symbol} {row.score:.1f} "
-            f"[{row.status}] {row.data_confidence} - {reason}{risk}"
-        )
-    return "\n".join(lines)
 
 
 def _normalize_universe(universe: Iterable[str], include_anchors: bool) -> list[str]:

@@ -1,4 +1,4 @@
-﻿from datetime import datetime, timezone
+from datetime import datetime, timezone
 
 from trader.models import Fill, Side
 from trader.order_lifecycle import (
@@ -7,7 +7,6 @@ from trader.order_lifecycle import (
     client_order_id,
     idempotency_key,
     reconcile_broker,
-    resolve_unknown,
 )
 
 
@@ -73,15 +72,3 @@ def test_portfolio_fill_application_is_cumulative_and_idempotent(tmp_path):
     portfolio.apply_fill(fill)
     portfolio.apply_fill(Fill("b1", "i1", "AAPL", Side.BUY, 2, 100, datetime.now(timezone.utc)))
     assert portfolio.positions["AAPL"].qty == 2
-
-
-
-def test_unknown_requires_explicit_broker_lookup(tmp_path):
-    from trader.order_lifecycle import OrderIntentStore
-    store = OrderIntentStore(str(tmp_path / "trade.duckdb"))
-    intent = type("Intent", (), {"intent_id": "i1", "signal_id": "p1", "symbol": "AAPL", "side": Side.BUY, "qty": 1.0, "limit_price": 100.0, "order_type": "LMT", "tif": "DAY"})()
-    key = idempotency_key("p1", "AAPL", "BUY", 1, 100, "OPEN")
-    store.persist(intent, key, "p1")
-    store.update(key, state=OrderLifecycle.UNKNOWN.value)
-    assert not resolve_unknown(store, key, True)
-    assert store.get_by_key(key)["state"] == OrderLifecycle.OPEN.value

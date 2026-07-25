@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class ConsensusSelector:
-    """实现 Selector Protocol —— 策略共识打分选股。"""
+    """实现 Selector —— 策略共识打分选股。"""
 
     def __init__(
         self,
@@ -92,10 +92,3 @@ class ConsensusSelector:
 # ---------------------------------------------------------------------------
 
 _default_selector: ConsensusSelector | None = None
-
-
-def get_selector() -> ConsensusSelector:
-    global _default_selector
-    if _default_selector is None:
-        _default_selector = ConsensusSelector()
-    return _default_selector

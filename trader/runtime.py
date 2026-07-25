@@ -22,7 +22,7 @@ from .data_cache import upsert_bars as _dc_upsert
 from .data_feed import AlpacaDataFeed
 from .market_calendar import SimpleMarketCalendar
 from .models import (
-    Bar, Notification, OrderIntent, OrderStatus,
+    AgentContext, Bar, Notification, OrderIntent, OrderStatus,
     Position, Side, TradePlan, new_id, utc_now,
 )
 from .news import FinnhubSource, PriceMoveSource, SECEdgarSource, WallStreetCNSource
@@ -33,8 +33,9 @@ from .position_monitor import StopTakeProfitMonitor
 from .review import SimpleReviewer
 from .risk_engine import RiskEngine
 from .order_lifecycle import OrderIntentStore, OrderLifecycle, idempotency_key, client_order_id, reconcile_broker
-from .paper_decision import PaperDecisionService, StrategyStatisticsRepository, UniverseProvider
+from .paper_decision import AdvisoryWorker, PaperDecisionService, StrategyStatisticsRepository, UniverseProvider
 from .bug_reporting import BugReporter
+from .ai.manager import AgentManager
 from .ai.safety import AIScorePolicy, AIScoreSnapshot, AIScoreValidator
 from .selection import ConsensusSelector
 from .watchdog import FileKillSwitch, HeartbeatWatchdog
@@ -176,7 +177,14 @@ class Runtime:
         self._order_store = OrderIntentStore(config.db_path)
         self._bug_reporter = BugReporter(config.db_path, "runtime")
         self._reconciliation_blocked = False
-        self._decision_service = PaperDecisionService(allow_without_ai=config.allow_quant_without_ai, ai_max_age_minutes=int(config.ai_score_max_age_minutes))
+        self._decision_service = PaperDecisionService(
+            allow_without_ai=config.allow_quant_without_ai,
+            ai_max_age_minutes=int(config.ai_score_max_age_minutes),
+        )
+        self._advisory_worker = AdvisoryWorker(
+            AgentManager(),
+            min_interval_seconds=max(60, int(config.agent_cycle_interval_minutes * 60)),
+        )
         self._strategy_stats = StrategyStatisticsRepository.from_json(config.strategy_statistics_path)
         self._universe_provider = UniverseProvider(config.symbols, config.universe_max_symbols, config.universe_max_age_minutes)
         self._universe_snapshot = self._universe_provider.provide(cli_symbols=config.symbols, now=utc_now())
@@ -210,6 +218,7 @@ class Runtime:
         while self._running:
             try:
                 self._tick()
+                time.sleep(self._cfg.poll_interval_secs)
             except KeyboardInterrupt:
                 logger.info("Runtime stopped by user")
                 break
@@ -222,8 +231,8 @@ class Runtime:
                 logger.error(
                     "Runtime tick failed: %s", type(exc).__name__, exc_info=True
                 )
-            time.sleep(self._cfg.poll_interval_secs)
 
+        self._advisory_worker.close()
         logger.info("Runtime stopped")
 
     def _run_reconciliation(self) -> None:
@@ -411,24 +420,43 @@ class Runtime:
             logger.error("selection.select 失败: %s", exc, exc_info=True)
             candidates = []
 
-        decisions_by_symbol = {}
-        if self._cfg.paper_decision_enabled:
-            decisions = self._decision_service.decide(
-                bars=raw_bars_map,
-                positions=positions,
-                candidates=candidates,
-                strategy_statistics=self._strategy_stats,
-                ai_advisories=self._read_ai_scores(),
-                market_regime=_get_current_regime_label(),
-                now=ts,
-                timeframe=self._cfg.timeframe,
-                universe_version=self._universe_snapshot.universe_version,
-                data_version=ts.isoformat(),
+        try:
+            completed = self._advisory_worker.poll()
+            if completed is not None:
+                logger.info("Agent cycle completed: %d advisories", len(completed))
+            started = self._advisory_worker.start(
+                AgentContext(
+                    candidates=candidates,
+                    news=news,
+                    positions=positions,
+                    equity=equity,
+                    as_of=ts,
+                ),
+                self._cfg.ai_score_db,
             )
-            decisions_by_symbol = {decision.symbol: decision for decision in decisions}
-            for decision in decisions:
-                self._audit.log_strategy_decision(decision)
-            candidates = [candidate for candidate in candidates if candidate.symbol in decisions_by_symbol]
+            if started:
+                logger.info("Agent cycle started in background")
+        except Exception as exc:
+            self._bug_reporter.capture_exception(exc, operation="agent.cycle")
+            logger.error("Agent cycle failed: %s", type(exc).__name__)
+
+        decisions_by_symbol = {}
+        decisions = self._decision_service.decide(
+            bars=raw_bars_map,
+            positions=positions,
+            candidates=candidates,
+            strategy_statistics=self._strategy_stats,
+            ai_advisories=self._read_ai_scores(),
+            market_regime=_get_current_regime_label(),
+            now=ts,
+            timeframe=self._cfg.timeframe,
+            universe_version=self._universe_snapshot.universe_version,
+            data_version=ts.isoformat(),
+        )
+        decisions_by_symbol = {decision.symbol: decision for decision in decisions}
+        for decision in decisions:
+            self._audit.log_strategy_decision(decision)
+        candidates = [candidate for candidate in candidates if candidate.symbol in decisions_by_symbol]
         # 12. 计划生成（ATRPlanner）
         # 过滤已有未成交挂单的标的，防止同一 tick 重复提交 LMT
         symbols_with_open_orders = {intent.symbol for intent in self._open_orders.values()}
@@ -525,10 +553,6 @@ class Runtime:
                 plan.status = "REJECTED"
                 continue
 
-            if self._cfg.paper_decision_enabled and self._cfg.paper_decision_shadow_mode:
-                plan.status = "SHADOW"
-                self._audit.log_trade_plan(plan)
-                continue
             if not self._cfg.auto_trade_paper:
                 plan.status = "DRY_RUN"
                 self._audit.log_trade_plan(plan)
@@ -561,9 +585,6 @@ class Runtime:
 
         仅 AI 自动模拟盘模式可提交；kill switch 始终可紧急拦截。
         """
-        if self._cfg.paper_decision_enabled and self._cfg.paper_decision_shadow_mode:
-            logger.info("[SHADOW] plan=%s broker submission disabled", plan.plan_id[:8])
-            return
         if not self._cfg.auto_trade_paper:
             logger.warning("[BLOCKED] plan=%s AI automatic paper trading is disabled", plan.plan_id[:8])
             return

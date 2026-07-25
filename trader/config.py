@@ -39,6 +39,27 @@ class Settings(BaseSettings):
         "", validation_alias=AliasChoices("ALPACA_API_SECRET", "ALPACA_SECRET_KEY"))
     alpaca_feed: str = Field(
         "sip", validation_alias=AliasChoices("ALPACA_DATA_FEED", "ALPACA_FEED"))
+    min_ai_score: int = Field(65, validation_alias=AliasChoices("MIN_AI_SCORE"))
+    ai_score_db: str = Field("ai_states.duckdb", validation_alias=AliasChoices("AI_SCORE_DB"))
+    ai_score_max_age_minutes: float = Field(
+        30.0, validation_alias=AliasChoices("AI_SCORE_MAX_AGE_MINUTES")
+    )
+    allow_quant_without_ai: bool = Field(
+        False, validation_alias=AliasChoices("ALLOW_QUANT_WITHOUT_AI")
+    )
+    strategy_statistics_path: str = Field(
+        "conf/strategy_statistics.json",
+        validation_alias=AliasChoices("STRATEGY_STATISTICS_PATH"),
+    )
+    agent_cycle_interval_minutes: float = Field(
+        15.0, validation_alias=AliasChoices("AGENT_CYCLE_INTERVAL_MINUTES")
+    )
+    universe_max_symbols: int = Field(
+        20, validation_alias=AliasChoices("UNIVERSE_MAX_SYMBOLS")
+    )
+    universe_max_age_minutes: int = Field(
+        1440, validation_alias=AliasChoices("UNIVERSE_MAX_AGE_MINUTES")
+    )
 
 
 # Loaded once at import — the one place .env is parsed for engine config.
@@ -83,12 +104,9 @@ class TradingConfig(BaseModel):
     # ---- Storage ------------------------------------------------------------
     db_path: str = "trade.duckdb"
 
-    # ---- Scheduler ----------------------------------------------------------
+    # ---- Runtime cadence ----------------------------------------------------
     poll_interval_secs: int = 30
     bars_lookback: int = 120                 # bars fetched per tick for indicator warm-up
-
-    # ---- Pending-order / gap-fill -------------------------------------------
-    pending_order_max_bars: int = 10
 
     # ---- AI 自动虚拟盘交易 -------------------------------------------------------
     # auto_trade_paper=True：
@@ -96,17 +114,27 @@ class TradingConfig(BaseModel):
     #   · 分数 ≥ min_ai_score 且确定性风控通过后下 LMT 单到 Alpaca paper
     #   · 分数 < min_ai_score 或 DB 无数据 → REJECTED（不执行）
     auto_trade_paper: bool = False
-    min_ai_score: int = 65               # AI 综合分达标线（≥ 此分才下单）
-    ai_score_db: str = "ai_states.duckdb"  # AI 评分来源（monitor 写，runtime 读）
+    min_ai_score: int = Field(default_factory=lambda: settings.min_ai_score)
+    ai_score_db: str = Field(default_factory=lambda: settings.ai_score_db)
 
-
-    ai_score_max_age_minutes: float = 30.0
-    paper_decision_enabled: bool = False
-    paper_decision_shadow_mode: bool = True
-    allow_quant_without_ai: bool = False
-    strategy_statistics_path: str = "conf/strategy_statistics.json"
-    universe_max_symbols: int = 20
-    universe_max_age_minutes: int = 1440
+    ai_score_max_age_minutes: float = Field(
+        default_factory=lambda: settings.ai_score_max_age_minutes
+    )
+    allow_quant_without_ai: bool = Field(
+        default_factory=lambda: settings.allow_quant_without_ai
+    )
+    strategy_statistics_path: str = Field(
+        default_factory=lambda: settings.strategy_statistics_path
+    )
+    agent_cycle_interval_minutes: float = Field(
+        default_factory=lambda: settings.agent_cycle_interval_minutes
+    )
+    universe_max_symbols: int = Field(
+        default_factory=lambda: settings.universe_max_symbols
+    )
+    universe_max_age_minutes: int = Field(
+        default_factory=lambda: settings.universe_max_age_minutes
+    )
 
     def model_post_init(self, __context: object) -> None:
         if self.auto_trade_paper and self.broker_type != 'alpaca_paper':

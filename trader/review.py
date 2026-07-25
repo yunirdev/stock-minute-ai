@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class SimpleReviewer:
-    """实现 Reviewer Protocol —— 从 DuckDB 账本生成简单盘后复盘报告。"""
+    """实现 Reviewer —— 从 DuckDB 账本生成简单盘后复盘报告。"""
 
     def __init__(self, db_path: str = "trade.duckdb") -> None:
         self._db_path = db_path

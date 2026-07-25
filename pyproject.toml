@@ -13,11 +13,10 @@ dependencies = [
     "plotly>=6.5.2",
     "pydantic>=2.12.5",
     "pydantic-settings>=2.6.0",
-    "pytest>=9.0.2",
+    "PyYAML>=6.0.2",
     "scipy>=1.16.0",
     "python-dotenv>=1.2.1",
     "requests>=2.32.0",
-    "ruff>=0.15.2",
     "ta>=0.11.0",
     "yfinance>=1.2.0",
     "alpaca-py>=0.43.4",
@@ -29,3 +28,12 @@ include = ['trader*']
 
 [tool.pytest.ini_options]
 cache_dir = ".tmp/pytest-cache"
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.70.0"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "ruff>=0.15.2",
+]

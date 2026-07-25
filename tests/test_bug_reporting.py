@@ -1,10 +1,8 @@
 import json
-import logging
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
-from trader.bug_reporting import BugLoggingHandler, BugReporter
-from trader.monitor_data import bug_events_df, bug_issues_df
+from trader.bug_reporting import BugReporter
 
 
 def test_deduplicates_redacts_and_reopens(tmp_path):
@@ -55,26 +53,6 @@ def test_captures_exception_links_and_status_changes(tmp_path):
     assert not reporter.resolve("missing")
 
 
-def test_logging_handler_and_monitor_queries(tmp_path):
-    db_path = str(tmp_path / "trade.duckdb")
-    reporter = BugReporter(db_path, "runtime")
-    handler = BugLoggingHandler(reporter)
-    record = logging.LogRecord(
-        "test.bug.reporting",
-        logging.ERROR,
-        __file__,
-        1,
-        "worker failed",
-        (),
-        None,
-    )
-    handler.handle(record)
-
-    issues = bug_issues_df(db_path=db_path)
-    events = bug_events_df(db_path=db_path)
-    assert issues.iloc[0]["message"] == "worker failed"
-    context = json.loads(events.iloc[0]["context_json"])
-    assert context["logger"] == "test.bug.reporting"
 
 def test_bug_cli_prints_unicode_events(monkeypatch, capsys, tmp_path):
     from trader import bug_cli

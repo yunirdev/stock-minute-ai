@@ -65,17 +65,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--min-ai-score",
         dest="min_ai_score",
         type=int,
-        default=65,
+        default=None,
         help="AI 综合评分门槛（0-100），≥ 此值才自动下单（默认 65）。仅 --auto-trade 时生效。",
     )
     parser.add_argument(
         "--ai-score-db",
         dest="ai_score_db",
-        default="ai_states.duckdb",
+        default=None,
         help="AI 评分数据库路径（默认 ai_states.duckdb）。",
     )
 
-    parser.add_argument("--ai-score-max-age-minutes", type=float, default=30.0)
+    parser.add_argument("--ai-score-max-age-minutes", type=float, default=None)
     return parser
 
 
@@ -120,9 +120,13 @@ def main() -> None:
         db_path=args.db_path or os.getenv("TRADE_DB_PATH", "trade.duckdb"),
         # AI 自动交易参数
         auto_trade_paper=args.auto_trade,
-        min_ai_score=args.min_ai_score,
-        ai_score_db=args.ai_score_db,
-        ai_score_max_age_minutes=args.ai_score_max_age_minutes,
+        min_ai_score=args.min_ai_score if args.min_ai_score is not None else settings.min_ai_score,
+        ai_score_db=args.ai_score_db or settings.ai_score_db,
+        ai_score_max_age_minutes=(
+            args.ai_score_max_age_minutes
+            if args.ai_score_max_age_minutes is not None
+            else settings.ai_score_max_age_minutes
+        ),
     )
 
     mode_names = {

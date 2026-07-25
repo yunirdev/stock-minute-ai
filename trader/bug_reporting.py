@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import re
 import threading
 import time
@@ -258,35 +257,3 @@ class BugReporter:
             return True
 
         return bool(self._write(update))
-
-
-class BugLoggingHandler(logging.Handler):
-    """Optional bridge from Python ERROR logs into BugReporter."""
-
-    def __init__(self, reporter: BugReporter) -> None:
-        super().__init__(level=logging.ERROR)
-        self.reporter = reporter
-        self._busy = False
-
-    def emit(self, record: logging.LogRecord) -> None:
-        if self._busy:
-            return
-        self._busy = True
-        context = {
-            "logger": record.name,
-            "path": record.pathname,
-            "line": record.lineno,
-        }
-        try:
-            if record.exc_info:
-                self.reporter.capture_exception(
-                    record.exc_info[1], operation=record.name, context=context
-                )
-            else:
-                self.reporter.capture_message(
-                    record.getMessage(), operation=record.name, context=context
-                )
-        except Exception:
-            pass
-        finally:
-            self._busy = False

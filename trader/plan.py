@@ -43,7 +43,7 @@ def _atr(bars_close: "list[float]", bars_high: "list[float]",
 
 
 class ATRPlanner:
-    """实现 Planner Protocol —— 基于 ATR 的入场/止损/止盈规划。"""
+    """实现 Planner —— 基于 ATR 的入场/止损/止盈规划。"""
 
     def __init__(self, params: Dict[str, Any] | None = None) -> None:
         self._params = {**_DEFAULT_PARAMS, **(params or {})}

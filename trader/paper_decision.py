@@ -1,8 +1,9 @@
-"""Deterministic decision service for Alpaca Paper and shadow evaluation."""
+"""Deterministic strategy decision gate for Alpaca Paper."""
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -84,11 +85,29 @@ class StrategyStatistics:
     params: dict[str, Any] = field(default_factory=dict)
 
     def reliable(self, now: datetime, min_trades: int = 30, max_age_days: int = 90) -> bool:
+        now = _utc(now)
+        evaluated_at = _utc(self.evaluated_at)
+        data_start = _utc(self.data_start)
+        data_end = _utc(self.data_end)
+        metrics = (
+            self.out_of_sample_net_return,
+            self.sharpe,
+            self.max_drawdown,
+            self.win_rate,
+            self.average_trade_return,
+            self.fees,
+            self.slippage,
+        )
         return (
             self.trade_count >= min_trades
-            and self.data_end > self.data_start
-            and now - _utc(self.evaluated_at) <= timedelta(days=max_age_days)
-            and self.max_drawdown <= 1
+            and data_start < data_end <= now
+            and evaluated_at <= now
+            and now - evaluated_at <= timedelta(days=max_age_days)
+            and all(math.isfinite(float(value)) for value in metrics)
+            and 0 <= self.max_drawdown <= 1
+            and 0 <= self.win_rate <= 1
+            and self.fees >= 0
+            and self.slippage >= 0
         )
 
 
@@ -169,12 +188,19 @@ class PaperDecisionService:
         decisions = []
         for candidate in candidates:
             symbol = getattr(candidate, "symbol", None) or candidate.get("symbol")
-            score = float(getattr(candidate, "score", 0) if not isinstance(candidate, dict) else candidate.get("score", 0))
-            stats = repo.find(symbol, timeframe, market_regime, now)
+            reasons = getattr(candidate, "reasons", None) or (
+                candidate.get("reasons", {}) if isinstance(candidate, dict) else {}
+            )
+            votes = reasons.get("votes", {})
+            stats = [
+                record for record in repo.find(symbol, timeframe, market_regime, now)
+                if int(votes.get(record.strategy, 0)) != 0
+            ]
             if not stats or symbol not in bars:
                 continue
             stats.sort(key=lambda r: (-r.out_of_sample_net_return, -r.sharpe, r.max_drawdown, -r.trade_count, r.strategy))
             chosen, alternatives = stats[0], stats[1:]
+            side = Side.BUY if int(votes[chosen.strategy]) > 0 else Side.SELL
             advisory = ai_advisories.get(symbol)
             ai_result = AIScoreValidator(AIScorePolicy(0, self.ai_max_age), lambda: now).validate(advisory)
             if not ai_result.valid and not self.allow_without_ai:
@@ -193,7 +219,7 @@ class PaperDecisionService:
             confidence = max(0.0, min(1.0, 0.5 + chosen.sharpe / 10 - chosen.max_drawdown / 2))
             decisions.append(StrategyDecision(
                 decision_id, symbol, chosen.strategy, chosen.strategy_version, dict(chosen.params),
-                Side.BUY if score >= 50 else Side.SELL, confidence, 0.0, now,
+                side, confidence, 0.0, now,
                 now + timedelta(minutes=self.ttl), market_regime,
                 getattr(candidate, "source", None) or (candidate.get("source") if isinstance(candidate, dict) else None) or "runtime",
                 evidence, run_id, chosen.statistics_id, data_version, now, tuple(reasons),
@@ -204,17 +230,26 @@ class PaperDecisionService:
 
 
 class AdvisoryWorker:
-    """Single-flight non-blocking AgentManager runner; UI is not involved."""
-    def __init__(self, manager: Any, timeout_seconds: int = 900) -> None:
+    """Rate-limited, single-flight AgentManager runner; UI is not involved."""
+    def __init__(
+        self,
+        manager: Any,
+        timeout_seconds: int = 900,
+        min_interval_seconds: int = 900,
+    ) -> None:
         self.manager, self.timeout = manager, timeout_seconds
+        self.min_interval = min_interval_seconds
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="advisory")
         self._future: Future | None = None
         self._started = 0.0
+        self._next_start = 0.0
 
     def start(self, context: Any, db_path: str) -> bool:
-        if self._future and not self._future.done():
+        now = time.monotonic()
+        if (self._future and not self._future.done()) or now < self._next_start:
             return False
-        self._started = time.monotonic()
+        self._started = now
+        self._next_start = now + self.min_interval
         self._future = self._pool.submit(self.manager.run_cycle, context, db_path)
         return True
 
@@ -222,7 +257,11 @@ class AdvisoryWorker:
         if not self._future:
             return None
         if self._future.done():
-            return self._future.result()
+            future, self._future = self._future, None
+            return future.result()
         if time.monotonic() - self._started > self.timeout:
             self._future.cancel()
         return None
+
+    def close(self) -> None:
+        self._pool.shutdown(wait=False, cancel_futures=True)
