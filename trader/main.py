@@ -57,7 +57,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help=(
-            "AI 自动虚拟盘交易：读取 ai_states.duckdb 的 AI 综合评分，"
+            "AI 自动虚拟盘交易：读取当日冻结的 TradingAgents 研究结果，"
             "分数与确定性风控达标后向 Alpaca paper 自动提交 LMT 单。"
         ),
     )
@@ -72,10 +72,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--ai-score-db",
         dest="ai_score_db",
         default=None,
-        help="AI 评分数据库路径（默认 ai_states.duckdb）。",
+        help="AI/每日研究数据库路径（默认 ai_states.duckdb）。",
     )
 
     parser.add_argument("--ai-score-max-age-minutes", type=float, default=None)
+    parser.add_argument("--daily-research-max-age-hours", type=float, default=None)
     return parser
 
 
@@ -122,6 +123,12 @@ def main() -> None:
         auto_trade_paper=args.auto_trade,
         min_ai_score=args.min_ai_score if args.min_ai_score is not None else settings.min_ai_score,
         ai_score_db=args.ai_score_db or settings.ai_score_db,
+        daily_research_db=args.ai_score_db or settings.daily_research_db,
+        daily_research_max_age_hours=(
+            args.daily_research_max_age_hours
+            if args.daily_research_max_age_hours is not None
+            else settings.daily_research_max_age_hours
+        ),
         ai_score_max_age_minutes=(
             args.ai_score_max_age_minutes
             if args.ai_score_max_age_minutes is not None
@@ -138,6 +145,11 @@ def main() -> None:
     print(f"  标的: {cfg.symbols}")
     print(f"  策略: {cfg.strategies}")
     print(f"  周期: {cfg.timeframe}  轮询: {cfg.poll_interval_secs}s")
+    if cfg.daily_research_enabled:
+        print(
+            "  每日研究: 开启（盘前/盘后一次，盘中读取冻结报告；"
+            f"深度分析 Top {cfg.daily_research_deep_limit}）"
+        )
     if args.auto_trade:
         print(f"  AI 自动交易: 开启（评分门槛 ≥ {cfg.min_ai_score}，读取 {cfg.ai_score_db}）")
     else:

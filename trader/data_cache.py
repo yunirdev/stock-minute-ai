@@ -312,6 +312,137 @@ def get_bars(symbol: str, timeframe: str) -> pd.DataFrame:
     return df.copy() if df is not None else pd.DataFrame()
 
 
+def describe_cached_bars(
+    symbol: str,
+    timeframe: str,
+    *,
+    frame: pd.DataFrame | None = None,
+    captured_at: datetime | None = None,
+) -> dict:
+    """Describe and serialize the exact cache frame consumed by research."""
+    captured_at = (captured_at or datetime.now(timezone.utc)).astimezone(
+        timezone.utc
+    )
+    bars = get_bars(symbol, timeframe) if frame is None else frame.copy()
+    path = _parquet_path(symbol, timeframe)
+    required = {
+        "timestamp_utc",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+    }
+    normalized = bars.copy()
+    normalized.columns = [str(column).lower() for column in normalized.columns]
+    missing_columns = sorted(required - set(normalized.columns))
+    if missing_columns:
+        rows: list[dict] = []
+        data_start = None
+        data_end = None
+    else:
+        normalized["timestamp_utc"] = pd.to_datetime(
+            normalized["timestamp_utc"],
+            utc=True,
+        )
+        columns = [
+            column
+            for column in (
+                "symbol",
+                "timestamp_utc",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+            )
+            if column in normalized.columns
+        ]
+        rows = []
+        for raw in normalized[columns].to_dict(orient="records"):
+            row = {}
+            for key, value in raw.items():
+                if key == "timestamp_utc":
+                    row[key] = pd.Timestamp(value).isoformat()
+                elif pd.isna(value):
+                    row[key] = None
+                elif hasattr(value, "item"):
+                    row[key] = value.item()
+                else:
+                    row[key] = value
+            rows.append(row)
+        data_start = (
+            normalized["timestamp_utc"].min().to_pydatetime()
+            if not normalized.empty
+            else None
+        )
+        data_end = (
+            normalized["timestamp_utc"].max().to_pydatetime()
+            if not normalized.empty
+            else None
+        )
+
+    if normalized.empty:
+        status = "MISSING"
+        quality_score = 0.0
+        failure_code = "BAR_CACHE_EMPTY"
+    elif missing_columns:
+        status = "FAILED"
+        quality_score = 0.0
+        failure_code = "BAR_COLUMNS_MISSING"
+    elif not rows:
+        status = "MISSING"
+        quality_score = 0.0
+        failure_code = "BAR_CACHE_EMPTY"
+    elif len(rows) < 40:
+        status = "DEGRADED"
+        quality_score = min(len(rows) / 40.0, 1.0)
+        failure_code = "BAR_HISTORY_SHORT"
+    else:
+        status = "OK"
+        quality_score = 1.0
+        failure_code = ""
+    file_updated_at = (
+        datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        if path.exists()
+        else None
+    )
+    return {
+        "source": "local_bar_cache",
+        "status": status,
+        "as_of": data_end or captured_at,
+        "fetched_at": captured_at,
+        "quality_score": quality_score,
+        "coverage": ("ohlcv",),
+        "payload_version": "local-bars:v1",
+        "failure_code": failure_code,
+        "metadata": {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "row_count": len(rows),
+            "missing_columns": missing_columns,
+            "cache_file": str(path),
+            "file_updated_at": (
+                file_updated_at.isoformat()
+                if file_updated_at is not None
+                else None
+            ),
+            "data_start": (
+                data_start.isoformat() if data_start is not None else None
+            ),
+            "data_end": (
+                data_end.isoformat() if data_end is not None else None
+            ),
+        },
+        "payload": {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "columns": sorted(required),
+            "rows": rows,
+        },
+    }
+
+
 
 
 
@@ -401,6 +532,34 @@ def _alpaca_fetch_bars(symbol: str, timeframe: str, start_str: str, end_str: str
         "low":    float(b["l"]), "close":  float(b["c"]),
         "volume": float(b["v"]),
     } for b in all_bars])
+
+
+def fetch_alpaca_bars_window(
+    symbol: str,
+    timeframe: str,
+    start: datetime,
+    end: datetime,
+) -> pd.DataFrame:
+    """Read one explicit Alpaca history window without mutating local cache."""
+    if start.tzinfo is None or start.utcoffset() is None:
+        raise ValueError("ALPACA_HISTORY_START_TIMEZONE_REQUIRED")
+    if end.tzinfo is None or end.utcoffset() is None:
+        raise ValueError("ALPACA_HISTORY_END_TIMEZONE_REQUIRED")
+    start_utc = start.astimezone(timezone.utc)
+    end_utc = end.astimezone(timezone.utc)
+    if start_utc >= end_utc:
+        raise ValueError("ALPACA_HISTORY_WINDOW_INVALID")
+    normalized_symbol = symbol.strip().upper()
+    if not normalized_symbol:
+        raise ValueError("ALPACA_HISTORY_SYMBOL_REQUIRED")
+    if timeframe not in _ALPACA_TF:
+        raise ValueError("ALPACA_HISTORY_TIMEFRAME_UNSUPPORTED")
+    return _alpaca_fetch_bars(
+        normalized_symbol,
+        timeframe,
+        start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        end_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
 
 
 def _alpaca_fetch_full(symbol: str, timeframe: str) -> pd.DataFrame:

@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     ai_score_max_age_minutes: float = Field(
         30.0, validation_alias=AliasChoices("AI_SCORE_MAX_AGE_MINUTES")
     )
+    ai_min_contributors: int = Field(
+        3, validation_alias=AliasChoices("AI_MIN_CONTRIBUTORS")
+    )
+    ai_min_weight_coverage: float = Field(
+        0.50, validation_alias=AliasChoices("AI_MIN_WEIGHT_COVERAGE")
+    )
     allow_quant_without_ai: bool = Field(
         False, validation_alias=AliasChoices("ALLOW_QUANT_WITHOUT_AI")
     )
@@ -59,6 +65,29 @@ class Settings(BaseSettings):
     )
     universe_max_age_minutes: int = Field(
         1440, validation_alias=AliasChoices("UNIVERSE_MAX_AGE_MINUTES")
+    )
+
+
+    daily_research_enabled: bool = Field(
+        True, validation_alias=AliasChoices('DAILY_RESEARCH_ENABLED')
+    )
+    daily_research_db: str = Field(
+        'ai_states.duckdb', validation_alias=AliasChoices('DAILY_RESEARCH_DB')
+    )
+    daily_research_max_age_hours: float = Field(
+        36.0, validation_alias=AliasChoices('DAILY_RESEARCH_MAX_AGE_HOURS')
+    )
+    daily_research_screen_limit: int = Field(
+        10, validation_alias=AliasChoices('DAILY_RESEARCH_SCREEN_LIMIT')
+    )
+    daily_research_deep_limit: int = Field(
+        5, validation_alias=AliasChoices('DAILY_RESEARCH_DEEP_LIMIT')
+    )
+    daily_research_close_hour_et: int = Field(
+        16, validation_alias=AliasChoices('DAILY_RESEARCH_CLOSE_HOUR_ET')
+    )
+    daily_research_close_minute_et: int = Field(
+        15, validation_alias=AliasChoices('DAILY_RESEARCH_CLOSE_MINUTE_ET')
     )
 
 
@@ -120,6 +149,12 @@ class TradingConfig(BaseModel):
     ai_score_max_age_minutes: float = Field(
         default_factory=lambda: settings.ai_score_max_age_minutes
     )
+    ai_min_contributors: int = Field(
+        default_factory=lambda: settings.ai_min_contributors
+    )
+    ai_min_weight_coverage: float = Field(
+        default_factory=lambda: settings.ai_min_weight_coverage
+    )
     allow_quant_without_ai: bool = Field(
         default_factory=lambda: settings.allow_quant_without_ai
     )
@@ -136,6 +171,30 @@ class TradingConfig(BaseModel):
         default_factory=lambda: settings.universe_max_age_minutes
     )
 
+    daily_research_enabled: bool = Field(
+        default_factory=lambda: settings.daily_research_enabled
+    )
+    daily_research_db: str = Field(
+        default_factory=lambda: settings.daily_research_db
+    )
+    daily_research_max_age_hours: float = Field(
+        default_factory=lambda: settings.daily_research_max_age_hours
+    )
+    daily_research_screen_limit: int = Field(
+        default_factory=lambda: settings.daily_research_screen_limit
+    )
+    daily_research_deep_limit: int = Field(
+        default_factory=lambda: settings.daily_research_deep_limit
+    )
+    daily_research_close_hour_et: int = Field(
+        default_factory=lambda: settings.daily_research_close_hour_et
+    )
+    daily_research_close_minute_et: int = Field(
+        default_factory=lambda: settings.daily_research_close_minute_et
+    )
+
     def model_post_init(self, __context: object) -> None:
+        if self.broker_type not in {"alpaca_paper", "alpaca_live"}:
+            raise ValueError("UNSUPPORTED_BROKER_TYPE")
         if self.auto_trade_paper and self.broker_type != 'alpaca_paper':
             raise ValueError('AUTO_TRADE_REQUIRES_ALPACA_PAPER')

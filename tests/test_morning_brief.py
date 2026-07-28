@@ -530,6 +530,7 @@ def test_premarket_movers_use_yahoo_chart_snapshot(monkeypatch):
     import urllib.request
 
     import trader.morning_brief as mb
+    import yfinance as yf
 
     payload = {
         "chart": {
@@ -556,6 +557,16 @@ def test_premarket_movers_use_yahoo_chart_snapshot(monkeypatch):
         }
     }
     monkeypatch.setattr(urllib.request, "urlopen", lambda *_, **__: _FakeResponse(payload))
+    monkeypatch.setattr(
+        yf,
+        "Ticker",
+        lambda _: SimpleNamespace(
+            info={
+                "preMarketPrice": 102.0,
+                "regularMarketPreviousClose": 100.0,
+            }
+        ),
+    )
 
     movers = mb._fetch_premarket_movers(["NVDA"])
 

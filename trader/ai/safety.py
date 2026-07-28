@@ -18,11 +18,18 @@ class AIScoreSnapshot:
     is_stub: bool = False
     schema_version: int = 1
     contributors: list[dict[str, Any]] | None = None
+    contributor_count: int = 0
+    weight_coverage: float = 0.0
+    has_llm: bool = False
+    fallback_count: int = 0
 
 @dataclass(frozen=True)
 class AIScorePolicy:
     min_ai_score: float = 65.0
     max_age_minutes: float = 30.0
+    min_contributors: int = 1
+    min_weight_coverage: float = 0.0
+    require_llm: bool = False
 
 @dataclass(frozen=True)
 class AIScoreValidationResult:
@@ -67,6 +74,13 @@ class AIScoreValidator:
             return AIScoreValidationResult(False, "AI_SCORE_MODEL_MISSING", "AI model is missing", age_seconds=age, score=score, run_id=snapshot.run_id)
         if not snapshot.run_id or not (snapshot.provenance or snapshot.source or snapshot.generated_by):
             return AIScoreValidationResult(False, "AI_SCORE_PROVENANCE_MISSING", "AI score provenance is missing", age_seconds=age, score=score, run_id=snapshot.run_id)
+        if snapshot.contributors is not None:
+            if snapshot.contributor_count < self.policy.min_contributors:
+                return AIScoreValidationResult(False, "AI_SCORE_CONTRIBUTORS_INSUFFICIENT", "AI contributor count is insufficient", age_seconds=age, score=score, run_id=snapshot.run_id)
+            if snapshot.weight_coverage < self.policy.min_weight_coverage:
+                return AIScoreValidationResult(False, "AI_SCORE_COVERAGE_INSUFFICIENT", "AI weight coverage is insufficient", age_seconds=age, score=score, run_id=snapshot.run_id)
+            if self.policy.require_llm and not snapshot.has_llm:
+                return AIScoreValidationResult(False, "AI_SCORE_LLM_MISSING", "A real LLM contributor is required", age_seconds=age, score=score, run_id=snapshot.run_id)
         if score < self.policy.min_ai_score:
             return AIScoreValidationResult(False, "AI_SCORE_BELOW_THRESHOLD", "AI score is below threshold", age_seconds=age, score=score, run_id=snapshot.run_id)
         return AIScoreValidationResult(True, "AI_SCORE_VALID", "AI score is valid", age_seconds=age, score=score, run_id=snapshot.run_id)

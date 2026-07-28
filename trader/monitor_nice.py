@@ -15,10 +15,12 @@ trader/monitor_nice.py
 from __future__ import annotations
 
 import json
+import inspect
 import logging
 import os
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -40,6 +42,7 @@ sys.path.insert(0, str(_ROOT))
 from trader.monitor_data import (  # noqa: E402
     DB_PATH,
     equity_df,
+    explain_order,
     fills_df,
     heartbeat,
     live_alpaca_equity,
@@ -47,7 +50,12 @@ from trader.monitor_data import (  # noqa: E402
     latest_reconciliation,
     orders_df,
     risk_events_df,
+    render_order_explanation_html,
     signals_df,
+)
+from trader.operations_observability import (  # noqa: E402
+    ButtonActionAuditStore,
+    button_contract_manifest,
 )
 
 if sys.platform == "win32":
@@ -67,6 +75,10 @@ _PID_FILE = _ROOT / ".engine.pid"
 _PREFS_PATH = _ROOT / "conf" / "ui_settings.json"
 _REFRESH_SEC = 5.0
 _AI_DB = str(_ROOT / "ai_states.duckdb")
+_DAILY_DB_RAW = Path(os.getenv("DAILY_RESEARCH_DB", "ai_states.duckdb"))
+_DAILY_RESEARCH_DB = str(
+    _DAILY_DB_RAW if _DAILY_DB_RAW.is_absolute() else _ROOT / _DAILY_DB_RAW
+)
 
 from trader.ui_health import (  # noqa: E402
     UI_HEALTH_SCRIPT,
@@ -74,6 +86,8 @@ from trader.ui_health import (  # noqa: E402
     format_health_age,
     record_ui_health,
 )
+from trader.monitor_research_view import live_research_html  # noqa: E402
+from trader.research_monitor import live_monitor_snapshot  # noqa: E402
 
 
 @app.get("/healthz")
@@ -91,6 +105,61 @@ def _ui_health_report(report: UIHealthReport) -> dict:
             "UI health report persistence failed: %s", type(exc).__name__
         )
         return {"accepted": False}
+
+
+@app.get("/api/ui-actions")
+def _ui_actions_contract() -> dict:
+    actions = button_contract_manifest()
+    return {"action_count": len(actions), "actions": actions}
+
+
+@app.get("/api/order-explanation/{plan_id}")
+def _order_explanation(plan_id: str) -> dict:
+    return explain_order(DB_PATH, plan_id)
+
+
+_ACTION_AUDIT_STORE = ButtonActionAuditStore(DB_PATH)
+_ACTIVE_UI_ACTIONS: dict[str, str] = {}
+
+
+def _audited_callback(action_id: str, callback):
+    """Persist one handler dispatch and fail closed on duplicate in-flight calls."""
+
+    async def _wrapped():
+        request_id = _ACTIVE_UI_ACTIONS.get(action_id) or str(uuid.uuid4())
+        started = _ACTION_AUDIT_STORE.begin(
+            action_id,
+            request_id,
+            now=datetime.now(timezone.utc),
+        )
+        if action_id in _ACTIVE_UI_ACTIONS:
+            return started
+        _ACTIVE_UI_ACTIONS[action_id] = request_id
+        try:
+            result = callback()
+            if inspect.isawaitable(result):
+                result = await result
+            empty_result = isinstance(result, (list, dict, tuple, set)) and not result
+            return _ACTION_AUDIT_STORE.finish(
+                started["action_run_id"],
+                state="EMPTY" if empty_result else "SUCCESS",
+                result_ref=f"ui-handler:{action_id}:{request_id}",
+                user_message="动作已完成" if result is not None else "动作已接收",
+                now=datetime.now(timezone.utc),
+            )
+        except Exception as exc:
+            _ACTION_AUDIT_STORE.finish(
+                started["action_run_id"],
+                state="ERROR",
+                result_ref="",
+                user_message=f"操作失败: {type(exc).__name__}",
+                now=datetime.now(timezone.utc),
+            )
+            raise
+        finally:
+            _ACTIVE_UI_ACTIONS.pop(action_id, None)
+
+    return _wrapped
 
 
 ui.add_body_html(f"<script>{UI_HEALTH_SCRIPT}</script>")
@@ -474,15 +543,12 @@ with ui.element("div").classes("qa-body"):
             el.on("click", lambda n=name: _select(n))
             _nav_refs[name] = el
 
-        _nav_group("实况")
-        _nav_item("overview", "📊", "总览")
-        _nav_item("activity", "🧾", "交易记录")
-        _nav_item("cockpit", "🤖", "决策台")
-        _nav_item("selection", "🔭", "选股池")
-        _nav_item("research", "🔬", "研究")
-        _nav_item("risk", "🔒", "风控")
-        _nav_item("maintenance", "🔧", "维护")
-        _nav_item("system", "⚙️", "系统")
+        _nav_group("工作台")
+        _nav_item("overview", "📊", "今日总览")
+        _nav_item("selection", "🔭", "机会中心")
+        _nav_item("activity", "🧾", "交易与持仓")
+        _nav_item("research", "🔬", "研究验证")
+        _nav_item("operations", "⚙️", "系统运营")
 
     content = ui.element("div").classes("qa-content")
 
@@ -864,9 +930,88 @@ def _render_overview():
             '<span style="font-size:12px;color:var(--fg3)">🌍 市场环境 — 点击「刷新」获取</span>'
         )
         ui.element("div").style("flex:1")
-        ui.button("刷新市场环境", on_click=_refresh_regime).props(
+        ui.button(
+            "刷新市场环境",
+            on_click=_audited_callback("overview.refresh_regime", _refresh_regime),
+        ).props(
             "unelevated dense flat outline"
         ).style("font-size:11px;color:var(--fg3)")
+
+    with ui.element("div").classes("qa-card"):
+        with ui.row().classes("items-center gap-3"):
+            ui.label("每日研究与 Runtime 实时监控").classes("qa-card-title")
+            research_status = ui.label("就绪").style(
+                "font-size:12px;color:var(--qa-text-muted)"
+            )
+            ui.element("div").style("flex:1")
+            run_research_btn = ui.button("运行今日研究").props(
+                "unelevated dense color=primary"
+            )
+        ui.html(
+            '<div class="qa-note">每天盘后或盘前只运行一次 TradingAgents；'
+            '盘中 Runtime 只更新价格、入场距离、持仓、订单和状态。</div>'
+        )
+        research_live = ui.html(
+            live_research_html(live_monitor_snapshot(_DAILY_RESEARCH_DB))
+        ).style("margin-top:10px")
+
+        def _run_daily_research_now():
+            run_research_btn.props("disable")
+            research_status.set_text("研究运行中…")
+            import threading as _research_threading
+
+            def _research_work():
+                try:
+                    from trader.config import settings as _settings
+                    from trader.daily_research import (
+                        DailyResearchService,
+                        DailyResearchStore,
+                        TradingAgentsAdapter,
+                        research_target_date,
+                    )
+
+                    now = datetime.now(timezone.utc)
+                    service = DailyResearchService(
+                        DailyResearchStore(_settings.daily_research_db),
+                        TradingAgentsAdapter(),
+                        notifier=None,
+                    )
+                    result = service.run(
+                        [
+                            symbol.strip().upper()
+                            for symbol in str(
+                                _pref('sys_sym', 'SPY,QQQ,AAPL,MSFT,NVDA')
+                            ).split(',')
+                            if symbol.strip()
+                        ],
+                        trading_date=research_target_date(now),
+                        timeframe=str(_pref('sys_tf', '5m')),
+                        screen_limit=_settings.daily_research_screen_limit,
+                        deep_limit=_settings.daily_research_deep_limit,
+                        strategy_statistics_path=_settings.strategy_statistics_path,
+                        force=True,
+                        now=now,
+                    )
+                    research_status.set_text(
+                        f"{result.status} · 完成 {result.completed_symbols} · "
+                        f"失败 {result.failed_symbols}"
+                        + (f" · {result.error_code}" if result.error_code else "")
+                    )
+                    research_live.set_content(
+                        live_research_html(live_monitor_snapshot(_DAILY_RESEARCH_DB))
+                    )
+                except Exception as exc:
+                    research_status.set_text(f"研究失败: {exc}")
+                finally:
+                    run_research_btn.props(remove="disable")
+
+            _research_threading.Thread(
+                target=_research_work, daemon=True
+            ).start()
+
+        run_research_btn.on_click(
+            _audited_callback("overview.run_research", _run_daily_research_now)
+        )
 
     with ui.element("div").classes("qa-kpi-row"):
         k_total = _kpi("总资产")
@@ -899,7 +1044,12 @@ def _render_overview():
                         update()
 
                     _sbtn = (
-                        ui.button(_sl, on_click=_on_span)
+                        ui.button(
+                            _sl,
+                            on_click=_audited_callback(
+                                f"overview.span_{_sl.lower()}", _on_span
+                            ),
+                        )
                         .props("flat no-caps dense")
                         .classes("qa-span-btn")
                     )
@@ -943,6 +1093,9 @@ def _render_overview():
 
     def update():
         nonlocal _eq_span_key
+        research_live.set_content(
+            live_research_html(live_monitor_snapshot(_DAILY_RESEARCH_DB))
+        )
         live = live_alpaca_equity()
 
         # ── 确定 DuckDB 查询窗口 ──────────────────────────────────────────
@@ -1094,7 +1247,7 @@ def _render_overview():
 
 def _render_activity():
     _page_head(
-        "交易记录",
+        "交易与持仓",
         "AI 计划 · 信号 · 风控事件 · 订单 · 数据窗口 24 小时",
         badge="live",
     )
@@ -1119,6 +1272,7 @@ def _render_activity():
         ("side", "方向", "center"),
         ("qty", "数量", "right"),
         ("status", "状态", "center"),
+        ("plan_id", "计划 ID", "left"),
     ]
 
     with ui.element("div").classes("qa-card"):
@@ -1136,6 +1290,16 @@ def _render_activity():
         ui.label("orders").classes("qa-card-sub")
         order_t = _make_table(order_cols)
         order_e = ui.element("div")
+    with ui.element("div").classes("qa-card"):
+        ui.label("最新订单完整解释").classes("qa-card-title")
+        ui.label("来源 · 研究 · 计划版本 · 风险 · OrderIntent · 成交").classes(
+            "qa-card-sub"
+        )
+        order_explanation = ui.html(
+            render_order_explanation_html(
+                {"status": "EMPTY", "plan_id": "", "missing": ["order"]}
+            )
+        )
 
     def _refresh_one(table, empty_box, df, cols, fmts, icon, msg):
         table.set_visibility(not df.empty)
@@ -1147,6 +1311,7 @@ def _render_activity():
             _fill_table(table, df, cols, fmts=fmts)
 
     def update():
+        recent_orders = orders_df(24)
         _refresh_one(
             sig_t,
             sig_e,
@@ -1168,11 +1333,23 @@ def _render_activity():
         _refresh_one(
             order_t,
             order_e,
-            orders_df(24),
+            recent_orders,
             order_cols,
             {"created_at": _fmt_time, "qty": lambda v: f"{float(v):,.0f}"},
             "📋",
             "暂无订单",
+        )
+        if recent_orders.empty or "plan_id" not in recent_orders.columns:
+            explanation = {
+                "status": "EMPTY",
+                "plan_id": "",
+                "missing": ["order"],
+            }
+        else:
+            plan_id = str(recent_orders.iloc[0].get("plan_id") or "")
+            explanation = explain_order(DB_PATH, plan_id)
+        order_explanation.set_content(
+            render_order_explanation_html(explanation)
         )
 
     update()
@@ -1180,7 +1357,7 @@ def _render_activity():
 
 
 def _render_system():
-    _page_head("系统", "引擎控制与运行健康", badge="live")
+    _page_head("系统运营 · 引擎与通知", "引擎控制、运行健康与外部通知", badge="live")
 
     with ui.element("div").classes("qa-card"):
         ui.label("引擎控制").classes("qa-card-title")
@@ -1243,7 +1420,7 @@ def _render_system():
             "⚠️ AI 自动交易：勾选后引擎将读取决策台的 AI 综合评分，"
             "评分 ≥ 门槛时自动向 Alpaca 虚拟盘提交 LMT 限价单。"
             "不勾选 = DRY-RUN（只记日志，不下单）。"
-            "实盘下单请改 .env BROKER_TYPE=alpaca_live。"
+            "自动实盘不受支持；alpaca_live 与自动交易组合会 fail-closed。"
             "</div>"
         )
         ui.html(
@@ -1267,10 +1444,18 @@ def _render_system():
             def _do_stop():
                 ui.notify(_stop_engine())
 
-            ui.button("▶ 启动引擎", on_click=_do_start, color="positive").props(
+            ui.button(
+                "▶ 启动引擎",
+                on_click=_audited_callback("system.start", _do_start),
+                color="positive",
+            ).props(
                 "unelevated"
             )
-            ui.button("■ 停止", on_click=_do_stop, color="negative").props(
+            ui.button(
+                "■ 停止",
+                on_click=_audited_callback("system.stop", _do_stop),
+                color="negative",
+            ).props(
                 "unelevated outline"
             )
 
@@ -1379,7 +1564,9 @@ def _render_system():
                             trade_count=cnt,
                             symbols=_system_symbols(),
                         )
-                        ok = make_notifier().send(msg)
+                        ok = make_notifier(
+                            external_send_enabled=True
+                        ).send(msg)
                         _push_status.set_content(
                             '<span style="color:#3fb950">✓ 复盘已发送</span>'
                             if ok
@@ -1418,16 +1605,30 @@ def _render_system():
 
                 _thr.Thread(target=_work_dr, daemon=True).start()
 
-            ui.button("📨 立即发送晨报", on_click=_do_send_brief).props(
+            ui.button(
+                "📨 立即发送晨报",
+                on_click=_audited_callback("discord.morning", _do_send_brief),
+            ).props(
                 "unelevated dense color=primary"
             )
-            ui.button("📈 发送盘中 OR/VWAP", on_click=_do_send_intraday).props(
+            ui.button(
+                "📈 发送盘中 OR/VWAP",
+                on_click=_audited_callback("discord.intraday", _do_send_intraday),
+            ).props(
                 "unelevated dense color=accent"
             )
-            ui.button("📋 立即发送复盘", on_click=_do_send_review).props(
+            ui.button(
+                "📋 立即发送复盘",
+                on_click=_audited_callback("discord.review", _do_send_review),
+            ).props(
                 "unelevated dense color=secondary"
             )
-            ui.button("🧾 发送方向复盘", on_click=_do_send_direction_review).props(
+            ui.button(
+                "🧾 发送方向复盘",
+                on_click=_audited_callback(
+                    "discord.direction", _do_send_direction_review
+                ),
+            ).props(
                 "unelevated dense outline"
             )
         ui.html(
@@ -1519,7 +1720,7 @@ def _render_system():
 
 
 def _render_research():
-    _page_head("研究", "因子分析 · 策略回测 · 数据本地优先")
+    _page_head("研究验证", "因子分析 · 策略回测 · 数据本地优先")
 
     import asyncio
 
@@ -1787,7 +1988,7 @@ def _render_research():
                 if _state["tab"] == "research":
                     fa_run_btn.enable()
 
-        fa_run_btn.on_click(_run_fa)
+        fa_run_btn.on_click(_audited_callback("factors.run", _run_fa))
 
     # ════════════════════════════════════════════════════════════════════════
     # 二、策略回测
@@ -2051,12 +2252,15 @@ def _render_research():
             if _state["tab"] == "research":
                 bt_run_btn.enable()
 
-    bt_run_btn.on_click(_run)
+    bt_run_btn.on_click(_audited_callback("backtest.run", _run))
     return None
 
 
 def _render_selection_pools():
-    _page_head("选股池", "长期关注池 · 决策池")
+    _page_head(
+        "机会中心",
+        "低频全市场扫描 · 热点候选 · 动态观察池（现阶段沿用长期池/决策池数据）",
+    )
 
     try:
         from trader.selection_pools import (
@@ -2581,6 +2785,7 @@ def _render_selection_pools():
                 decision_style=_decision_style_value(),
                 ai_db_path=_AI_DB,
                 save=False,
+                download_missing_decision_etfs=True,
                 progress_callback=_progress_update,
             )
             save_selection_pools(results)
@@ -2616,6 +2821,7 @@ def _render_selection_pools():
                 limit=daily_limit,
                 decision_style=_decision_style_value(),
                 ai_db_path=_AI_DB,
+                download_missing_decision_etfs=True,
                 progress_callback=_progress_update,
             )
             save_selection_pool(result)
@@ -2642,13 +2848,15 @@ def _render_selection_pools():
     scan_status.on_value_change(lambda _e: _refresh_scan_table())
     scan_tag.on_value_change(lambda _e: _refresh_scan_table())
     scan_limit.on_value_change(lambda _e: _refresh_scan_table())
-    reset_filter_btn.on_click(_reset_scan_filters)
+    reset_filter_btn.on_click(
+        _audited_callback("pool.clear_filter", _reset_scan_filters)
+    )
     scan_table.on("rowClick", _on_scan_row)
-    scan_btn.on_click(_run_scan)
-    build_all_btn.on_click(_build_all)
-    build_long_btn.on_click(_build_long)
-    build_daily_btn.on_click(_build_daily)
-    send_btn.on_click(_send_to_cockpit)
+    scan_btn.on_click(_audited_callback("pool.full_scan", _run_scan))
+    build_all_btn.on_click(_audited_callback("pool.rebuild_all", _build_all))
+    build_long_btn.on_click(_audited_callback("pool.long_term", _build_long))
+    build_daily_btn.on_click(_audited_callback("pool.decision", _build_daily))
+    send_btn.on_click(_audited_callback("pool.send_decision", _send_to_cockpit))
     ui.timer(
         1.0,
         lambda: progress_html.set_content(
@@ -2661,13 +2869,14 @@ def _render_selection_pools():
 
 
 def _render_cockpit():
-    _page_head("决策台", "多 Agent 并行分析 · ThreadPoolExecutor + DuckDB 持久化")
+    _page_head("研究实验台", "旧版自定义 Agent · 仅手动研究，不进入生产 Runtime")
 
     n_real_agents = sum(1 for _, meta in _AGENT_META.items() if not meta[3])
     ui.html(
         f'<div class="qa-note">'
-        f"AI agent 只产出 Advisory / TradePlan；Runtime 通过 AI 安全门和确定性风控后自动执行。"
-        f"点击「运行一轮」触发 {n_real_agents} 个 agent 双轨并行分析（需 Ollama 在线）。"
+        f"这里保留旧版自定义 Agent 供手动对照研究，不再每 15 分钟进入生产 Runtime。"
+        f"点击「运行一轮」会触发 {n_real_agents} 个实验 agent（需 Ollama 在线）；"
+        f"正式路径请在总览运行每日 TradingAgents 研究。"
         f"</div>"
     )
 
@@ -2747,7 +2956,10 @@ def _render_cockpit():
             content = _json.dumps(data, ensure_ascii=False, indent=2, default=str)
             ui.download(content.encode("utf-8"), filename=f"ai_report_{ts}.json")
 
-        ui.button("↓ 导出 JSON", on_click=_do_download).props(
+        ui.button(
+            "↓ 导出 JSON",
+            on_click=_audited_callback("agent.export", _do_download),
+        ).props(
             "unelevated dense flat outline"
         ).style("color:var(--ai);border-color:rgba(88,166,255,.4);font-size:11px")
     report_el = ui.html(_report_html([]))
@@ -2764,7 +2976,7 @@ def _render_cockpit():
         logger.warning("Cockpit: 用户强制重置运行状态")
         ui.notify("运行状态已重置", type="warning")
 
-    reset_btn.on_click(_force_reset)  # 绑定一次
+    reset_btn.on_click(_audited_callback("agent.reset", _force_reset))  # 绑定一次
 
     def _candidate_source_symbols() -> list[str]:
         raw = (sym_in.value or "SPY,AAPL,NVDA,MSFT").strip()
@@ -2845,8 +3057,12 @@ def _render_cockpit():
         _apply_daily_candidates(rows)
         ui.notify("已载入每日候选池")
 
-    daily_btn.on_click(_do_build_daily_candidates)
-    load_daily_btn.on_click(_do_load_daily_candidates)
+    daily_btn.on_click(
+        _audited_callback("agent.generate", _do_build_daily_candidates)
+    )
+    load_daily_btn.on_click(
+        _audited_callback("agent.load", _do_load_daily_candidates)
+    )
 
     # ── 运行按钮逻辑 ─────────────────────────────────────────────────────
     def _do_run():
@@ -3073,7 +3289,7 @@ def _render_cockpit():
                     from trader.notify import make_notifier
 
                     report_data = _build_report_data(mgr, _AI_DB)
-                    notifier = make_notifier()
+                    notifier = make_notifier(external_send_enabled=True)
                     for msg in build_ai_analysis_messages(report_data):
                         notifier.send(msg)
                 except Exception as e:
@@ -3087,7 +3303,7 @@ def _render_cockpit():
 
         threading.Thread(target=_bg, daemon=True).start()
 
-    run_btn.on_click(_do_run)
+    run_btn.on_click(_audited_callback("agent.run", _do_run))
 
     # ── T1 选股结果 (ConsensusSelector) ─────────────────────────────────────
     with ui.element("div").classes("qa-card"):
@@ -3157,7 +3373,7 @@ def _render_cockpit():
 
             threading.Thread(target=_work, daemon=True).start()
 
-        _t1_run_btn.on_click(_do_t1)
+        _t1_run_btn.on_click(_audited_callback("selection.run", _do_t1))
 
     # ── 增量更新函数（每 5s 由定时器调用）─────────────────────────────────
     def update():
@@ -3307,7 +3523,11 @@ def _render_cockpit():
 
 
 def _render_risk():
-    _page_head("风控", "回撤熔断 · Kill Switch · 执行开关 · 风控事件", badge="live")
+    _page_head(
+        "系统运营 · 风控",
+        "回撤熔断 · Kill Switch · 执行开关 · 风控事件",
+        badge="live",
+    )
 
     # ── 读取 config（一次，不在 update 里重复） ───────────────────────────────
     try:
@@ -3420,10 +3640,17 @@ def _render_risk():
                     ui.notify(f"操作失败: {exc}", color="warning")
 
             with ui.row().classes("gap-3").style("margin-top:14px"):
-                ui.button("🛑 触发急停", on_click=_do_engage, color="negative").props(
+                ui.button(
+                    "🛑 触发急停",
+                    on_click=_audited_callback("risk.trigger", _do_engage),
+                    color="negative",
+                ).props(
                     "unelevated"
                 )
-                ui.button("✓ 解除急停", on_click=_do_disengage).props(
+                ui.button(
+                    "✓ 解除急停",
+                    on_click=_audited_callback("risk.clear", _do_disengage),
+                ).props(
                     "unelevated outline"
                 )
 
@@ -3573,7 +3800,10 @@ def _render_risk():
 
 
 def _render_maintenance():
-    _page_head("维护", "绩效复盘 · 异常检测 · 整改建议 · Discord 日报")
+    _page_head(
+        "系统运营 · 诊断",
+        "绩效复盘 · 异常检测 · 整改建议 · Discord 日报",
+    )
     import threading
 
     ui.html(
@@ -3696,7 +3926,9 @@ def _render_maintenance():
 
         threading.Thread(target=_work, daemon=True).start()
 
-    run_btn_m.on_click(lambda: _do_maintenance())
+    run_btn_m.on_click(
+        _audited_callback("maintenance.run", lambda: _do_maintenance())
+    )
     return None
 
 
@@ -5311,12 +5543,63 @@ def _report_html(report_data: list) -> str:
 _cockpit_run = {"running": False, "last_run": None, "stage": "", "start_time": None}
 
 
+def _render_operations():
+    """Thin operations hub; production controls remain in their bounded views."""
+    _page_head(
+        "系统运营",
+        "集中管理 Runtime、风险、通知、诊断与恢复",
+        badge="live",
+    )
+    with ui.element("div").classes("qa-grid").style(
+        "grid-template-columns:repeat(auto-fit,minmax(240px,1fr))"
+    ):
+        with ui.element("div").classes("qa-card"):
+            ui.label("引擎与通知").classes("qa-card-title")
+            ui.label(
+                "启动/停止 Runtime，检查心跳、启动对账、Discord 授权与发送状态。"
+            ).classes("qa-card-sub")
+            system_link = ui.element("div").classes("qa-nav-item")
+            with system_link:
+                ui.label("进入引擎与通知")
+            system_link.on("click", lambda: _select("system"))
+        with ui.element("div").classes("qa-card"):
+            ui.label("风控与急停").classes("qa-card-title")
+            ui.label(
+                "查看回撤、风险事件和 Kill Switch；危险操作与普通监控分开。"
+            ).classes("qa-card-sub")
+            risk_link = ui.element("div").classes("qa-nav-item")
+            with risk_link:
+                ui.label("进入风控与急停")
+            risk_link.on("click", lambda: _select("risk"))
+        with ui.element("div").classes("qa-card"):
+            ui.label("诊断与复盘").classes("qa-card-title")
+            ui.label(
+                "运行异常检测、查看绩效复盘和只读整改建议。"
+            ).classes("qa-card-sub")
+            maintenance_link = ui.element("div").classes("qa-nav-item")
+            with maintenance_link:
+                ui.label("进入诊断与复盘")
+            maintenance_link.on("click", lambda: _select("maintenance"))
+    with ui.element("div").classes("qa-card").style("margin-top:12px"):
+        ui.label("平台边界").classes("qa-card-title")
+        ui.label(
+            "NiceGUI 负责监控、研究和运营；Runtime 仍是唯一订单提交者。"
+            "旧版自定义 Agent 已从主导航移除，不进入生产交易链。"
+        ).classes("qa-card-sub")
+
+    def update():
+        return None
+
+    return update
+
+
 _RENDERERS = {
     "overview": _render_overview,
     "activity": _render_activity,
     "cockpit": _render_cockpit,
     "selection": _render_selection_pools,
     "research": _render_research,
+    "operations": _render_operations,
     "risk": _render_risk,
     "maintenance": _render_maintenance,
     "system": _render_system,
@@ -5325,11 +5608,11 @@ _RENDERERS = {
 # 旧 tab 名称 → 新名称（保留用户偏好跨版本兼容）
 _TAB_MIGRATION = {
     "market_env": "overview",
-    "t1_selection": "cockpit",
+    "t1_selection": "research",
     "t2_factor": "research",
     "t3_trading": "activity",
-    "t4_risk": "risk",
-    "t5_maintenance": "maintenance",
+    "t4_risk": "operations",
+    "t5_maintenance": "operations",
     "universe": "selection",
     "models": "overview",
 }
@@ -5418,11 +5701,13 @@ if __name__ in {"__main__", "__mp_main__"}:
         (a.split("=", 1)[1] for a in sys.argv if a.startswith("--port=")), None
     )
     _port = int(_port_arg or os.getenv("QUANT_PORT", "8080"))
+    _host = os.getenv("QUANT_HOST", "127.0.0.1")
     try:
         ui.run(
             title="美股K线 · DuckDB + Alpaca 实时",
             reload=False,
             native=not _web,
+            host=_host if _web else None,
             port=_port if _web else None,
             show=_web,
             window_size=(1600, 1000) if not _web else None,

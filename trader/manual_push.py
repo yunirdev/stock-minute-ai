@@ -72,7 +72,7 @@ def build_direction_review_message(
 
 
 def _send_all(messages: List[Notification]) -> bool:
-    notifier = make_notifier()
+    notifier = make_notifier(external_send_enabled=True)
     ok = True
     for message in messages:
         ok = notifier.send(message) and ok

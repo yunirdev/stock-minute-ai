@@ -88,6 +88,19 @@ class AuditLog:
             )
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS plan_risk_events (
+                ts          TIMESTAMPTZ,
+                plan_id     TEXT,
+                decision_id TEXT,
+                symbol      TEXT,
+                side        TEXT,
+                action      TEXT,
+                phase       TEXT,
+                verdict     TEXT,
+                reason      TEXT
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS ai_safety_events (
                 ts TIMESTAMPTZ, symbol TEXT, plan_id TEXT, score DOUBLE,
                 run_id TEXT, created_at TIMESTAMPTZ, age_seconds DOUBLE,
@@ -203,6 +216,34 @@ class AuditLog:
                 "INSERT INTO risk_events VALUES (?,?,?,?,?,?)",
                 [datetime.now(timezone.utc), signal.symbol, signal.strategy,
                  signal.side.value, v, verdict.reason],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def log_plan_risk_event(
+        self,
+        plan: TradePlan,
+        verdict: RiskVerdict,
+        *,
+        phase: str,
+    ) -> None:
+        """Persist a plan-linked deterministic risk verdict for traceability."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO plan_risk_events VALUES (?,?,?,?,?,?,?,?,?)",
+                [
+                    datetime.now(timezone.utc),
+                    plan.plan_id,
+                    plan.metadata.get("decision_id", ""),
+                    plan.symbol,
+                    plan.side.value,
+                    plan.action,
+                    phase,
+                    "APPROVED" if verdict.approved else "BLOCKED",
+                    verdict.reason,
+                ],
             )
             conn.commit()
         finally:

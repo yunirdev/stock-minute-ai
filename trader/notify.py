@@ -11,12 +11,16 @@ notify.py
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict
 
+from .discord_delivery import DiscordDeliveryStore
 from .models import Notification
 
 logger = logging.getLogger(__name__)
@@ -45,22 +49,78 @@ class DiscordNotifier:
         bot_token: str | None = None,
         channel_id: str | None = None,
         webhook_url: str | None = None,
+        *,
+        external_send_enabled: bool | None = None,
+        audit_db_path: str | None = None,
     ) -> None:
         # None = 未显式传入，读环境变量；"" = 显式禁用，不读环境变量（测试用）
         self._token   = (bot_token   if bot_token   is not None else os.getenv("DISCORD_BOT_TOKEN",   "")).strip()
         self._channel = (channel_id  if channel_id  is not None else os.getenv("DISCORD_CHANNEL_ID",  "")).strip()
         self._webhook = (webhook_url if webhook_url  is not None else os.getenv("DISCORD_WEBHOOK_URL", "")).strip()
         self._console = ConsoleNotifier()
+        explicitly_configured = any(
+            value is not None for value in (bot_token, channel_id, webhook_url)
+        )
+        if external_send_enabled is None:
+            external_send_enabled = explicitly_configured or os.getenv(
+                "DISCORD_EXTERNAL_SEND_ENABLED", ""
+            ).strip().lower() in {"1", "true", "yes", "on"}
+        self._external_send_enabled = bool(external_send_enabled)
+        root = Path(__file__).resolve().parents[1]
+        raw_db = Path(
+            audit_db_path or os.getenv("TRADE_DB_PATH", "trade.duckdb")
+        )
+        self._audit_db_path = str(
+            raw_db if raw_db.is_absolute() else root / raw_db
+        )
 
     # ── 公共入口 ─────────────────────────────────────────────────────────────
 
     def send(self, note: Notification) -> bool:
+        configured = bool((self._token and self._channel) or self._webhook)
+        if not configured:
+            logger.warning(
+                "Discord 未配置（无 BOT_TOKEN/CHANNEL_ID 也无 WEBHOOK_URL），降级 console"
+            )
+        payload_key = "|".join(
+            (
+                note.kind,
+                note.title,
+                note.body,
+                str(note.plan_id or ""),
+                datetime.now(timezone.utc).date().isoformat(),
+                f"authorized={self._external_send_enabled}",
+            )
+        )
+        dedupe_key = hashlib.sha256(payload_key.encode()).hexdigest()
+        try:
+            result = DiscordDeliveryStore(
+                self._audit_db_path,
+                sender=_DiscordTransport(self),
+                external_send_enabled=self._external_send_enabled,
+            ).deliver(
+                note,
+                message_kind=note.kind or "system",
+                dedupe_key=dedupe_key,
+                dry_run=not configured,
+                now=datetime.now(timezone.utc),
+            )
+        except Exception as exc:
+            logger.error(
+                "Discord 审计失败，禁止外发: %s",
+                type(exc).__name__,
+            )
+            return self._console.send(note) if not configured else False
+        if result["status"] == "DRY_RUN":
+            return self._console.send(note)
+        return result["status"] == "SENT"
+
+    def _send_configured(self, note: Notification) -> bool:
         if self._token and self._channel:
             return self._send_bot(note)
         if self._webhook:
             return self._send_webhook(note)
-        logger.warning("Discord 未配置（无 BOT_TOKEN/CHANNEL_ID 也无 WEBHOOK_URL），降级 console")
-        return self._console.send(note)
+        return False
 
     # ── Bot Token 方式 ────────────────────────────────────────────────────────
 
@@ -117,7 +177,16 @@ class DiscordNotifier:
             return ok
         except Exception as exc:
             logger.error("Discord 推送失败: %s，降级 console", exc)
-            return self._console.send(note)
+            self._console.send(note)
+            return False
+
+
+class _DiscordTransport:
+    def __init__(self, notifier: DiscordNotifier) -> None:
+        self.notifier = notifier
+
+    def send(self, note: Notification) -> bool:
+        return self.notifier._send_configured(note)
 
 
 def _color_for_kind(kind: str) -> int:
@@ -132,6 +201,9 @@ def _color_for_kind(kind: str) -> int:
 
 
 # 默认单例（供 runtime / cockpit 使用）
-def make_notifier() -> DiscordNotifier:
+def make_notifier(
+    *,
+    external_send_enabled: bool | None = None,
+) -> DiscordNotifier:
     """优先 Bot Token，其次 Webhook，最后 console。"""
-    return DiscordNotifier()
+    return DiscordNotifier(external_send_enabled=external_send_enabled)

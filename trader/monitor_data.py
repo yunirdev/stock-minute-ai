@@ -18,6 +18,11 @@ import duckdb
 import pandas as pd
 from dotenv import load_dotenv
 
+from .operations_observability import (
+    explain_order as explain_order,
+    render_order_explanation_html as render_order_explanation_html,
+)
+
 _ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(_ROOT / ".env", override=True)  # .env 优先于已存在的 OS 环境变量，见 config.py 注释
 

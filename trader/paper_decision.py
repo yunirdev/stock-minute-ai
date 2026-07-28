@@ -163,10 +163,22 @@ class StrategyDecision:
 
 
 class PaperDecisionService:
-    def __init__(self, *, allow_without_ai: bool = False, ai_max_age_minutes: int = 30, decision_ttl_minutes: int = 15) -> None:
+    def __init__(
+        self,
+        *,
+        allow_without_ai: bool = False,
+        ai_max_age_minutes: int = 30,
+        decision_ttl_minutes: int = 15,
+        ai_min_contributors: int = 3,
+        ai_min_weight_coverage: float = 0.50,
+        min_ai_score: float = 0.0,
+    ) -> None:
         self.allow_without_ai = allow_without_ai
         self.ai_max_age = ai_max_age_minutes
         self.ttl = decision_ttl_minutes
+        self.ai_min_contributors = ai_min_contributors
+        self.ai_min_weight_coverage = ai_min_weight_coverage
+        self.min_ai_score = min_ai_score
 
     def decide(
         self,
@@ -202,7 +214,16 @@ class PaperDecisionService:
             chosen, alternatives = stats[0], stats[1:]
             side = Side.BUY if int(votes[chosen.strategy]) > 0 else Side.SELL
             advisory = ai_advisories.get(symbol)
-            ai_result = AIScoreValidator(AIScorePolicy(0, self.ai_max_age), lambda: now).validate(advisory)
+            ai_result = AIScoreValidator(
+                AIScorePolicy(
+                    self.min_ai_score,
+                    self.ai_max_age,
+                    min_contributors=(1 if self.allow_without_ai else self.ai_min_contributors),
+                    min_weight_coverage=(0.0 if self.allow_without_ai else self.ai_min_weight_coverage),
+                    require_llm=not self.allow_without_ai,
+                ),
+                lambda: now,
+            ).validate(advisory)
             if not ai_result.valid and not self.allow_without_ai:
                 continue
             evidence = {}
@@ -260,7 +281,12 @@ class AdvisoryWorker:
             future, self._future = self._future, None
             return future.result()
         if time.monotonic() - self._started > self.timeout:
-            self._future.cancel()
+            future, self._future = self._future, None
+            future.cancel()
+            old_pool = self._pool
+            self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="advisory")
+            old_pool.shutdown(wait=False, cancel_futures=True)
+            raise TimeoutError("advisory cycle exceeded its deadline")
         return None
 
     def close(self) -> None:

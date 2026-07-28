@@ -8,9 +8,12 @@ Agent/LLM 不直接调用 broker；自动执行仅允许 Alpaca Paper 限价单�
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -22,22 +25,52 @@ from .data_cache import upsert_bars as _dc_upsert
 from .data_feed import AlpacaDataFeed
 from .market_calendar import SimpleMarketCalendar
 from .models import (
-    AgentContext, Bar, Notification, OrderIntent, OrderStatus,
-    Position, Side, TradePlan, new_id, utc_now,
+    Bar,
+    CandidatePlanStatus,
+    FinalTradePlanStatus,
+    InvalidationEvent,
+    Notification,
+    OrderIntent,
+    OrderStatus,
+    Position,
+    PositionAdjustment,
+    RiskVerdict,
+    Side,
+    TradePlan,
+    utc_now,
 )
 from .news import FinnhubSource, PriceMoveSource, SECEdgarSource, WallStreetCNSource
 from .notify import DiscordNotifier
 from .plan import ATRPlanner
 from .portfolio import Portfolio
+from .invalidation_events import InvalidationEventStore
+from .position_adjustments import PositionAdjustmentStore
+from .position_plans import PositionPlanFillProjector, PositionPlanStore
+from .position_quality import PositionQualityStore
+from .post_trade_learning import PostTradeLearningCoordinator
+from .production_evidence import ProductionEvidenceCoordinator
+from .production_operations import ProductionOperationsCoordinator
 from .position_monitor import StopTakeProfitMonitor
 from .review import SimpleReviewer
 from .risk_engine import RiskEngine
-from .order_lifecycle import OrderIntentStore, OrderLifecycle, idempotency_key, client_order_id, reconcile_broker
-from .paper_decision import AdvisoryWorker, PaperDecisionService, StrategyStatisticsRepository, UniverseProvider
+from .order_lifecycle import (
+    OrderIntentStore,
+    OrderLifecycle,
+    ReconciliationReport,
+    idempotency_key,
+    reconcile_broker_facts,
+)
+from .paper_decision import PaperDecisionService, StrategyStatisticsRepository, UniverseProvider
 from .bug_reporting import BugReporter
-from .ai.manager import AgentManager
 from .ai.safety import AIScorePolicy, AIScoreSnapshot, AIScoreValidator
+from .daily_runtime_support import DailyRuntimeSupport
+from .execution_pipeline import (
+    ExecutionPipelineStore,
+    candidate_from_trade_plan,
+)
+from .signal_reports import SignalStore, build_ready_signal_report
 from .selection import ConsensusSelector
+from .trade_episodes import TradeEpisodeStore
 from .watchdog import FileKillSwitch, HeartbeatWatchdog
 
 logger = logging.getLogger(__name__)
@@ -140,7 +173,7 @@ class Runtime:
 
     def __init__(self, config: TradingConfig) -> None:
         self._cfg = config
-        is_paper = config.broker_type != "alpaca_live"
+        is_paper = config.broker_type == "alpaca_paper"
 
         self._kill = FileKillSwitch()
         self._calendar = SimpleMarketCalendar()
@@ -175,20 +208,60 @@ class Runtime:
         self._tick_count = 0
         self._open_orders: Dict[str, OrderIntent] = {}
         self._order_store = OrderIntentStore(config.db_path)
+        self._position_plan_store = PositionPlanStore(config.db_path)
+        self._position_plan_projector = PositionPlanFillProjector(
+            self._position_plan_store
+        )
+        self._invalidation_event_store = InvalidationEventStore(
+            config.db_path
+        )
+        self._position_adjustment_store = PositionAdjustmentStore(
+            config.db_path
+        )
+        self._position_quality_store = PositionQualityStore(config.db_path)
+        self._production_evidence = ProductionEvidenceCoordinator(
+            config.db_path
+        )
+        self._production_operations = ProductionOperationsCoordinator(
+            config.db_path,
+            ai_db_path=(
+                config.daily_research_db
+                if config.daily_research_enabled
+                else config.ai_score_db
+            ),
+        )
+        self._execution_pipeline_store = ExecutionPipelineStore(
+            config.db_path
+        )
+        self._trade_episode_store = TradeEpisodeStore(config.db_path)
+        self._post_trade_learning = PostTradeLearningCoordinator(
+            config.db_path
+        )
+        self._signal_store = SignalStore(config.db_path)
         self._bug_reporter = BugReporter(config.db_path, "runtime")
         self._reconciliation_blocked = False
+        daily_research = bool(config.daily_research_enabled)
         self._decision_service = PaperDecisionService(
             allow_without_ai=config.allow_quant_without_ai,
-            ai_max_age_minutes=int(config.ai_score_max_age_minutes),
-        )
-        self._advisory_worker = AdvisoryWorker(
-            AgentManager(),
-            min_interval_seconds=max(60, int(config.agent_cycle_interval_minutes * 60)),
+            min_ai_score=config.min_ai_score,
+            ai_max_age_minutes=(
+                int(config.daily_research_max_age_hours * 60)
+                if daily_research
+                else int(config.ai_score_max_age_minutes)
+            ),
+            ai_min_contributors=1 if daily_research else config.ai_min_contributors,
+            ai_min_weight_coverage=(
+                1.0 if daily_research else config.ai_min_weight_coverage
+            ),
         )
         self._strategy_stats = StrategyStatisticsRepository.from_json(config.strategy_statistics_path)
         self._universe_provider = UniverseProvider(config.symbols, config.universe_max_symbols, config.universe_max_age_minutes)
         self._universe_snapshot = self._universe_provider.provide(cli_symbols=config.symbols, now=utc_now())
+        self._daily_research = DailyRuntimeSupport(
+            config, self._universe_snapshot.symbols
+        )
         self._live_plans: Dict[str, TradePlan] = {}  # symbol → 当前活跃计划
+        self._monitor_plans: Dict[str, TradePlan] = {}
         self._daily_start_set = False
         self._last_review_date: Optional[str] = None
         self._last_brief_date: Optional[str] = None
@@ -232,38 +305,355 @@ class Runtime:
                     "Runtime tick failed: %s", type(exc).__name__, exc_info=True
                 )
 
-        self._advisory_worker.close()
+        self._daily_research.close()
         logger.info("Runtime stopped")
+
+    def _recover_incomplete_adjustments(self) -> list[str]:
+        store = getattr(self, "_position_adjustment_store", None)
+        if store is None:
+            return []
+        errors: list[str] = []
+        for adjustment in store.list_incomplete():
+            if adjustment.status.value != "PLANNED":
+                continue
+            current = self._position_plan_store.current(
+                adjustment.position_plan_id
+            )
+            if current is None:
+                errors.append(
+                    "POSITION_ADJUSTMENT_PLAN_MISSING:"
+                    f"{adjustment.adjustment_id}"
+                )
+                continue
+            try:
+                order_plan = store.order_plan_for(
+                    adjustment,
+                    plan=current,
+                )
+                prepared_intent = self._execute_via_pipeline(
+                    order_plan,
+                    0.0,
+                    self._portfolio.positions,
+                )
+                if prepared_intent is None:
+                    raise RuntimeError(
+                        "POSITION_ADJUSTMENT_INTENT_NOT_PREPARED"
+                    )
+                key = prepared_intent.idempotency_key
+                row = self._order_store.get_by_key(key)
+                if row is None:
+                    errors.append(
+                        "POSITION_ADJUSTMENT_ORDER_NOT_CREATED:"
+                        f"{adjustment.adjustment_id}"
+                    )
+                    continue
+                store.link_order(
+                    adjustment.adjustment_id,
+                    order_intent_id=str(row["intent_id"]),
+                    order_idempotency_key=key,
+                )
+            except Exception as exc:
+                errors.append(
+                    "POSITION_ADJUSTMENT_RECOVERY_FAILED:"
+                    f"{adjustment.adjustment_id}:{type(exc).__name__}"
+                )
+        return errors
+
+    def _position_plan_reconciliation_errors(self) -> list[str]:
+        store = getattr(self, "_position_plan_store", None)
+        if store is None:
+            return []
+        errors: list[str] = []
+        positions = self._portfolio.positions
+        for plan in store.recover_open():
+            position = positions.get(plan.symbol)
+            local_qty = float(position.qty) if position is not None else 0.0
+            if abs(local_qty - plan.open_quantity) > 1e-8:
+                errors.append(
+                    "POSITION_PLAN_QUANTITY_MISMATCH:"
+                    f"{plan.symbol}:plan={plan.open_quantity:g},"
+                    f"local={local_qty:g}"
+                )
+        adjustment_store = getattr(
+            self,
+            "_position_adjustment_store",
+            None,
+        )
+        if adjustment_store is None:
+            return errors
+        order_rows = {
+            str(row.get("idempotency_key") or ""): row
+            for row in self._order_store.list_all()
+        }
+        terminal_failure_states = {
+            OrderLifecycle.CANCELED.value,
+            OrderLifecycle.REJECTED.value,
+        }
+        for adjustment in adjustment_store.list_incomplete():
+            if adjustment.status.value == "PLANNED":
+                errors.append(
+                    "POSITION_ADJUSTMENT_UNLINKED:"
+                    f"{adjustment.adjustment_id}"
+                )
+                continue
+            row = order_rows.get(adjustment.order_idempotency_key)
+            if row is None:
+                errors.append(
+                    "POSITION_ADJUSTMENT_ORDER_MISSING:"
+                    f"{adjustment.adjustment_id}"
+                )
+                continue
+            state = str(row.get("state") or "")
+            if state == OrderLifecycle.FILLED.value:
+                adjustment_store.mark_completed_by_order_plan(
+                    adjustment.order_plan_id
+                )
+            elif state in terminal_failure_states:
+                errors.append(
+                    "POSITION_ADJUSTMENT_ORDER_TERMINAL:"
+                    f"{adjustment.adjustment_id}:{state}"
+                )
+        return errors
 
     def _run_reconciliation(self) -> None:
         try:
-            report = reconcile_broker(self._broker, self._order_store.list_all(), self._portfolio.positions.values())
-            self._audit.log_reconciliation(report)
-            self._reconciliation_blocked = not report.ok
-            if self._reconciliation_blocked:
-                logger.error("startup reconciliation blocked trading")
+            recovery_errors = self._recover_incomplete_adjustments()
             local_rows = self._order_store.list_all()
-            for fill in self._broker.get_recent_fills():
+            broker_orders = list(self._broker.get_open_orders())
+            broker_positions = list(self._broker.get_positions())
+            broker_fills = list(self._broker.get_recent_fills())
+            unexplained_fills: list[str] = []
+
+            for fill in broker_fills:
                 local = next((row for row in local_rows if row.get("broker_order_id") == fill.order_id), None)
                 if local:
                     fill.intent_id = local["intent_id"]
                     self._portfolio.apply_fill(fill)
-            for order in self._broker.get_open_orders():
+                    projector = getattr(
+                        self,
+                        "_position_plan_projector",
+                        None,
+                    )
+                    if projector is not None:
+                        current_plan = (
+                            self._position_plan_store.current_for_symbol(
+                                fill.symbol
+                            )
+                        )
+                        trade_plan = None
+                        if fill.side == Side.BUY and current_plan is None:
+                            trade_plan = (
+                                self._position_plan_store.recover_trade_plan(
+                                    str(local.get("plan_id") or "")
+                                )
+                            )
+                        if current_plan is not None or trade_plan is not None:
+                            projected_plan = projector.apply(
+                                fill=fill,
+                                applied_delta=None,
+                                trade_plan=trade_plan,
+                            )
+                            episode_store = getattr(
+                                self,
+                                "_trade_episode_store",
+                                None,
+                            )
+                            if (
+                                episode_store is not None
+                                and projected_plan is not None
+                            ):
+                                episode = episode_store.sync(
+                                    projected_plan.position_plan_id
+                                )
+                                self._post_trade_learning.process(episode)
+                    self._signal_store.apply_fill(
+                        str(local.get("plan_id", "")), fill
+                    )
+                    cumulative_filled_qty = float(fill.filled_qty)
+                    total_qty = float(local.get("qty") or 0.0)
+                    remaining_qty = max(
+                        total_qty - cumulative_filled_qty,
+                        0.0,
+                    )
+                    self._order_store.update(
+                        local["idempotency_key"],
+                        filled_qty=cumulative_filled_qty,
+                        remaining_qty=remaining_qty,
+                        state=(
+                            OrderLifecycle.FILLED.value
+                            if remaining_qty <= 0
+                            else OrderLifecycle.PARTIALLY_FILLED.value
+                        ),
+                    )
+                    if remaining_qty <= 0:
+                        adjustment_store = getattr(
+                            self,
+                            "_position_adjustment_store",
+                            None,
+                        )
+                        if adjustment_store is not None:
+                            adjustment_store.mark_completed_by_order_plan(
+                                str(local.get("plan_id") or "")
+                            )
+                else:
+                    unexplained_fills.append(str(fill.order_id))
+
+            local_rows = self._order_store.list_all()
+            active_states = {
+                OrderLifecycle.PERSISTED.value,
+                OrderLifecycle.SENDING.value,
+                OrderLifecycle.ACKNOWLEDGED.value,
+                OrderLifecycle.UNKNOWN.value,
+                OrderLifecycle.OPEN.value,
+                OrderLifecycle.PARTIALLY_FILLED.value,
+                OrderLifecycle.CANCEL_REQUESTED.value,
+            }
+            for order in broker_orders:
                 broker_id = str(order.get("id", "")) if isinstance(order, dict) else str(getattr(order, "id", ""))
-                local = next((row for row in self._order_store.list_all() if row.get("broker_order_id") == broker_id), None)
+                broker_client_id = (
+                    order.get("client_order_id")
+                    if isinstance(order, dict)
+                    else getattr(order, "client_order_id", None)
+                )
+                local = next(
+                    (
+                        row
+                        for row in local_rows
+                        if row.get("state") in active_states
+                        and (
+                            str(row.get("broker_order_id") or "") == broker_id
+                            or (
+                                broker_client_id
+                                and row.get("client_order_id")
+                                == broker_client_id
+                            )
+                        )
+                    ),
+                    None,
+                )
                 if local:
-                    self._open_orders[broker_id] = OrderIntent(
+                    intent = OrderIntent(
                         intent_id=local["intent_id"], signal_id=local.get("decision_id", ""),
                         symbol=local["symbol"], side=Side(local["side"]), qty=local["qty"],
                         order_type=local["order_type"], limit_price=local["limit_price"],
                         tif=local["tif"], idempotency_key=local["idempotency_key"],
-                        client_order_id=local.get("client_order_id", ""))
+                        client_order_id=local.get("client_order_id", ""),
+                        decision_id=local.get("decision_id", ""),
+                        plan_id=local.get("plan_id", ""),
+                        candidate_plan_id=local.get(
+                            "candidate_plan_id",
+                            "",
+                        ),
+                        final_plan_id=local.get("final_plan_id", ""),
+                        final_plan_version=int(
+                            local.get("final_plan_version") or 0
+                        ),
+                        risk_check_id=local.get("risk_check_id", ""),
+                        evidence_refs=tuple(
+                            json.loads(
+                                local.get("evidence_refs_json") or "[]"
+                            )
+                        ),
+                    )
+                    self._open_orders[broker_id] = intent
+                    self._order_store.update(
+                        local["idempotency_key"],
+                        broker_order_id=broker_id,
+                        state=(
+                            OrderLifecycle.PARTIALLY_FILLED.value
+                            if float(local.get("filled_qty") or 0.0) > 0
+                            else OrderLifecycle.OPEN.value
+                        ),
+                    )
+
+            local_rows = self._order_store.list_all()
+            report = reconcile_broker_facts(
+                broker_orders,
+                broker_positions,
+                broker_fills,
+                local_rows,
+                self._portfolio.positions.values(),
+            )
+            report.errors.extend(
+                f"UNEXPLAINED_FILL:{order_id}"
+                for order_id in unexplained_fills
+            )
+            report.errors.extend(recovery_errors)
+            report.errors.extend(
+                self._position_plan_reconciliation_errors()
+            )
+            quality_store = getattr(
+                self,
+                "_position_quality_store",
+                None,
+            )
+            if quality_store is not None:
+                try:
+                    observed_at = utc_now()
+                    quality_store.capture(
+                        broker_positions=broker_positions,
+                        local_positions=self._portfolio.positions.values(),
+                        observed_at=observed_at,
+                        observation_kind="REAL",
+                    )
+                    quality_store.build_report(
+                        as_of=observed_at.astimezone(
+                            ZoneInfo("America/New_York")
+                        ).date(),
+                        required_days=30,
+                        observation_kind="REAL",
+                    )
+                except Exception as exc:
+                    report.errors.append(
+                        "POSITION_QUALITY_CAPTURE_FAILED:"
+                        f"{type(exc).__name__}"
+                    )
+            report.ok = (
+                not report.unexplained_orders
+                and not report.unexplained_positions
+                and not report.errors
+            )
+            self._audit.log_reconciliation(report)
+            self._reconciliation_blocked = not report.ok
+            if self._reconciliation_blocked:
+                logger.error("startup reconciliation blocked trading")
         except Exception as exc:
             self._reconciliation_blocked = True
+            report = ReconciliationReport(
+                ok=False,
+                errors=[type(exc).__name__],
+            )
+            try:
+                self._audit.log_reconciliation(report)
+            except Exception:
+                logger.exception("failed to persist reconciliation failure")
             self._bug_reporter.capture_exception(exc, operation="runtime.reconciliation")
             logger.error("startup reconciliation failed: %s", type(exc).__name__)
     def stop(self) -> None:
         self._running = False
+
+    def _make_decision_plan(
+        self,
+        cand,
+        latest_bar: Bar,
+        decision,
+        *,
+        current_qty: float,
+        bars_history: list[Bar],
+    ) -> TradePlan:
+        """Translate a validated StrategyDecision into an ATR plan.
+
+        Direction belongs to PaperDecision. Candidate score is confidence
+        evidence only and must never infer or override BUY/SELL here.
+        """
+        return self._planner.make_plan(
+            cand,
+            latest_bar,
+            params=decision.params,
+            side=decision.side,
+            current_qty=current_qty,
+            bars_history=bars_history,
+        )
 
     # ── 主循环 ───────────────────────────────────────────────────────────────
 
@@ -271,6 +661,47 @@ class Runtime:
         self._tick_count += 1
         ts = utc_now()
         logger.info("── tick #%d  %s ──", self._tick_count, ts.strftime("%H:%M:%S UTC"))
+
+        self._daily_research.tick(ts)
+        try:
+            position_report = self._position_quality_store.build_report(
+                as_of=ts.astimezone(ZoneInfo("America/New_York")).date(),
+                required_days=30,
+                observation_kind="REAL",
+            )
+            self._production_evidence.tick(
+                now=ts,
+                research_run=self._daily_research.store.latest_run(),
+                position_report=position_report,
+                reconciliation_blocked=self._reconciliation_blocked,
+            )
+        except Exception as exc:
+            self._bug_reporter.capture_exception(
+                exc,
+                operation="runtime.production_evidence",
+            )
+            logger.error(
+                "production evidence capture failed: %s",
+                type(exc).__name__,
+            )
+        try:
+            backup = self._production_operations.tick(now=ts)
+            if backup["status"] == "FAILED":
+                logger.error(
+                    "production backup failed: %s",
+                    backup["error_code"],
+                )
+        except Exception as exc:
+            self._bug_reporter.capture_exception(
+                exc,
+                operation="runtime.production_backup",
+            )
+            logger.error(
+                "production backup failed: %s",
+                type(exc).__name__,
+            )
+        for expired in self._signal_store.invalidate_expired(ts):
+            self._monitor_plans.pop(expired.symbol, None)
 
         # 1. Kill switch 急停检查
         if self._reconciliation_blocked:
@@ -324,11 +755,15 @@ class Runtime:
             self._portfolio.snapshot_external_equity(equity)
             self._audit.log_heartbeat(self._tick_count, equity)
             self._maybe_daily_review(ts)
+            self._publish_runtime_status(
+                ts, session, equity, positions, message="market closed"
+            )
             return
         if session != "open":
             logger.info("market session=%s — no new trade plans outside regular hours", session)
             self._portfolio.snapshot_external_equity(equity)
             self._audit.log_heartbeat(self._tick_count, equity)
+            self._publish_runtime_status(ts, session, equity, positions)
             return
 
         # 8. 拉取 K 线，更新数据缓存
@@ -364,6 +799,9 @@ class Runtime:
             logger.warning("无可用 K 线数据，跳过 selection")
             self._portfolio.snapshot_external_equity(equity)
             self._audit.log_heartbeat(self._tick_count, equity)
+            self._publish_runtime_status(
+                ts, session, equity, positions, message="no fresh bars"
+            )
             return
 
         # 9. 新闻事件：四路合并（WSCN + SEC 8-K + Finnhub + 价格异动）
@@ -392,7 +830,11 @@ class Runtime:
                     "[POS_MONITOR] %s %s @ %.2f",
                     close_plan.symbol, close_plan.rationale[:40], close_plan.entry_price,
                 )
-                self._execute_plan(close_plan, equity, positions)
+                self._execute_via_pipeline(
+                    close_plan,
+                    equity,
+                    positions,
+                )
 
         # 11. 选股（ConsensusSelector → T0 regime 动态 score 阈值过滤）
         score_threshold = _get_score_threshold()
@@ -420,25 +862,18 @@ class Runtime:
             logger.error("selection.select 失败: %s", exc, exc_info=True)
             candidates = []
 
-        try:
-            completed = self._advisory_worker.poll()
-            if completed is not None:
-                logger.info("Agent cycle completed: %d advisories", len(completed))
-            started = self._advisory_worker.start(
-                AgentContext(
-                    candidates=candidates,
-                    news=news,
-                    positions=positions,
-                    equity=equity,
-                    as_of=ts,
-                ),
-                self._cfg.ai_score_db,
+        ai_scores = self._read_ai_scores(ts)
+        if self._cfg.daily_research_enabled:
+            research_symbols = set(ai_scores)
+            candidates = [
+                candidate
+                for candidate in candidates
+                if candidate.symbol in research_symbols
+            ]
+            logger.info(
+                'daily research gate: %d candidates from run shortlist',
+                len(candidates),
             )
-            if started:
-                logger.info("Agent cycle started in background")
-        except Exception as exc:
-            self._bug_reporter.capture_exception(exc, operation="agent.cycle")
-            logger.error("Agent cycle failed: %s", type(exc).__name__)
 
         decisions_by_symbol = {}
         decisions = self._decision_service.decide(
@@ -446,7 +881,7 @@ class Runtime:
             positions=positions,
             candidates=candidates,
             strategy_statistics=self._strategy_stats,
-            ai_advisories=self._read_ai_scores(),
+            ai_advisories=ai_scores,
             market_regime=_get_current_regime_label(),
             now=ts,
             timeframe=self._cfg.timeframe,
@@ -481,17 +916,34 @@ class Runtime:
                     for b in raw[:-1]
                 ]
                 decision = decisions_by_symbol.get(cand.symbol)
-                plan = self._planner.make_plan(
+                if decision is None:
+                    logger.warning(
+                        "PaperDecision missing for %s; skip plan generation",
+                        cand.symbol,
+                    )
+                    continue
+                plan = self._make_decision_plan(
                     cand,
                     _alpaca_bar_to_model(raw[-1], cand.symbol, self._cfg.timeframe),
-                    params=decision.params if decision else None,
+                    decision,
                     current_qty=qty_held,
                     bars_history=bars_history,
                 )
-                if decision:
-                    plan.source = "paper_decision"
-                    plan.metadata.update({"decision_id": decision.decision_id, "strategy": decision.strategy, "strategy_statistics_id": decision.strategy_statistics_id, "universe_version": decision.universe_version, "data_version": decision.data_version})
-                    self._audit.link_decision_plan(decision.decision_id, plan.plan_id)
+                plan.source = "paper_decision"
+                plan.metadata.update(
+                    {
+                        "decision_id": decision.decision_id,
+                        "strategy": decision.strategy,
+                        "strategy_version": decision.strategy_version,
+                        "strategy_statistics_id": (
+                            decision.strategy_statistics_id
+                        ),
+                        "universe_version": decision.universe_version,
+                        "data_version": decision.data_version,
+                        "valid_until": decision.valid_until,
+                    }
+                )
+                self._audit.link_decision_plan(decision.decision_id, plan.plan_id)
                 raw_plans.append(plan)
                 logger.info(
                     "Plan [%s] action=%s entry=%.2f stop=%.2f tp=%.2f",
@@ -505,26 +957,38 @@ class Runtime:
             logger.info("本轮无计划生成")
             self._portfolio.snapshot_external_equity(equity)
             self._audit.log_heartbeat(self._tick_count, equity)
+            self._publish_runtime_status(
+                ts, session, equity, positions, bars=model_bars
+            )
             return
 
         # 13. 仓位分配（EqualWeightAllocator 填 qty / target_weight）
         try:
-            plans = self._allocator.allocate(raw_plans, equity, positions)
+            pending_buy_notional = (
+                self._order_store.pending_buy_notional_by_symbol()
+            )
+            plans = self._allocator.allocate(
+                raw_plans,
+                equity,
+                positions,
+                pending_buy_notional=pending_buy_notional,
+            )
         except Exception as exc:
             self._bug_reporter.capture_exception(
                 exc, operation="allocator.allocate"
             )
             logger.error("allocator.allocate 失败: %s", exc, exc_info=True)
-            plans = raw_plans
+            plans = []
 
         # 14. AI 安全门 + 确定性风控
         # 14a. AI 自动交易模式：用 ai_states.duckdb 的综合评分更新 plan.confidence
         if self._cfg.auto_trade_paper:
-            ai_scores = self._read_ai_scores()
             if ai_scores:
                 for plan in plans:
                     snapshot = ai_scores.get(plan.symbol)
-                    result = AIScoreValidator(AIScorePolicy(self._cfg.min_ai_score, self._cfg.ai_score_max_age_minutes)).validate(snapshot)
+                    result = AIScoreValidator(
+                        self._ai_score_policy(self._cfg.min_ai_score)
+                    ).validate(snapshot)
                     if result.valid:
                         plan.confidence = result.score / 100.0
                         logger.info(
@@ -538,7 +1002,9 @@ class Runtime:
                         self._audit.log_ai_safety_event(plan, result, self._cfg)
             else:
                 logger.warning("AI safety gate: no readable scores from %s", self._cfg.ai_score_db)
-                validator = AIScoreValidator(AIScorePolicy(self._cfg.min_ai_score, self._cfg.ai_score_max_age_minutes))
+                validator = AIScoreValidator(
+                    self._ai_score_policy(self._cfg.min_ai_score)
+                )
                 for plan in plans:
                     plan.status = "REJECTED"
                     result = validator.validate(None)
@@ -547,11 +1013,43 @@ class Runtime:
         for plan in plans:
             if plan.status == "REJECTED":
                 continue
-            verdict = self._risk.evaluate_plan(plan, equity, positions)
+            verdict = self._risk.evaluate_plan(
+                plan,
+                equity,
+                positions,
+                pending_buy_notional=pending_buy_notional,
+            )
+            self._audit.log_plan_risk_event(
+                plan,
+                verdict,
+                phase="PLAN",
+            )
             if not verdict.approved:
                 logger.info("Plan [%s] 风控拒绝: %s", plan.symbol, verdict.reason)
                 plan.status = "REJECTED"
+                self._audit.log_trade_plan(plan)
                 continue
+
+            decision = decisions_by_symbol.get(plan.symbol)
+            latest_bar = model_bars.get(plan.symbol)
+            if decision is not None and latest_bar is not None:
+                try:
+                    report = build_ready_signal_report(
+                        plan,
+                        decision,
+                        ai_scores.get(plan.symbol),
+                        latest_bar,
+                        equity=equity,
+                        now=ts,
+                        timeframe=self._cfg.timeframe,
+                    )
+                    _stored_report, created = self._signal_store.register_ready(report)
+                    if created or plan.symbol not in self._monitor_plans:
+                        self._monitor_plans[plan.symbol] = plan
+                except Exception as exc:
+                    logger.warning(
+                        "SignalReport %s failed: %s", plan.symbol, exc
+                    )
 
             if not self._cfg.auto_trade_paper:
                 plan.status = "DRY_RUN"
@@ -564,22 +1062,262 @@ class Runtime:
 
             plan.status = "READY"
             self._audit.log_trade_plan(plan)
-            self._execute_plan(plan, equity, positions)
+            self._execute_via_pipeline(
+                plan,
+                equity,
+                positions,
+                risk_verdict=verdict,
+            )
 
         # 16. 快照 + 心跳
         self._portfolio.snapshot_external_equity(equity)
         self._audit.log_heartbeat(self._tick_count, equity)
+        self._publish_runtime_status(
+            ts, session, equity, positions, bars=model_bars
+        )
 
         # 17. 盘后复盘（每日一次，21:00 UTC 后触发）
         self._maybe_daily_review(ts)
 
+    def _publish_runtime_status(
+        self,
+        ts: datetime,
+        session: str,
+        equity: float,
+        positions: Dict[str, Position],
+        *,
+        bars: Optional[Dict[str, Bar]] = None,
+        message: str = "",
+    ) -> None:
+        self._daily_research.publish_status(
+            now=ts,
+            tick_count=self._tick_count,
+            session=session,
+            equity=equity,
+            reconciliation_blocked=self._reconciliation_blocked,
+            kill_switch=self._kill.engaged(),
+            bars=bars,
+            positions=positions,
+            plans=self._monitor_plans,
+            open_orders=self._open_orders.values(),
+            message=message,
+        )
+
     # ── 执行单个计划 ─────────────────────────────────────────────────────────
 
-    def _execute_plan(
+    def _execute_via_pipeline(
         self,
         plan: TradePlan,
         equity: float,
         positions: Dict[str, Position],
+        *,
+        risk_verdict: RiskVerdict | None = None,
+    ) -> OrderIntent | None:
+        legacy_key = idempotency_key(
+            plan.plan_id,
+            plan.symbol,
+            plan.side.value,
+            plan.qty,
+            plan.entry_price,
+            plan.action,
+        )
+        legacy = self._order_store.get_by_key(legacy_key)
+        if legacy and (
+            legacy.get("broker_order_id")
+            or legacy.get("state")
+            in {
+                OrderLifecycle.SENDING.value,
+                OrderLifecycle.UNKNOWN.value,
+                OrderLifecycle.OPEN.value,
+                OrderLifecycle.PARTIALLY_FILLED.value,
+            }
+        ):
+            return None
+        store = getattr(self, "_execution_pipeline_store", None)
+        if store is None:
+            store = ExecutionPipelineStore(self._cfg.db_path)
+            self._execution_pipeline_store = store
+        now = max(utc_now(), plan.created_at)
+        metadata = plan.metadata
+        decision_id = str(
+            metadata.get("decision_id") or plan.plan_id
+        )
+        evidence_refs = tuple(
+            str(value)
+            for value in (
+                metadata.get("decision_id"),
+                metadata.get("strategy_statistics_id"),
+                metadata.get("data_version"),
+                metadata.get("invalidation_event_id"),
+                metadata.get("position_plan_version_id"),
+            )
+            if value
+        ) or (f"runtime-plan:{plan.plan_id}",)
+        valid_until = metadata.get("valid_until")
+        if not isinstance(valid_until, datetime) or valid_until <= now:
+            valid_until = now + timedelta(minutes=5)
+        candidate = candidate_from_trade_plan(
+            plan,
+            decision_id=decision_id,
+            strategy_version=str(
+                metadata.get("strategy_version")
+                or metadata.get("strategy")
+                or "runtime-v1"
+            ),
+            data_version=str(
+                metadata.get("data_version")
+                or f"runtime-plan:{plan.plan_id}"
+            ),
+            evidence_refs=evidence_refs,
+            valid_until=valid_until,
+        )
+        existing_candidate = store.get_candidate(
+            candidate.candidate_plan_id
+        )
+        if (
+            existing_candidate is not None
+            and existing_candidate.status
+            == CandidatePlanStatus.REJECTED
+        ):
+            plan.status = "REJECTED"
+            return None
+        if existing_candidate is None:
+            store.register_candidate(candidate)
+            store.validate_candidate(
+                candidate.candidate_plan_id,
+                now=now,
+            )
+        elif existing_candidate.status == CandidatePlanStatus.DRAFT:
+            store.validate_candidate(
+                candidate.candidate_plan_id,
+                now=now,
+            )
+        verdict = risk_verdict
+        if verdict is None:
+            if plan.action in {"CLOSE", "REDUCE"}:
+                verdict = RiskVerdict(
+                    True,
+                    "退出或减仓不增加敞口",
+                    suggested_qty=plan.qty,
+                )
+            else:
+                verdict = self._risk.evaluate_plan(
+                    plan,
+                    equity,
+                    positions,
+                    pending_buy_notional=(
+                        self._order_store
+                        .pending_buy_notional_by_symbol()
+                    ),
+                )
+        if not verdict.approved:
+            store.reject_candidate(
+                candidate.candidate_plan_id,
+                now=now,
+            )
+            plan.status = "REJECTED"
+            audit = getattr(self, "_audit", None)
+            if audit is not None:
+                audit.log_plan_risk_event(
+                    plan,
+                    verdict,
+                    phase="PRE_SUBMIT",
+                )
+                audit.log_trade_plan(plan)
+            return None
+        final = store.get_final_by_candidate(
+            candidate.candidate_plan_id
+        )
+        if final is None:
+            final = store.finalize(
+                candidate.candidate_plan_id,
+                risk_verdict=verdict,
+                risk_check_id=(
+                    "risk-check-"
+                    + hashlib.sha256(
+                        "|".join(
+                            (
+                                candidate.candidate_plan_id,
+                                verdict.reason,
+                                f"{verdict.suggested_qty:.8f}",
+                            )
+                        ).encode()
+                    ).hexdigest()[:24]
+                ),
+                risk_config_version="risk-config-v1",
+                now=now,
+            )
+        if final.status == FinalTradePlanStatus.FINAL_EXECUTABLE:
+            intent = store.create_order_intent(
+                final.final_plan_id,
+                now=now,
+            )
+        else:
+            intent = store.get_intent_for_final(final.final_plan_id)
+            if intent is None:
+                raise RuntimeError("PIPELINE_INTENT_REFERENCE_MISSING")
+        intent.plan_id = plan.plan_id
+        self._submit_pipeline_intent(
+            plan,
+            equity,
+            positions,
+            intent=intent,
+        )
+        return intent
+
+    def process_invalidation_event(
+        self,
+        event: InvalidationEvent,
+        *,
+        limit_price: float | None,
+        received_at: datetime | None = None,
+    ) -> PositionAdjustment:
+        """Validate one fact and create at most one durable adjustment order."""
+        existing = self._position_adjustment_store.get_by_event(
+            event.event_id
+        )
+        if existing is not None:
+            return existing
+        current = self._position_plan_store.current(
+            event.position_plan_id
+        )
+        if current is None:
+            raise ValueError("INVALIDATION_POSITION_PLAN_NOT_FOUND")
+        self._invalidation_event_store.record(
+            event,
+            plan=current,
+            received_at=received_at,
+        )
+        adjustment, order_plan, _ = (
+            self._position_adjustment_store.prepare(
+                event,
+                plan=current,
+                limit_price=limit_price,
+            )
+        )
+        if order_plan is not None:
+            prepared_intent = self._execute_via_pipeline(
+                order_plan,
+                0.0,
+                self._portfolio.positions,
+            )
+            key = prepared_intent.idempotency_key
+            row = self._order_store.get_by_key(key)
+            if row is not None:
+                adjustment = self._position_adjustment_store.link_order(
+                    adjustment.adjustment_id,
+                    order_intent_id=str(row["intent_id"]),
+                    order_idempotency_key=key,
+                )
+        return adjustment
+
+    def _submit_pipeline_intent(
+        self,
+        plan: TradePlan,
+        equity: float,
+        positions: Dict[str, Position],
+        *,
+        intent: OrderIntent,
     ) -> None:
         """将通过 AI 安全门和确定性风控的计划转成 LMT 限价单。
 
@@ -587,6 +1325,12 @@ class Runtime:
         """
         if not self._cfg.auto_trade_paper:
             logger.warning("[BLOCKED] plan=%s AI automatic paper trading is disabled", plan.plan_id[:8])
+            return
+        if self._cfg.broker_type != "alpaca_paper":
+            logger.error(
+                "[BLOCKED] plan=%s automatic submission requires alpaca_paper",
+                plan.plan_id[:8],
+            )
             return
         if self._reconciliation_blocked:
             logger.warning("[BLOCKED] startup reconciliation incomplete")
@@ -597,29 +1341,73 @@ class Runtime:
             )
             return
 
-        key = idempotency_key(plan.plan_id, plan.symbol, plan.side.value, plan.qty, plan.entry_price, plan.action)
+        if plan.action in {"CLOSE", "REDUCE"}:
+            self._signal_store.mark_exit(
+                plan.symbol, plan_id=plan.plan_id, at=utc_now()
+            )
+
+        key = intent.idempotency_key
         existing = self._order_store.get_by_key(key)
         if existing and (existing.get("broker_order_id") or existing.get("state") in {OrderLifecycle.SENDING.value, OrderLifecycle.UNKNOWN.value, OrderLifecycle.OPEN.value, OrderLifecycle.PARTIALLY_FILLED.value}):
             logger.info("idempotent order already exists plan=%s", plan.plan_id[:8])
             return
-        intent = OrderIntent(
-            intent_id=existing.get("intent_id") if existing else new_id(),
-            signal_id=plan.plan_id,
-            symbol=plan.symbol,
-            side=plan.side,
-            qty=plan.qty,
-            order_type="LMT",
-            limit_price=plan.entry_price,
-            reference_price=plan.entry_price,
-            tif="DAY",
-            risk_tag=f"runtime/{plan.action}",
-            created_at=utc_now(),
-            idempotency_key=key,
-            client_order_id=client_order_id(key),
-            decision_id=plan.metadata.get("decision_id", ""),
-            plan_id=plan.plan_id,
-        )
-
+        increases_exposure = plan.action not in {"CLOSE", "REDUCE"}
+        if increases_exposure:
+            try:
+                pending_buy_notional = (
+                    self._order_store.pending_buy_notional_by_symbol()
+                    if plan.side == Side.BUY
+                    else {}
+                )
+                verdict = self._risk.evaluate_plan(
+                    plan,
+                    equity,
+                    positions,
+                    pending_buy_notional=pending_buy_notional,
+                )
+                audit = getattr(self, "_audit", None)
+                if audit is not None:
+                    audit.log_plan_risk_event(
+                        plan,
+                        verdict,
+                        phase="PRE_SUBMIT",
+                    )
+            except Exception as exc:
+                plan.status = "REJECTED"
+                self._bug_reporter.capture_exception(
+                    exc,
+                    operation="risk.pre_submit",
+                    symbol=plan.symbol,
+                    plan_id=plan.plan_id,
+                )
+                logger.error(
+                    "[BLOCKED] pre-submit risk unavailable for %s",
+                    plan.symbol,
+                )
+                return
+            if not verdict.approved:
+                plan.status = "REJECTED"
+                audit = getattr(self, "_audit", None)
+                if audit is not None:
+                    audit.log_trade_plan(plan)
+                logger.warning(
+                    "[BLOCKED] pre-submit risk rejected %s: %s",
+                    plan.symbol,
+                    verdict.reason,
+                )
+                return
+        else:
+            audit = getattr(self, "_audit", None)
+            if audit is not None:
+                audit.log_plan_risk_event(
+                    plan,
+                    RiskVerdict(
+                        True,
+                        "退出或减仓不增加敞口",
+                        suggested_qty=plan.qty,
+                    ),
+                    phase="PRE_SUBMIT",
+                )
         self._order_store.persist(intent, key, plan.plan_id)
         self._order_store.update(key, state=OrderLifecycle.SENDING.value)
         try:
@@ -670,9 +1458,29 @@ class Runtime:
                 fill = self._broker.get_fill(broker_id)
                 if fill is not None:
                     fill.intent_id = intent.intent_id
+                    cumulative_filled_qty = float(fill.filled_qty)
                     self._portfolio.apply_fill(fill)
+                    projected_plan = self._position_plan_projector.apply(
+                        fill=fill,
+                        applied_delta=None,
+                        trade_plan=self._live_plans.get(fill.symbol),
+                    )
+                    episode_store = getattr(
+                        self,
+                        "_trade_episode_store",
+                        None,
+                    )
+                    if (
+                        episode_store is not None
+                        and projected_plan is not None
+                    ):
+                        episode = episode_store.sync(
+                            projected_plan.position_plan_id
+                        )
+                        self._post_trade_learning.process(episode)
+                    self._signal_store.apply_fill(intent.plan_id, fill)
                     if intent.idempotency_key:
-                        self._order_store.update(intent.idempotency_key, filled_qty=fill.filled_qty, remaining_qty=max(0.0, intent.qty - fill.filled_qty), state=(OrderLifecycle.FILLED.value if status == OrderStatus.FILLED else OrderLifecycle.PARTIALLY_FILLED.value))
+                        self._order_store.update(intent.idempotency_key, filled_qty=cumulative_filled_qty, remaining_qty=max(0.0, intent.qty - cumulative_filled_qty), state=(OrderLifecycle.FILLED.value if status == OrderStatus.FILLED else OrderLifecycle.PARTIALLY_FILLED.value))
                     self._risk.record_success()
                     logger.info(
                         "FILLED %s %s qty=%.0f @ %.4f",
@@ -689,12 +1497,23 @@ class Runtime:
                 # BUY 成交后从 _live_plans 清理（允许后续重新开仓）
                 if fill is not None and fill.side == Side.SELL:
                     self._live_plans.pop(fill.symbol, None)
+                    self._monitor_plans.pop(fill.symbol, None)
                 if status == OrderStatus.FILLED:
+                    adjustment_store = getattr(
+                        self,
+                        "_position_adjustment_store",
+                        None,
+                    )
+                    if adjustment_store is not None:
+                        adjustment_store.mark_completed_by_order_plan(
+                            intent.plan_id
+                        )
                     done.append(broker_id)
             elif status in (OrderStatus.CANCELLED, OrderStatus.REJECTED):
                 logger.info("Order closed %s status=%s", broker_id, status.value)
                 # 订单取消/拒绝：也从 _live_plans 清理，允许重新进入选股
                 self._live_plans.pop(intent.symbol, None)
+                self._monitor_plans.pop(intent.symbol, None)
                 if intent.idempotency_key:
                     self._order_store.update(intent.idempotency_key, state=(OrderLifecycle.CANCELED.value if status == OrderStatus.CANCELLED else OrderLifecycle.REJECTED.value))
                 done.append(broker_id)
@@ -703,14 +1522,43 @@ class Runtime:
 
     # ── 每日复盘 ─────────────────────────────────────────────────────────────
 
-    def _read_ai_scores(self) -> Dict[str, AIScoreSnapshot]:
-        """从 ai_states.duckdb 读取最新 AI 加权综合分（0-100）。失败返回空字典。"""
+    def _read_ai_scores(
+        self, now: Optional[datetime] = None
+    ) -> Dict[str, AIScoreSnapshot]:
+        """Read today's frozen research; legacy snapshots are opt-in fallback."""
+        if self._cfg.daily_research_enabled:
+            return self._daily_research.snapshots(now or utc_now())
         try:
             from .ai.manager import get_score_snapshots_from_db
             return get_score_snapshots_from_db(self._cfg.ai_score_db)
         except Exception as exc:
             logger.warning("_read_ai_scores 失败: %s", exc)
             return {}
+
+    def _ai_score_policy(self, minimum: float) -> AIScorePolicy:
+        if self._cfg.daily_research_enabled:
+            return AIScorePolicy(
+                minimum,
+                self._cfg.daily_research_max_age_hours * 60,
+                min_contributors=1,
+                min_weight_coverage=1.0,
+                require_llm=True,
+            )
+        return AIScorePolicy(
+            minimum,
+            self._cfg.ai_score_max_age_minutes,
+            min_contributors=(
+                1
+                if self._cfg.allow_quant_without_ai
+                else self._cfg.ai_min_contributors
+            ),
+            min_weight_coverage=(
+                0.0
+                if self._cfg.allow_quant_without_ai
+                else self._cfg.ai_min_weight_coverage
+            ),
+            require_llm=not self._cfg.allow_quant_without_ai,
+        )
 
     def _maybe_morning_brief(self, ts: datetime) -> None:
         """美东 9AM（UTC 13h/14h）自动发送晨报，每天只发一次。"""

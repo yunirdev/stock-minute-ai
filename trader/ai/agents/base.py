@@ -45,6 +45,7 @@ class AgentBase(ABC):
             confidence=confidence,
             model=model,
             created_at=utc_now(),
+            is_fallback=bool(payload.get("_is_fallback", False)),
         )
 
     # ── LLM 调用工具（子类使用）─────────────────────────────────────────────
@@ -62,7 +63,9 @@ class AgentBase(ABC):
         result = client.json_chat(system, user, model=model, temperature=temperature)
         if not result and fallback is not None:
             logger.warning("%s: LLM 返回空，使用 fallback", self.role)
-            return fallback
+            result = dict(fallback)
+            result["_is_fallback"] = True
+            return result
         return result or {}
 
     def _clamp_score(self, value: Any, default: float = 50.0) -> float:

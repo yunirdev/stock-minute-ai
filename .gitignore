@@ -23,6 +23,7 @@ venv/
 
 # Runtime / logs
 logs/
+backups/
 sessions/*.log
 sessions/*.duckdb
 heartbeat.json

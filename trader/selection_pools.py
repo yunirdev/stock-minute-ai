@@ -35,6 +35,7 @@ _BROAD_ETFS = {
     "SPY", "QQQ", "IWM", "DIA", "VTI", "VOO", "IVV", "RSP",
     "XLK", "XLC", "XLY", "XLF", "XLE", "XLI", "XLV", "XLB", "XLP", "XLU", "XLRE",
 }
+_DECISION_ETFS = ("SPY", "QQQ", "IWM", "SMH", "XLK", "XLF", "TLT", "GLD")
 
 _CURATED_LARGE_CAP = [
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "GOOG", "META", "AVGO", "TSLA", "BRK.B",
@@ -103,6 +104,7 @@ def rebuild_selection_pipeline(
     decision_style: str = DECISION_STYLE_STANDARD,
     ai_db_path: Optional[str] = None,
     save: bool = True,
+    download_missing_decision_etfs: bool = False,
     progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> dict[str, PoolResult]:
     long_pool = build_long_term_pool(
@@ -122,6 +124,7 @@ def rebuild_selection_pipeline(
         ai_db_path=ai_db_path,
         sync_daily_store=save,
         base_items=long_pool.items,
+        download_missing_decision_etfs=download_missing_decision_etfs,
         progress_callback=progress_callback,
     )
     results = {
@@ -211,6 +214,7 @@ def build_daily_decision_pool(
     ai_db_path: Optional[str] = None,
     sync_daily_store: bool = True,
     base_items: Optional[list[PoolItem]] = None,
+    download_missing_decision_etfs: bool = False,
     progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> PoolResult:
     symbols = _normalize_symbols(source) or pool_symbols(
@@ -221,6 +225,8 @@ def build_daily_decision_pool(
     if not symbols:
         symbols = build_source_universe(None)[: max(limit, 1)]
     symbols = _with_decision_etfs(symbols)
+    if download_missing_decision_etfs:
+        _ensure_decision_etf_bars(symbols, progress_callback=progress_callback)
 
     style = _normalize_decision_style(decision_style)
     cfg = _decision_style_config(style)
@@ -559,10 +565,30 @@ def _decision_style_config(style: str) -> dict:
 
 def _with_decision_etfs(symbols: list[str]) -> list[str]:
     out = list(symbols)
-    for symbol in ("SPY", "QQQ", "IWM", "SMH", "XLK", "XLF", "TLT", "GLD"):
+    for symbol in _DECISION_ETFS:
         if symbol not in out:
             out.append(symbol)
     return out
+
+
+def _ensure_decision_etf_bars(
+    symbols: list[str],
+    *,
+    progress_callback: Optional[Callable[[dict], None]] = None,
+) -> None:
+    """Download missing daily history for the ETFs injected into the decision pool."""
+    etfs = [symbol for symbol in symbols if symbol in _DECISION_ETFS]
+    for idx, symbol in enumerate(etfs, start=1):
+        if len(_clean_bars(_load_bars(symbol, "1d"))) >= 60:
+            continue
+        _progress(
+            progress_callback,
+            DAILY_DECISION,
+            idx - 1,
+            len(etfs),
+            f"{symbol}: downloading missing daily bars",
+        )
+        _download_bars(symbol, "1d")
 
 
 def _decision_type(item: PoolItem) -> str:
@@ -1072,6 +1098,14 @@ def _load_bars(symbol: str, timeframe: str) -> pd.DataFrame:
     try:
         from .data_cache import get_bars
         return get_bars(symbol, timeframe)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _download_bars(symbol: str, timeframe: str) -> pd.DataFrame:
+    try:
+        from .data_cache import fetch_and_save
+        return fetch_and_save(symbol, timeframe)
     except Exception:
         return pd.DataFrame()
 

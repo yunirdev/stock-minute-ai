@@ -122,19 +122,40 @@ class TestAllocator:
 
 class TestATRPlanner:
     def test_plan_has_valid_prices(self, atr_planner, sample_candidate, sample_bar):
-        plan = atr_planner.make_plan(sample_candidate, sample_bar, {})
+        from trader.models import Side
+
+        plan = atr_planner.make_plan(
+            sample_candidate, sample_bar, {}, side=Side.BUY,
+        )
         # 多头：stop < entry < tp
         assert plan.stop_loss < plan.entry_price < plan.take_profit
         assert plan.status == "DRAFT"
         assert plan.rationale != ""
 
     def test_plan_symbol_matches_candidate(self, atr_planner, sample_candidate, sample_bar):
-        plan = atr_planner.make_plan(sample_candidate, sample_bar, {})
+        from trader.models import Side
+
+        plan = atr_planner.make_plan(
+            sample_candidate, sample_bar, {}, side=Side.BUY,
+        )
         assert plan.symbol == sample_candidate.symbol
+
+    def test_explicit_sell_direction_overrides_high_candidate_score(
+        self, atr_planner, sample_candidate, sample_bar,
+    ):
+        from trader.models import Side
+
+        assert sample_candidate.score >= 50
+        plan = atr_planner.make_plan(
+            sample_candidate, sample_bar, {}, side=Side.SELL,
+        )
+
+        assert plan.side == Side.SELL
+        assert plan.take_profit < plan.entry_price < plan.stop_loss
 
     def test_plan_uses_real_atr_when_history_available(self, atr_planner, sample_candidate, sample_bar):
         """bars_history 足够时应使用多 bar ATR，而不是单 bar 的 high-low 简化版。"""
-        from trader.models import Bar
+        from trader.models import Bar, Side
 
         # 构造 20 根历史 bar，true range 明显比 sample_bar 自身的 high-low(=4.0) 小很多
         history = [
@@ -143,9 +164,12 @@ class TestATRPlanner:
             for _ in range(20)
         ]
         plan_with_history = atr_planner.make_plan(
-            sample_candidate, sample_bar, {}, bars_history=history,
+            sample_candidate, sample_bar, {}, side=Side.BUY,
+            bars_history=history,
         )
-        plan_single_bar = atr_planner.make_plan(sample_candidate, sample_bar, {})
+        plan_single_bar = atr_planner.make_plan(
+            sample_candidate, sample_bar, {}, side=Side.BUY,
+        )
 
         # 单 bar range（4.0）算出的止损距离，应明显大于真实多 bar ATR 算出的止损距离
         single_bar_stop_dist = abs(sample_bar.close - plan_single_bar.stop_loss)

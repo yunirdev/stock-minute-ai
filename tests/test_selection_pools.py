@@ -120,6 +120,72 @@ def test_aggressive_decision_style_expands_candidate_count(monkeypatch):
     assert any("风格 aggressive" in item.reasons for item in result.items)
 
 
+def test_decision_etf_data_preparation_downloads_only_missing(monkeypatch):
+    import trader.selection_pools as sp
+
+    cached = {"SPY": _bars()}
+    downloads = []
+
+    monkeypatch.setattr(
+        sp,
+        "_load_bars",
+        lambda symbol, _timeframe: cached.get(symbol, pd.DataFrame()),
+    )
+
+    def fake_download(symbol: str, timeframe: str) -> pd.DataFrame:
+        downloads.append((symbol, timeframe))
+        cached[symbol] = _bars()
+        return cached[symbol]
+
+    monkeypatch.setattr(sp, "_download_bars", fake_download)
+
+    sp._ensure_decision_etf_bars(["NVDA", "SPY", "IWM", "XLF"])
+
+    assert downloads == [("IWM", "1d"), ("XLF", "1d")]
+
+
+def test_daily_pool_prepares_decision_etfs_before_scoring(monkeypatch):
+    import trader.decision_trade_plans as dtp
+    import trader.selection_pools as sp
+
+    prepared = False
+
+    def fake_prepare(_symbols, *, progress_callback=None):
+        nonlocal prepared
+        prepared = True
+
+    def fake_bars(_symbol: str, _timeframe: str) -> pd.DataFrame:
+        assert prepared
+        return _bars(step=0.5)
+
+    monkeypatch.setattr(sp, "_ensure_decision_etf_bars", fake_prepare)
+    monkeypatch.setattr(sp, "_load_bars", fake_bars)
+    monkeypatch.setattr(sp, "_load_ai_scores", lambda _path: {})
+    monkeypatch.setattr(sp, "save_daily_candidates", lambda _rows: None)
+    monkeypatch.setattr(sp, "save_decision_pool_report", lambda _report: None)
+    monkeypatch.setattr(dtp, "build_decision_trade_plan_report", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        sp,
+        "load_selection_pool",
+        lambda layer, path=sp._STORE: sp.PoolResult(
+            layer=layer,
+            updated_at="",
+            source_size=0,
+            selected_size=0,
+            items=[],
+        ),
+    )
+
+    sp.build_daily_decision_pool(
+        ["NVDA"],
+        limit=3,
+        ai_db_path=":memory:",
+        download_missing_decision_etfs=True,
+    )
+
+    assert prepared
+
+
 def test_source_universe_prefers_latest_market_scan(monkeypatch):
     import trader.market_scan as ms
     import trader.selection_pools as sp

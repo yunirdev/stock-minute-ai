@@ -64,22 +64,29 @@ class AlpacaBroker:
     # ------------------------------------------------------------------
 
     def place_order(self, intent: OrderIntent) -> str:
+        if not self._paper:
+            raise RuntimeError("LIVE_ORDER_SUBMISSION_DISABLED")
+        if intent.order_type != "LMT":
+            raise ValueError("AUTOMATIC_EXECUTION_REQUIRES_LMT")
+
         from alpaca.trading.enums import OrderSide, TimeInForce
-        from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
+        from alpaca.trading.requests import LimitOrderRequest
 
         side = OrderSide.BUY if intent.side == Side.BUY else OrderSide.SELL
         qty = max(int(intent.qty), 1)
         tif = TimeInForce.DAY
 
-        # 红线：默认只下 LMT；MKT 仅在 intent 明确要求且无限价时
-        if intent.order_type == "MKT" and intent.limit_price is None:
-            req = MarketOrderRequest(symbol=intent.symbol, qty=qty, side=side, time_in_force=tif, client_order_id=intent.client_order_id or None)
-        else:
-            px = intent.limit_price if intent.limit_price else intent.reference_price
-            if not px or px <= 0:
-                raise ValueError(f"LMT 单需要有效 limit_price: {intent.symbol}")
-            req = LimitOrderRequest(symbol=intent.symbol, qty=qty, side=side,
-                                    time_in_force=tif, limit_price=round(float(px), 2), client_order_id=intent.client_order_id or None)
+        px = intent.limit_price if intent.limit_price else intent.reference_price
+        if not px or px <= 0:
+            raise ValueError(f"LMT 单需要有效 limit_price: {intent.symbol}")
+        req = LimitOrderRequest(
+            symbol=intent.symbol,
+            qty=qty,
+            side=side,
+            time_in_force=tif,
+            limit_price=round(float(px), 2),
+            client_order_id=intent.client_order_id or None,
+        )
 
         order = self._client.submit_order(req)
         bid = str(order.id)
@@ -151,8 +158,23 @@ class AlpacaBroker:
                     unrealized_pnl=float(getattr(p, "unrealized_pl", 0) or 0),
                 ))
         except Exception as exc:
-            logger.warning("ALPACA 查询持仓失败: %s", exc)
+            logger.warning(
+                "ALPACA position reconciliation failed: %s",
+                type(exc).__name__,
+            )
+            raise
         return out
+
+    def get_account_cash(self) -> float:
+        try:
+            account = self._client.get_account()
+            return float(account.cash)
+        except Exception as exc:
+            logger.warning(
+                "ALPACA cash reconciliation failed: %s",
+                type(exc).__name__,
+            )
+            raise
 
     def get_account_equity(self) -> float:
         try:

@@ -131,6 +131,64 @@ def save_statistics(records: list[StrategyStatistics], path: str | Path) -> None
     output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def describe_strategy_statistics(
+    records: list[StrategyStatistics] | tuple[StrategyStatistics, ...],
+    *,
+    symbol: str,
+    timeframe: str,
+    source_path: str,
+    captured_at: datetime,
+) -> dict:
+    """Describe the exact statistics repository records used by screening."""
+    matching = [
+        record
+        for record in records
+        if record.symbol == symbol and record.timeframe == timeframe
+    ]
+    payload = []
+    for record in matching:
+        row = asdict(record)
+        for key in ("data_start", "data_end", "evaluated_at"):
+            row[key] = row[key].isoformat()
+        payload.append(row)
+    reliable = sum(record.reliable(captured_at) for record in matching)
+    if not matching:
+        status = "MISSING"
+        quality_score = 0.0
+        failure_code = (
+            "STRATEGY_STATISTICS_PATH_MISSING"
+            if not source_path
+            else "NO_MATCHING_STRATEGY_STATISTICS"
+        )
+        as_of = captured_at
+    elif reliable == len(matching):
+        status = "OK"
+        quality_score = 1.0
+        failure_code = ""
+        as_of = max(record.evaluated_at for record in matching)
+    else:
+        status = "DEGRADED"
+        quality_score = reliable / len(matching)
+        failure_code = "UNRELIABLE_STRATEGY_STATISTICS"
+        as_of = max(record.evaluated_at for record in matching)
+    return {
+        "source": "strategy_statistics",
+        "status": status,
+        "as_of": as_of,
+        "fetched_at": captured_at,
+        "quality_score": quality_score,
+        "coverage": ("holdout_statistics",),
+        "payload_version": "strategy-statistics:v1",
+        "failure_code": failure_code,
+        "metadata": {
+            "source_path": source_path,
+            "record_count": len(matching),
+            "reliable_count": reliable,
+        },
+        "payload": payload,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate PaperDecision strategy statistics")
     parser.add_argument("--symbols", required=True, help="Comma-separated cached symbols")

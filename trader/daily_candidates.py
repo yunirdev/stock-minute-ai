@@ -42,16 +42,28 @@ def build_daily_candidates(
     limit: int = 12,
     include_anchors: bool = True,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    input_capture: Optional[dict[str, pd.DataFrame]] = None,
+    now: datetime | None = None,
 ) -> list[DailyCandidate]:
     symbols = _normalize_universe(universe, include_anchors=include_anchors)
     ai_scores = _load_ai_scores(ai_db_path)
 
     rows = []
-    now_s = datetime.now(timezone.utc).isoformat()
+    captured_at = now or datetime.now(timezone.utc)
+    if captured_at.tzinfo is None or captured_at.utcoffset() is None:
+        raise ValueError("DAILY_CANDIDATE_NOW_TIMEZONE_REQUIRED")
+    now_s = captured_at.astimezone(timezone.utc).isoformat()
     _progress(progress_callback, 0, len(symbols), "开始计算每日决策池")
     for idx, symbol in enumerate(symbols, start=1):
         source_score, source_reasons, source_risks = _source_quality(symbol)
-        tactical = _tactical_score(symbol, timeframe)
+        if input_capture is None:
+            tactical = _tactical_score(symbol, timeframe)
+        else:
+            tactical = _tactical_score(
+                symbol,
+                timeframe,
+                input_capture=input_capture,
+            )
         ai_score = ai_scores.get(symbol)
 
         score, confidence, reasons, risks = _combine_scores(
@@ -176,8 +188,17 @@ def _source_quality(symbol: str) -> tuple[float, list[str], list[str]]:
     return max(0.0, min(100.0, score)), reasons, risks
 
 
-def _tactical_score(symbol: str, timeframe: str) -> Optional[dict]:
+def _tactical_score(
+    symbol: str,
+    timeframe: str,
+    *,
+    input_capture: Optional[dict[str, pd.DataFrame]] = None,
+) -> Optional[dict]:
     df = _load_bars(symbol, timeframe)
+    if input_capture is not None:
+        input_capture[symbol] = (
+            df.copy() if df is not None else pd.DataFrame()
+        )
     if df is None or len(df) < 40:
         return None
 

@@ -338,6 +338,7 @@ class AgentManager:
                     "run_id": "VARCHAR", "provider": "VARCHAR", "model": "VARCHAR",
                     "is_stub": "BOOLEAN", "source": "VARCHAR", "generated_by": "VARCHAR",
                     "schema_version": "INTEGER", "created_at_utc": "TIMESTAMPTZ",
+                    "is_fallback": "BOOLEAN",
                 }.items():
                     con.execute(f"ALTER TABLE ai_advisories ADD COLUMN IF NOT EXISTS {column} {sql_type}")
                 con.commit()
@@ -379,12 +380,12 @@ class AgentManager:
                     con.execute(
                         "INSERT OR IGNORE INTO ai_advisories "
                         "(advisory_id, kind, agent, payload_json, confidence, created_at, "
-                        "run_id, provider, model, is_stub, source, generated_by, schema_version, created_at_utc) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "run_id, provider, model, is_stub, source, generated_by, schema_version, created_at_utc, is_fallback) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         [adv.advisory_id, adv.kind, adv.agent,
                          json.dumps(adv.payload, default=str), adv.confidence, adv.created_at,
                          run_id, "stub" if is_stub else provider, model, is_stub,
-                         "agent_manager", adv.agent, 1, adv.created_at],
+                         "agent_manager", adv.agent, 1, adv.created_at, adv.is_fallback],
                     )
                 con.commit()
                 con.close()
@@ -481,30 +482,37 @@ def get_manager(use_real_agents: bool = True) -> AgentManager:
 
 
 def get_score_snapshots_from_db(db_path: str, limit: int = 300):
-    """Read composite scores with verifiable provenance; legacy rows remain incomplete."""
+    """Read the newest single-run composite for each symbol.
+
+    Legacy rows without verifiable UTC timestamps/run IDs are ignored instead of
+    being allowed to invalidate otherwise current symbols.
+    """
     from .safety import AIScoreSnapshot
     try:
         import duckdb
         con = duckdb.connect(db_path, read_only=True)
         columns = {row[1] for row in con.execute("PRAGMA table_info('ai_advisories')").fetchall()}
         provenance_columns = {"run_id", "provider", "model", "is_stub", "source", "generated_by", "created_at_utc"}
-        if provenance_columns <= columns:
-            rows = con.execute(
-                "SELECT kind, payload_json, confidence, created_at_utc, run_id, provider, model, is_stub, source, generated_by "
-                "FROM ai_advisories ORDER BY created_at_utc DESC LIMIT ?", [limit]
-            ).fetchall()
-        else:
-            rows = [(*row, None, None, None, False, None, None) for row in con.execute(
-                "SELECT kind, payload_json, confidence, created_at FROM ai_advisories ORDER BY created_at DESC LIMIT ?", [limit]
-            ).fetchall()]
+        if not provenance_columns <= columns:
+            con.close()
+            return {}
+        fallback_expr = "COALESCE(is_fallback, FALSE)" if "is_fallback" in columns else "FALSE"
+        rows = con.execute(
+            "SELECT kind, payload_json, confidence, created_at_utc, run_id, provider, "
+            f"model, is_stub, source, generated_by, {fallback_expr} "
+            "FROM ai_advisories "
+            "WHERE created_at_utc IS NOT NULL AND run_id IS NOT NULL "
+            "ORDER BY created_at_utc DESC LIMIT ?",
+            [limit],
+        ).fetchall()
         con.close()
     except Exception as exc:
         logger.debug("get_score_snapshots_from_db: %s", exc)
         return {}
 
-    grouped: Dict[str, Dict[str, tuple]] = {}
+    grouped: Dict[str, Dict[str, Dict[str, tuple]]] = {}
     for row in rows:
-        kind, payload_json, confidence, created_at, run_id, provider, model, is_stub, source, generated_by = row
+        kind, payload_json, _confidence, created_at, run_id, provider, model, is_stub, source, generated_by, is_fallback = row
         try:
             payload = json.loads(payload_json or "{}")
         except Exception:
@@ -512,32 +520,49 @@ def get_score_snapshots_from_db(db_path: str, limit: int = 300):
         symbol = payload.get("symbol")
         field = _SCORE_FIELD.get(kind)
         score = payload.get(field) if field else None
-        if not symbol or not isinstance(score, (int, float)):
+        if not symbol or not run_id or created_at is None or not isinstance(score, (int, float)):
             continue
-        grouped.setdefault(symbol, {}).setdefault(kind, (score, created_at, run_id, provider, model, bool(is_stub), source, generated_by))
+        run_values = grouped.setdefault(symbol, {}).setdefault(run_id, {})
+        run_values.setdefault(
+            kind,
+            (score, created_at, provider, model, bool(is_stub), source, generated_by, bool(is_fallback)),
+        )
 
     snapshots = {}
-    for symbol, values in grouped.items():
-        weighted_values = [(value, _AGENT_WEIGHTS[kind]) for kind, value in values.items() if kind in _AGENT_WEIGHTS]
-        total_weight = sum(weight for _, weight in weighted_values)
+    for symbol, runs in grouped.items():
+        run_id, values = max(
+            runs.items(),
+            key=lambda item: max(value[1] for value in item[1].values()),
+        )
+        weighted_values = [
+            (kind, value, _AGENT_WEIGHTS[kind])
+            for kind, value in values.items()
+            if kind in _AGENT_WEIGHTS and not value[7]
+        ]
+        total_weight = sum(weight for _kind, _value, weight in weighted_values)
         if not total_weight:
             continue
-        score = sum(value[0] * weight for value, weight in weighted_values) / total_weight
+        score = sum(value[0] * weight for _kind, value, weight in weighted_values) / total_weight
         contributors = [
-            {"agent_name": kind, "score": value[0], "created_at": value[1], "provider": value[3],
-             "model": value[4], "is_stub": value[5]} for kind, value in values.items()
+            {"agent_name": kind, "score": value[0], "created_at": value[1], "provider": value[2],
+             "model": value[3], "is_stub": value[4], "is_fallback": value[7]}
+            for kind, value in values.items()
         ]
-        newest = max(values.values(), key=lambda value: value[1])
-        providers = {value[3] for value in values.values() if value[3]}
-        models = {value[4] for value in values.values() if value[4]}
-        run_ids = {value[2] for value in values.values() if value[2]}
+        newest = max((value for _kind, value, _weight in weighted_values), key=lambda value: value[1])
+        providers = {value[2] for _kind, value, _weight in weighted_values if value[2]}
+        models = {value[3] for _kind, value, _weight in weighted_values if value[3]}
+        has_llm = any(kind not in _ALGO_ROLES for kind, _value, _weight in weighted_values)
         snapshots[symbol] = AIScoreSnapshot(
             symbol=symbol, score=round(score, 1), created_at=newest[1],
-            run_id=run_ids.pop() if len(run_ids) == 1 else None,
+            run_id=run_id,
             provider=",".join(sorted(providers)) or None,
             model=",".join(sorted(models)) or None,
-            source=newest[6], generated_by=newest[7],
-            is_stub=any(value[5] for value in values.values()),
+            source=newest[5], generated_by=newest[6],
+            is_stub=any(value[4] for _kind, value, _weight in weighted_values),
             contributors=contributors,
+            contributor_count=len(weighted_values),
+            weight_coverage=round(total_weight, 4),
+            has_llm=has_llm,
+            fallback_count=sum(1 for value in values.values() if value[7]),
         )
     return snapshots

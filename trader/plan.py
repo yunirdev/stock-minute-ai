@@ -53,6 +53,8 @@ class ATRPlanner:
         cand: Candidate,
         latest_bar: Bar,
         params: Dict[str, Any] | None = None,
+        *,
+        side: Side,
         current_qty: float = 0.0,
         bars_history: "list[Bar] | None" = None,
     ) -> TradePlan:
@@ -73,7 +75,7 @@ class ATRPlanner:
             # 用单 bar 的 range 做简化 ATR（无历史 bars 时 fallback）
             atr = max(latest_bar.high - latest_bar.low, latest_bar.close * 0.01)
 
-        side = Side.BUY if cand.score >= 50 else Side.SELL
+        side = Side(side)
         entry = latest_bar.close
 
         if side == Side.BUY:
@@ -86,7 +88,7 @@ class ATRPlanner:
             action = "REDUCE" if current_qty > 0 else "OPEN"
 
         rationale = (
-            f"score={cand.score:.1f} entry={entry:.2f} "
+            f"side={side.value} score={cand.score:.1f} entry={entry:.2f} "
             f"stop={stop:.2f} tp={tp:.2f} ATR≈{atr:.4f}"
         )
 
