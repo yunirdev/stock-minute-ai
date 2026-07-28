@@ -133,13 +133,17 @@ cleanup unless the task explicitly asks for it.
 
 - Date: 2026-07-27
 - Baseline: Isolated TradingAgents v0.3.1 with local Ollama 32K models.
-- Verification: 392 tests passed; full Ruff and compileall passed; MSFT local-model
+- Verification: 396 tests passed; full Ruff and compileall passed; MSFT local-model
   end-to-end analysis completed through the subprocess adapter.
 - Goal achieved: production Runtime consumes one immutable daily shortlist instead
   of rerunning the full LLM agent set every 15 minutes.
 
 ## Recent changes
 
+- Completed pre-trial release cleanup: NiceGUI Paper auto-trade authority is
+  session-scoped and always defaults off, stale Runtime sidecars no longer
+  render as healthy, interrupted daily research is recovered fail-closed, and
+  the simplified five-entry platform navigation passed real browser validation.
 - Connected the remaining evidence architecture to production callers: Runtime
   now freezes natural REAL maturity evidence, produces verified daily trade/AI
   DuckDB backups, and turns closed trade episodes into frozen reviews and

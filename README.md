@@ -93,6 +93,10 @@ Without --auto-trade, plans are recorded as DRY_RUN. With it, qualifying plans a
    Discord delivery is routed through one authorization/redaction/idempotency
    gateway and remains externally disabled unless
    `DISCORD_EXTERNAL_SEND_ENABLED=true` or an explicit UI/manual send is used.
+   The NiceGUI Paper auto-trade checkbox is session-scoped and defaults off on
+   every app start; saved UI preferences cannot silently re-enable submission.
+   Runtime status older than three minutes is rendered as stopped/stale rather
+   than healthy.
 
 The daily worker runs once in a pre-market window or once after 16:15 ET for the
 next weekday. Research evidence is valid for 36 hours by default; intraday bar

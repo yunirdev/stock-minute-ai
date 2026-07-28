@@ -1396,13 +1396,13 @@ def _render_system():
 
         # ── AI 自动交易 ────────────────────────────────────────────────────
         with ui.row().classes("items-center gap-4").style("margin-top:12px"):
-            auto_trade_cb = _persist(
-                ui.checkbox(
-                    "AI 自动交易（虚拟盘）",
-                    value=_pref("sys_auto_trade", False),
-                ).props("dark color=warning"),
-                "sys_auto_trade",
-            )
+            # Execution authority is intentionally session-scoped. A saved UI
+            # preference must never silently re-enable order submission after
+            # an app restart.
+            auto_trade_cb = ui.checkbox(
+                "AI 自动交易（虚拟盘）",
+                value=False,
+            ).props("dark color=warning")
             score_in = _persist(
                 ui.number(
                     "AI 评分门槛",
@@ -1417,8 +1417,9 @@ def _render_system():
             )
         ui.html(
             '<div class="qa-note">'
-            "⚠️ AI 自动交易：勾选后引擎将读取决策台的 AI 综合评分，"
-            "评分 ≥ 门槛时自动向 Alpaca 虚拟盘提交 LMT 限价单。"
+            "⚠️ AI 自动交易：每次打开平台都默认关闭，必须在本次会话显式勾选。"
+            "启用后仍要求当天冻结可信研究、当前策略信号、可靠 Holdout、"
+            "PaperDecision 与确定性风控全部通过，才会向 Alpaca Paper 提交 LMT 限价单。"
             "不勾选 = DRY-RUN（只记日志，不下单）。"
             "自动实盘不受支持；alpaca_live 与自动交易组合会 fail-closed。"
             "</div>"

@@ -36,3 +36,17 @@ def test_operations_hub_retains_bounded_operational_views() -> None:
     assert 'risk_link.on("click", lambda: _select("risk"))' in source
     assert 'maintenance_link.on("click", lambda: _select("maintenance"))' in source
     assert "旧版自定义 Agent 已从主导航移除" in source
+
+
+def test_auto_trade_control_is_session_scoped_and_defaults_off() -> None:
+    source = MONITOR.read_text(encoding="utf-8")
+
+    auto_trade_block = source[
+        source.index("# Execution authority is intentionally session-scoped")
+        : source.index('score_in = _persist(')
+    ]
+    assert 'value=False' in auto_trade_block
+    assert '_persist(' not in auto_trade_block
+    assert 'sys_auto_trade' not in auto_trade_block
+    assert "每次打开平台都默认关闭" in source
+    assert "读取决策台的 AI 综合评分" not in source

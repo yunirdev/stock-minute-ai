@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from trader.monitor_research_view import live_research_html
 
 
@@ -29,9 +31,11 @@ def test_live_research_html_renders_and_escapes():
                 "session": "open",
                 "tick_count": 2,
                 "equity": 10_000,
+                "updated_at": "2026-07-27T12:00:00+00:00",
                 "candidates": [],
             },
-        }
+        },
+        now=datetime(2026, 7, 27, 12, 1, tzinfo=timezone.utc),
     )
     assert "2026-07-27" in html
     assert "&lt;AAPL&gt;" in html
@@ -62,3 +66,23 @@ def test_live_research_html_explains_empty_deep_candidate_failure():
 
     assert "没有可进入深度研究的候选" in html
     assert "深度候选 0" in html
+
+
+def test_live_research_html_marks_stale_runtime_as_stopped():
+    html = live_research_html(
+        {
+            "research": {"run": None, "items": []},
+            "runtime": {
+                "session": "post",
+                "tick_count": 1,
+                "equity": 10_000,
+                "updated_at": "2026-07-27T12:00:00+00:00",
+                "candidates": [],
+            },
+        },
+        now=datetime(2026, 7, 27, 12, 4, 1, tzinfo=timezone.utc),
+        runtime_stale_after_seconds=180,
+    )
+
+    assert "已停止或心跳过期" in html
+    assert "运行正常" not in html

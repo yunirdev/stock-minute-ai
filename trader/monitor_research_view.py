@@ -1,6 +1,7 @@
 """HTML renderer for the live daily-research/Runtime monitor card."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from html import escape
 from typing import Any
 
@@ -10,8 +11,14 @@ _RUN_ERRORS = {
 }
 
 
-def live_research_html(snapshot: dict[str, Any] | None) -> str:
+def live_research_html(
+    snapshot: dict[str, Any] | None,
+    *,
+    now: datetime | None = None,
+    runtime_stale_after_seconds: int = 180,
+) -> str:
     snapshot = snapshot or {}
+    now = now or datetime.now(timezone.utc)
     research = snapshot.get("research") or {}
     run = research.get("run")
     runtime = snapshot.get("runtime")
@@ -40,8 +47,20 @@ def live_research_html(snapshot: dict[str, Any] | None) -> str:
     if runtime is not None:
         blocked = bool(runtime.get("reconciliation_blocked"))
         kill = bool(runtime.get("kill_switch"))
-        health = "阻断" if blocked or kill else "运行正常"
-        color = "var(--neg)" if blocked or kill else "var(--pos)"
+        stale = _runtime_stale(
+            runtime.get("updated_at"),
+            now=now,
+            stale_after_seconds=runtime_stale_after_seconds,
+        )
+        if blocked or kill:
+            health = "阻断"
+            color = "var(--neg)"
+        elif stale:
+            health = "已停止或心跳过期"
+            color = "var(--fg3)"
+        else:
+            health = "运行正常"
+            color = "var(--pos)"
         parts.append(
             '<div class="qa-note">'
             f"Runtime <b style=\"color:{color}\">{health}</b> · "
@@ -54,6 +73,26 @@ def live_research_html(snapshot: dict[str, Any] | None) -> str:
         parts.append(_runtime_rows(runtime.get("candidates") or []))
     parts.append("</div>")
     return "".join(parts)
+
+
+def _runtime_stale(
+    updated_at: Any,
+    *,
+    now: datetime,
+    stale_after_seconds: int,
+) -> bool:
+    if stale_after_seconds <= 0 or not isinstance(updated_at, str):
+        return True
+    try:
+        parsed = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return True
+    if now.tzinfo is None or now.utcoffset() is None:
+        now = now.replace(tzinfo=timezone.utc)
+    age = (now.astimezone(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds()
+    return age < 0 or age > stale_after_seconds
 
 
 def _research_rows(rows: list[dict[str, Any]]) -> str:
