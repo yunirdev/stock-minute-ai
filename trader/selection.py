@@ -9,25 +9,29 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Dict, List
 
-from .contracts import Selector
 from .data_cache import get_bars
-from .models import Candidate, new_id, utc_now
+from .models import Candidate, utc_now
 from .strategy_core import STRATEGY_OPTIONS, compute_signals
 
 logger = logging.getLogger(__name__)
 
 
 class ConsensusSelector:
-    """实现 Selector Protocol —— 策略共识打分选股。"""
+    """实现 Selector —— 策略共识打分选股。"""
 
     def __init__(
         self,
         strategies: List[str] | None = None,
         min_bars: int = 60,
     ) -> None:
-        self._strategies = strategies or list(STRATEGY_OPTIONS.keys())
+        default_strategies = (
+            list(STRATEGY_OPTIONS.keys())
+            if hasattr(STRATEGY_OPTIONS, "keys")
+            else list(STRATEGY_OPTIONS)
+        )
+        self._strategies = strategies or default_strategies
         self._min_bars = min_bars
 
     def select(
@@ -61,16 +65,24 @@ class ConsensusSelector:
             return None
 
         votes: Dict[str, int] = {}
+        errored_strategies: List[str] = []
         for strat in self._strategies:
             try:
                 result = compute_signals(df.copy(), strat)
                 sig = int(result.iloc[-1].get("strat_signal", 0))
                 if sig != 0:
                     votes[strat] = sig  # +1 看多, -1 看空
-            except Exception:
-                pass
+            except Exception as exc:
+                # A strategy that errors is NOT the same as one that computed
+                # and genuinely voted neutral — counting it in the denominator
+                # silently dilutes the consensus score. Exclude it and record
+                # which ones failed so a systematic data issue is visible
+                # (e.g. in the UI/audit) instead of just quietly lowering
+                # scores across the board.
+                logger.warning("selection %s 策略 %s 跳过: %s", symbol, strat, exc)
+                errored_strategies.append(strat)
 
-        total = len(self._strategies)
+        total = len(self._strategies) - len(errored_strategies)
         bull = sum(1 for v in votes.values() if v > 0)
         score = round(100.0 * bull / total, 1) if total > 0 else 50.0
 
@@ -78,7 +90,11 @@ class ConsensusSelector:
             symbol=symbol,
             score=score,
             rank=0,  # filled after sort
-            reasons={"votes": votes, "total_strategies": total},
+            reasons={
+                "votes": votes,
+                "total_strategies": total,
+                "errored_strategies": errored_strategies,
+            },
             as_of=as_of or utc_now(),
         )
 
@@ -88,10 +104,3 @@ class ConsensusSelector:
 # ---------------------------------------------------------------------------
 
 _default_selector: ConsensusSelector | None = None
-
-
-def get_selector() -> ConsensusSelector:
-    global _default_selector
-    if _default_selector is None:
-        _default_selector = ConsensusSelector()
-    return _default_selector

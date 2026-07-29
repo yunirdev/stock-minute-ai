@@ -25,8 +25,7 @@ import logging
 import shutil
 import subprocess
 import yaml
-import json
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +100,19 @@ class AgentReachClient:
                         timeout=20)
         if not raw:
             return []
+        try:
+            parsed = yaml.safe_load(raw)
+            if isinstance(parsed, dict) and parsed.get("ok") and isinstance(parsed.get("data"), list):
+                results = []
+                for t in parsed["data"][:n]:
+                    text = t.get("text", "").replace("\n", " ").strip()
+                    author = t.get("author", {}).get("screenName", "")
+                    likes = t.get("metrics", {}).get("likes", 0)
+                    if text:
+                        results.append(f"@{author} (♥{likes}): {text[:200]}")
+                return results
+        except Exception:
+            pass
         return [line.strip() for line in raw.splitlines() if line.strip()][:n]
 
     # ── Reddit 搜索 ──────────────────────────────────────────────────────
@@ -113,8 +125,8 @@ class AgentReachClient:
         if not self.has_reddit():
             logger.debug("opencli 未安装，跳过 Reddit 搜索")
             return []
-        raw = self._run(["opencli", "reddit", "search", query, "-f", "yaml", "-n", str(n)],
-                        timeout=20)
+        raw = self._run(["opencli", "reddit", "search", query, "-f", "yaml", "--limit", str(n)],
+                        timeout=30)
         if not raw:
             return []
         try:
@@ -128,6 +140,64 @@ class AgentReachClient:
         except Exception:
             pass
         return [line.strip() for line in raw.splitlines() if line.strip()][:n]
+
+    # ── Fintwit 影响力账号（Twitter 大V）────────────────────────────────────
+    #
+    # 使用 Twitter 的 from: 运算符搜索指定账号的推文。
+    # 分类说明：
+    #   options_flow   — 期权/暗池数据驱动
+    #   macro          — 宏观视角
+    #   news           — 突发新闻
+    #   quant_data     — 量化/国会数据
+    #   technical      — 技术分析
+    #   user_defined   — 用户自选
+    #
+    FINTWIT_INFLUENCERS: Dict[str, str] = {
+        # ── 用户自选 ──────────────────────────────────────────────────
+        "aleabitoreddit":  "user_defined",     # 用户关注，交易分析
+        # ── 期权流/暗池 ─────────────────────────────────────────────────
+        "unusual_whales":  "options_flow",     # 期权流 + 国会交易，全球最火之一
+        "OptionsHawk":     "options_flow",     # 异常大单预警，实时扫描
+        "quiverquant":     "quant_data",       # 国会持仓/机构/暗池数据
+        # ── 宏观/突发新闻 ────────────────────────────────────────────────
+        "DeItaone":        "news",             # Bloomberg 第一手消息
+        "zerohedge":       "macro",            # 宏观风险/空头视角（高流量）
+        "elerianm":        "macro",            # Mohamed El-Erian，前PIMCO CEO
+        # ── 技术分析 ────────────────────────────────────────────────────
+        "GarethSoloway":   "technical",        # 技术分析，零售端影响力大
+    }
+
+    def search_influencer_mentions(
+        self,
+        symbol: str,
+        accounts: Dict[str, str] | None = None,
+        n_per_batch: int = 5,
+    ) -> List[str]:
+        """
+        搜索 Fintwit 大V 对指定标的的推文。
+        使用 Twitter `from:` 运算符，批量查询（每批最多 3 个账号，避免 query 过长）。
+        返回格式：["@username [category]: tweet text", ...]
+        """
+        if not self.has_twitter():
+            return []
+        accs = accounts or self.FINTWIT_INFLUENCERS
+        if not accs:
+            return []
+
+        results: List[str] = []
+        account_list = list(accs.items())
+
+        # 分批查询（每批 3 个账号）
+        batch_size = 3
+        for i in range(0, len(account_list), batch_size):
+            batch = account_list[i : i + batch_size]
+            from_clause = " OR ".join(f"from:{acc}" for acc, _ in batch)
+            query = f"${symbol} ({from_clause})"
+            raw_tweets = self.search_twitter(query, n=n_per_batch)
+            for tweet in raw_tweets:
+                results.append(f"[Fintwit] {tweet}")
+
+        return results[:15]  # 最多返回 15 条
 
     # ── 预设金融 RSS Feeds ────────────────────────────────────────────────
 
@@ -165,8 +235,15 @@ class AgentReachClient:
     ) -> str:
         """运行 CLI 命令并返回 stdout 文本；失败时返回空字符串。"""
         try:
+            # Windows 上 npm 全局 CLI 生成 .CMD 文件，需要 cmd.exe 才能执行
+            import sys
+            actual_cmd = cmd
+            if sys.platform == "win32":
+                exe = shutil.which(cmd[0])
+                if exe and exe.upper().endswith(".CMD"):
+                    actual_cmd = ["cmd.exe", "/c"] + cmd
             result = subprocess.run(
-                cmd,
+                actual_cmd,
                 capture_output=True,
                 text=True,
                 timeout=timeout or self._timeout,

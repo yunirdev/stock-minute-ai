@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List
 
@@ -22,7 +22,7 @@ _HEARTBEAT_MAX_STALE_SECS = 120   # 2 分钟无心跳则告警
 
 
 class HeartbeatWatchdog:
-    """实现 Watchdog Protocol —— 检查 heartbeat 新鲜度与数据缺口。"""
+    """实现 Watchdog —— 检查 heartbeat 新鲜度与数据缺口。"""
 
     def __init__(
         self,
@@ -37,10 +37,12 @@ class HeartbeatWatchdog:
         try:
             import duckdb
             conn = duckdb.connect(self._db_path, read_only=True)
-            row = conn.execute(
-                "SELECT MAX(ts) FROM audit_heartbeats"
-            ).fetchone()
-            conn.close()
+            try:
+                row = conn.execute(
+                    "SELECT MAX(ts) FROM heartbeat"
+                ).fetchone()
+            finally:
+                conn.close()
             if row and row[0]:
                 last_hb = row[0]
                 if isinstance(last_hb, str):
@@ -59,7 +61,7 @@ class HeartbeatWatchdog:
                 alerts.append(Alert(
                     level="warn",
                     source="watchdog",
-                    message="audit_heartbeats 表为空或不存在",
+                    message="heartbeat 表为空或不存在",
                 ))
         except Exception as exc:
             logger.warning("watchdog 检查失败: %s", exc)
@@ -69,7 +71,7 @@ class HeartbeatWatchdog:
 
 
 class FileKillSwitch:
-    """实现 KillSwitch Protocol —— 用 JSON 状态文件控制急停。"""
+    """实现 KillSwitch —— 用 JSON 状态文件控制急停。"""
 
     def __init__(self, path: Path | str = _KILL_SWITCH_PATH) -> None:
         self._path = Path(path)
@@ -80,8 +82,14 @@ class FileKillSwitch:
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
             return bool(data.get("engaged", False))
-        except Exception:
-            return False
+        except Exception as exc:
+            # Fail closed: a state file that can't be read/parsed (corrupt,
+            # or caught mid-write by engage()) must NOT be treated as "not
+            # engaged" — that would silently defeat the emergency stop for
+            # as long as the corruption persists, with no alert. Prefer a
+            # false-positive halt over a false-negative "trading continues."
+            logger.error("KillSwitch 状态文件读取失败，按已激活处理: %s", exc)
+            return True
 
     def engage(self, reason: str = "手动急停") -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)

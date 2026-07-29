@@ -3,16 +3,19 @@ base.py
 Agent 基类 + StubAgent（通用空实现）。
 
 红线：agent 只产出 Advisory（status=DRAFT 的 TradePlan 包在 Advisory.payload 里）。
-      绝不 import broker / order_manager / scheduler。
+      绝不 import broker / order execution。
 """
 from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from trader.contracts import AgentContext
+from trader.models import AgentContext
 from trader.models import Advisory, new_id, utc_now
+
+if TYPE_CHECKING:
+    from trader.ai.client import LLMClient
 
 logger = logging.getLogger(__name__)
 
@@ -42,13 +45,14 @@ class AgentBase(ABC):
             confidence=confidence,
             model=model,
             created_at=utc_now(),
+            is_fallback=bool(payload.get("_is_fallback", False)),
         )
 
     # ── LLM 调用工具（子类使用）─────────────────────────────────────────────
 
     def _llm_json(
         self,
-        client: "LLMClient",
+        client: LLMClient,
         system: str,
         user: str,
         model: str = "",
@@ -56,11 +60,12 @@ class AgentBase(ABC):
         fallback: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """调用 LLM，返回 JSON dict；失败时返回 fallback。"""
-        from trader.ai.client import LLMClient  # local import to avoid circular
         result = client.json_chat(system, user, model=model, temperature=temperature)
         if not result and fallback is not None:
             logger.warning("%s: LLM 返回空，使用 fallback", self.role)
-            return fallback
+            result = dict(fallback)
+            result["_is_fallback"] = True
+            return result
         return result or {}
 
     def _clamp_score(self, value: Any, default: float = 50.0) -> float:

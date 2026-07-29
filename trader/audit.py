@@ -1,4 +1,4 @@
-"""
+﻿"""
 audit.py
 Append-only audit log stored in DuckDB.
 
@@ -16,7 +16,7 @@ from pathlib import Path
 import duckdb
 
 from .config import TradingConfig
-from .models import OrderIntent, RiskVerdict, Signal
+from .models import OrderIntent, RiskVerdict, Signal, TradePlan
 
 logger = logging.getLogger(__name__)
 
@@ -88,10 +88,68 @@ class AuditLog:
             )
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS plan_risk_events (
+                ts          TIMESTAMPTZ,
+                plan_id     TEXT,
+                decision_id TEXT,
+                symbol      TEXT,
+                side        TEXT,
+                action      TEXT,
+                phase       TEXT,
+                verdict     TEXT,
+                reason      TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ai_safety_events (
+                ts TIMESTAMPTZ, symbol TEXT, plan_id TEXT, score DOUBLE,
+                run_id TEXT, created_at TIMESTAMPTZ, age_seconds DOUBLE,
+                reason_code TEXT, message TEXT, broker_type TEXT, auto_trade_paper BOOLEAN
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS reconciliation_reports (
+                ts TIMESTAMPTZ, ok BOOLEAN, open_orders INTEGER, positions INTEGER,
+                fills_seen INTEGER, unexplained_orders TEXT, unexplained_positions TEXT, errors TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS strategy_decisions (
+                decision_id TEXT PRIMARY KEY, universe_version TEXT, symbol TEXT,
+                strategy TEXT, strategy_version TEXT, side TEXT, confidence DOUBLE,
+                market_regime TEXT, candidate_source TEXT, evidence TEXT,
+                ai_advisory_run_id TEXT, strategy_statistics_id TEXT,
+                data_version TEXT, reason_codes TEXT, rejected_alternatives TEXT,
+                created_at TIMESTAMPTZ, valid_until TIMESTAMPTZ
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS decision_plan_links (
+                decision_id TEXT, plan_id TEXT UNIQUE, created_at TIMESTAMPTZ
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS heartbeat (
                 ts          TIMESTAMP,
                 tick_count  INTEGER,
                 equity      DOUBLE
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS trade_plans (
+                plan_id     TEXT PRIMARY KEY,
+                symbol      TEXT,
+                action      TEXT,
+                side        TEXT,
+                qty         DOUBLE,
+                entry_price DOUBLE,
+                stop_loss   DOUBLE,
+                take_profit DOUBLE,
+                confidence  DOUBLE,
+                rationale   TEXT,
+                status      TEXT,
+                created_at  TIMESTAMPTZ,
+                updated_at  TIMESTAMPTZ
             )
         """)
         conn.commit()
@@ -163,21 +221,102 @@ class AuditLog:
         finally:
             conn.close()
 
+    def log_plan_risk_event(
+        self,
+        plan: TradePlan,
+        verdict: RiskVerdict,
+        *,
+        phase: str,
+    ) -> None:
+        """Persist a plan-linked deterministic risk verdict for traceability."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO plan_risk_events VALUES (?,?,?,?,?,?,?,?,?)",
+                [
+                    datetime.now(timezone.utc),
+                    plan.plan_id,
+                    plan.metadata.get("decision_id", ""),
+                    plan.symbol,
+                    plan.side.value,
+                    plan.action,
+                    phase,
+                    "APPROVED" if verdict.approved else "BLOCKED",
+                    verdict.reason,
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def log_ai_safety_event(self, plan: TradePlan, result, config: TradingConfig) -> None:
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO ai_safety_events VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                [datetime.now(timezone.utc), plan.symbol, plan.plan_id, result.score,
+                 result.run_id, None, result.age_seconds, result.reason_code,
+                 result.message, config.broker_type, config.auto_trade_paper],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    def log_reconciliation(self, report) -> None:
+        conn = self._connect()
+        try:
+            conn.execute("INSERT INTO reconciliation_reports VALUES (?,?,?,?,?,?,?,?)", [
+                report.created_at, report.ok, report.open_orders, report.positions, report.fills_seen,
+                json.dumps(report.unexplained_orders), json.dumps(report.unexplained_positions), json.dumps(report.errors)])
+            conn.commit()
+        finally:
+            conn.close()
+
+    def log_strategy_decision(self, decision) -> None:
+        conn = self._connect()
+        try:
+            conn.execute("""
+                INSERT INTO strategy_decisions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT (decision_id) DO NOTHING
+            """, [decision.decision_id, decision.universe_version, decision.symbol,
+                   decision.strategy, decision.strategy_version, decision.side.value,
+                   decision.confidence, decision.market_regime, decision.candidate_source,
+                   json.dumps(decision.evidence, default=str), decision.ai_advisory_run_id,
+                   decision.strategy_statistics_id, decision.data_version,
+                   json.dumps(decision.reason_codes), json.dumps(decision.rejected_alternatives),
+                   decision.created_at, decision.valid_until])
+            conn.commit()
+        finally:
+            conn.close()
+    def link_decision_plan(self, decision_id: str, plan_id: str) -> None:
+        conn = self._connect()
+        try:
+            conn.execute("INSERT INTO decision_plan_links VALUES (?,?,?) ON CONFLICT (plan_id) DO NOTHING",
+                         [decision_id, plan_id, datetime.now(timezone.utc)])
+            conn.commit()
+        finally:
+            conn.close()
     def log_heartbeat(self, tick_count: int, equity: float) -> None:
         """Overwrite the single-row heartbeat table on every tick."""
         now = datetime.now(timezone.utc)
         # Write to DuckDB (best-effort — may fail if another process holds the lock)
         try:
             conn = self._connect()
-            conn.execute("DELETE FROM heartbeat")
-            conn.execute(
-                "INSERT INTO heartbeat VALUES (?,?,?)",
-                [now, tick_count, equity],
-            )
-            conn.commit()
-            conn.close()
+            try:
+                conn.execute("DELETE FROM heartbeat")
+                conn.execute(
+                    "INSERT INTO heartbeat VALUES (?,?,?)",
+                    [now, tick_count, equity],
+                )
+                conn.commit()
+            finally:
+                conn.close()
         except Exception as _exc:
-            logger.debug("heartbeat DuckDB write skipped: %s", _exc)
+            # WARNING, not debug: HeartbeatWatchdog reads this table to detect a
+            # hung engine. A silent debug-level swallow here previously let the
+            # DuckDB write fail every tick for a full day undetected, while the
+            # watchdog kept firing CRITICAL staleness alerts against a table
+            # nobody could see was never being updated.
+            logger.warning("heartbeat DuckDB write skipped: %s", _exc)
         # Always write JSON sidecar — no file locking, readable by Streamlit
         try:
             _HEARTBEAT_FILE.write_text(
@@ -190,6 +329,23 @@ class AuditLog:
             )
         except Exception as _exc:
             logger.debug("heartbeat JSON write failed: %s", _exc)
+
+    def log_trade_plan(self, plan: TradePlan) -> None:
+        """写入（或更新）trade_plans 表。plan_id 已存在时只更新 status/updated_at。"""
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO trade_plans VALUES (?,?,?,?,?,?,?,?,?,?,?,NOW(),NOW())
+                ON CONFLICT (plan_id) DO UPDATE SET status=excluded.status, updated_at=NOW()
+                """,
+                [plan.plan_id, plan.symbol, plan.action, plan.side.value,
+                 plan.qty, plan.entry_price, plan.stop_loss, plan.take_profit,
+                 plan.confidence, plan.rationale, plan.status],
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def close(self) -> None:
         pass  # No persistent connection to close

@@ -63,7 +63,7 @@ class AlpacaDataFeed:
             resp = requests.get(
                 url, headers=self._headers, params=params, timeout=15)
             resp.raise_for_status()
-            raw = resp.json().get("bars", [])
+            raw = resp.json().get("bars") or []
         except Exception as exc:
             logger.error("Alpaca fetch_bars %s: %s", symbol, exc)
             return []

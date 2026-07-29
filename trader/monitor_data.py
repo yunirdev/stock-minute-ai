@@ -18,8 +18,13 @@ import duckdb
 import pandas as pd
 from dotenv import load_dotenv
 
+from .operations_observability import (
+    explain_order as explain_order,
+    render_order_explanation_html as render_order_explanation_html,
+)
+
 _ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(_ROOT / ".env")
+load_dotenv(_ROOT / ".env", override=True)  # .env 优先于已存在的 OS 环境变量，见 config.py 注释
 
 DB_PATH = str(_ROOT / os.getenv("TRADE_DB_PATH", "trade.duckdb"))
 HEARTBEAT_JSON = _ROOT / "logs" / "heartbeat.json"
@@ -31,11 +36,14 @@ def db_query(sql: str, params: list | None = None, db_path: str = DB_PATH) -> pd
         return pd.DataFrame()
     try:
         conn = duckdb.connect(db_path, read_only=True)
-        df = conn.execute(sql, params or []).df()
-        conn.close()
-        return df
     except Exception:
         return pd.DataFrame()
+    try:
+        return conn.execute(sql, params or []).df()
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        conn.close()
 
 
 def heartbeat(db_path: str = DB_PATH, heartbeat_json: Path = HEARTBEAT_JSON) -> Optional[datetime]:
@@ -81,10 +89,144 @@ def risk_events_df(hours: int, db_path: str = DB_PATH) -> pd.DataFrame:
                     [_since(hours)], db_path)
 
 
+def latest_reconciliation(db_path: str = DB_PATH) -> dict | None:
+    """Return the newest startup reconciliation report, if the schema exists."""
+    df = db_query(
+        "SELECT * FROM reconciliation_reports ORDER BY ts DESC LIMIT 1",
+        db_path=db_path,
+    )
+    return None if df.empty else df.iloc[0].to_dict()
+
+
+def episode_review_outcome_counts(limit: int = 50, db_path: str = DB_PATH) -> pd.DataFrame:
+    """Outcome distribution over the most recent frozen episode reviews."""
+    recent = db_query(
+        "SELECT outcome FROM episode_reviews ORDER BY created_at DESC LIMIT ?",
+        [limit],
+        db_path,
+    )
+    if recent.empty:
+        return recent
+    return (
+        recent["outcome"]
+        .value_counts()
+        .rename_axis("outcome")
+        .reset_index(name="count")
+    )
+
+
+def latest_strategy_release_event(db_path: str = DB_PATH) -> dict | None:
+    """Return the newest champion/challenger promotion or rejection event."""
+    df = db_query(
+        "SELECT * FROM strategy_release_events ORDER BY created_at DESC LIMIT 1",
+        db_path=db_path,
+    )
+    return None if df.empty else df.iloc[0].to_dict()
+
+
+def latest_paper_maturity_status(db_path: str = DB_PATH) -> dict | None:
+    """Compact REAL 60-session maturity progress for the overview badge."""
+    obs = db_query(
+        "SELECT session_date, unexplained_duplicate_orders, plan_rewrites, "
+        "state_differences, unresolved_failures FROM paper_maturity_observations "
+        "WHERE evidence_type = 'REAL'",
+        db_path=db_path,
+    )
+    if obs.empty:
+        return None
+    anomaly_cols = [
+        "unexplained_duplicate_orders",
+        "plan_rewrites",
+        "state_differences",
+        "unresolved_failures",
+    ]
+    has_anomaly = bool((obs[anomaly_cols].fillna(0).astype(float).sum(axis=1) > 0).any())
+    return {
+        "real_sessions": int(obs["session_date"].nunique()),
+        "required_sessions": 60,
+        "has_anomaly": has_anomaly,
+    }
+
+
+def recent_news(hours: int = 24, limit: int = 30, db_path: str = DB_PATH) -> pd.DataFrame:
+    """Recent polled news/filings/price-move events, newest first."""
+    return db_query(
+        "SELECT ts, kind, symbol, title, summary, url, source FROM news_events "
+        "WHERE ts >= ? ORDER BY ts DESC LIMIT ?",
+        [_since(hours), limit],
+        db_path,
+    )
+
+
+
+
+
+
+
 # ── Alpaca 实时账户权益（绕过 DuckDB，用于 monitor 总览）────────────────────────
 
 _ALPACA_CACHE: dict = {"ts": None, "data": None}
 _ALPACA_CACHE_TTL = 30   # seconds
+
+
+_POS_CACHE: dict = {"ts": None, "data": None}
+_POS_CACHE_TTL = 30
+
+
+def live_alpaca_positions() -> list[dict]:
+    """直接调 Alpaca REST API 获取当前持仓列表，缓存 30 秒。
+    返回 [{"symbol", "side", "qty", "avg_entry_price", "current_price",
+            "market_value", "unrealized_pl", "unrealized_plpc"}, ...]
+    或 []（未配置 / 网络超时）。
+    """
+    import json as _json
+    import urllib.request as _urllib
+
+    now = datetime.now(timezone.utc)
+    if (
+        _POS_CACHE["ts"] is not None
+        and (now - _POS_CACHE["ts"]).total_seconds() < _POS_CACHE_TTL
+    ):
+        return _POS_CACHE["data"] or []
+
+    api_key = os.getenv("ALPACA_API_KEY", "")
+    secret  = os.getenv("ALPACA_API_SECRET", "") or os.getenv("ALPACA_SECRET_KEY", "")
+    broker_type = os.getenv("BROKER_TYPE", "alpaca_paper")
+
+    if not api_key or not secret:
+        _POS_CACHE.update(ts=now, data=[])
+        return []
+
+    base = (
+        "https://api.alpaca.markets"
+        if broker_type == "alpaca_live"
+        else "https://paper-api.alpaca.markets"
+    )
+    try:
+        req = _urllib.Request(
+            f"{base}/v2/positions",
+            headers={"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret},
+        )
+        with _urllib.urlopen(req, timeout=5) as resp:
+            raw = _json.loads(resp.read())
+        result = [
+            {
+                "symbol":          p.get("symbol", ""),
+                "side":            p.get("side", ""),
+                "qty":             float(p.get("qty", 0)),
+                "avg_entry_price": float(p.get("avg_entry_price", 0)),
+                "current_price":   float(p.get("current_price", 0)),
+                "market_value":    float(p.get("market_value", 0)),
+                "unrealized_pl":   float(p.get("unrealized_pl", 0)),
+                "unrealized_plpc": float(p.get("unrealized_plpc", 0)),
+            }
+            for p in (raw if isinstance(raw, list) else [])
+        ]
+        _POS_CACHE.update(ts=now, data=result)
+        return result
+    except Exception:
+        _POS_CACHE.update(ts=now, data=[])
+        return []
 
 
 def live_alpaca_equity() -> Optional[dict]:

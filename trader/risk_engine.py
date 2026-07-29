@@ -3,17 +3,18 @@ risk_engine.py
 Pre-trade risk checks and real-time circuit breakers.
 
 Flow:
-    RiskEngine.evaluate(signal, equity, positions) -> RiskVerdict
+    RiskEngine.evaluate_plan(plan, equity, positions) -> RiskVerdict
     RiskEngine.check_equity(current_equity)         # daily DD circuit breaker
     RiskEngine.record_failure() / record_success()  # consecutive failure guard
 """
 from __future__ import annotations
 
 import logging
-from typing import Dict
+import math
+from typing import Dict, Mapping
 
 from .config import TradingConfig
-from .models import Position, RiskVerdict, Side, Signal, TradePlan
+from .models import Position, RiskVerdict, Side, TradePlan
 
 logger = logging.getLogger(__name__)
 
@@ -76,88 +77,100 @@ class RiskEngine:
     # Pre-trade evaluation
     # ------------------------------------------------------------------
 
-    def evaluate(
-        self,
-        signal: Signal,
-        current_equity: float,
-        positions: Dict[str, Position],
-    ) -> RiskVerdict:
-        """
-        Evaluate a signal against all risk rules.
-        Returns RiskVerdict(approved=False, reason=...) to block, or
-        RiskVerdict(approved=True, suggested_qty=...) to allow.
-        """
-        if self._halted:
-            return RiskVerdict(False, "系统熔断中: " + self._halt_reason)
-
-        # Short-selling guard
-        if not self._cfg.risk.allow_short and signal.side == Side.SELL:
-            pos = positions.get(signal.symbol)
-            if pos is None or pos.qty <= 0:
-                return RiskVerdict(False, "不允许裸空仓")
-
-        price = signal.exec_price
-        if not (price > 0):
-            return RiskVerdict(False, f"执行价无效: {price}")
-
-        # Position size: max_position_pct * equity
-        max_value = current_equity * self._cfg.risk.max_position_pct
-        qty_by_size = max_value / price
-
-        # Risk-per-trade: max_trade_risk_pct * equity / (price * 1% stop)
-        risk_value = current_equity * self._cfg.risk.max_trade_risk_pct
-        qty_by_risk = risk_value / (price * 0.01)
-
-        qty = min(qty_by_size, qty_by_risk) * self._cfg.leverage
-
-        # For SELL: cap to actual position size (avoid over-selling / going short accidentally)
-        if signal.side == Side.SELL:
-            pos = positions.get(signal.symbol)
-            held = pos.qty if pos is not None else 0.0
-            qty = min(qty, held)
-
-        # Apply integer rounding for whole-share brokers
-        qty = max(int(qty), 0)
-
-        if qty < 1:
-            return RiskVerdict(
-                False,
-                f"建议仓位不足1股 (equity={current_equity:.0f}, price={price:.2f})",
-            )
-
-        return RiskVerdict(True, "通过", suggested_qty=float(qty))
-
     def evaluate_plan(
         self,
         plan: TradePlan,
         current_equity: float,
         positions: Dict[str, Position],
+        pending_buy_notional: Mapping[str, float] | None = None,
     ) -> RiskVerdict:
         """Plan-level pre-trade checks（用于 runtime.py 计划驱动管道）。"""
         if self._halted:
             return RiskVerdict(False, "系统熔断中: " + self._halt_reason)
 
-        if plan.stop_loss <= 0:
+        try:
+            entry_price = float(plan.entry_price)
+            stop_loss = float(plan.stop_loss)
+            qty = float(plan.qty)
+            equity = float(current_equity)
+        except (TypeError, ValueError):
+            return RiskVerdict(False, "计划价格、数量或权益无效")
+        if not all(
+            math.isfinite(value)
+            for value in (entry_price, stop_loss, qty, equity)
+        ):
+            return RiskVerdict(False, "计划价格、数量或权益无效")
+        if equity <= 0:
+            return RiskVerdict(False, f"账户权益无效: {equity}")
+        if stop_loss <= 0:
             return RiskVerdict(False, "计划缺少有效止损")
-        if plan.entry_price <= 0:
-            return RiskVerdict(False, f"入场价无效: {plan.entry_price}")
-        if plan.qty <= 0:
-            return RiskVerdict(False, f"数量无效: {plan.qty}")
+        if entry_price <= 0:
+            return RiskVerdict(False, f"入场价无效: {entry_price}")
+        if qty <= 0:
+            return RiskVerdict(False, f"数量无效: {qty}")
 
-        if plan.side == Side.BUY and plan.entry_price <= plan.stop_loss:
+        if plan.side == Side.BUY and entry_price <= stop_loss:
             return RiskVerdict(
                 False,
-                f"BUY: 入场价({plan.entry_price:.2f}) ≤ 止损({plan.stop_loss:.2f})",
+                f"BUY: 入场价({entry_price:.2f}) ≤ 止损({stop_loss:.2f})",
             )
-        if plan.side == Side.SELL and plan.entry_price >= plan.stop_loss:
+        if plan.side == Side.SELL and entry_price >= stop_loss:
             return RiskVerdict(
                 False,
-                f"SELL: 入场价({plan.entry_price:.2f}) ≥ 止损({plan.stop_loss:.2f})",
+                f"SELL: 入场价({entry_price:.2f}) ≥ 止损({stop_loss:.2f})",
             )
 
-        cost = plan.entry_price * plan.qty
-        max_cost = current_equity * self._cfg.risk.max_position_pct
-        if cost > max_cost:
+        increases_exposure = plan.action not in {"CLOSE", "REDUCE"}
+        if increases_exposure:
+            try:
+                max_trade_risk_pct = float(
+                    self._cfg.risk.max_trade_risk_pct
+                )
+            except (TypeError, ValueError):
+                return RiskVerdict(False, "单笔风险配置无效")
+            if (
+                not math.isfinite(max_trade_risk_pct)
+                or max_trade_risk_pct <= 0
+            ):
+                return RiskVerdict(False, "单笔风险配置无效")
+            trade_risk = abs(entry_price - stop_loss) * qty
+            max_trade_risk = equity * max_trade_risk_pct
+            if trade_risk > max_trade_risk + 1e-9:
+                return RiskVerdict(
+                    False,
+                    f"单笔止损风险 ${trade_risk:,.2f} 超上限 "
+                    f"${max_trade_risk:,.2f} "
+                    f"({max_trade_risk_pct * 100:.2f}% 资产)",
+                )
+
+        cost = entry_price * qty
+        max_cost = equity * self._cfg.risk.max_position_pct
+        increases_long = (
+            plan.side == Side.BUY
+            and increases_exposure
+        )
+        if increases_long:
+            position = positions.get(plan.symbol)
+            held_qty = max(float(position.qty), 0.0) if position else 0.0
+            held_notional = held_qty * entry_price
+            try:
+                pending_notional = max(
+                    float((pending_buy_notional or {}).get(plan.symbol, 0.0)),
+                    0.0,
+                )
+            except (TypeError, ValueError):
+                return RiskVerdict(False, "未成交买单敞口无效")
+            if not math.isfinite(pending_notional):
+                return RiskVerdict(False, "未成交买单敞口无效")
+            cumulative_cost = held_notional + pending_notional + cost
+            if cumulative_cost > max_cost + 1e-9:
+                return RiskVerdict(
+                    False,
+                    f"累计仓位 ${cumulative_cost:,.0f} 超上限 "
+                    f"${max_cost:,.0f} "
+                    f"({self._cfg.risk.max_position_pct * 100:.0f}% 资产)",
+                )
+        elif increases_exposure and cost > max_cost:
             return RiskVerdict(
                 False,
                 f"仓位成本 ${cost:,.0f} 超上限 ${max_cost:,.0f} "
@@ -171,7 +184,7 @@ class RiskEngine:
                     False, f"{plan.symbol} 已有持仓 {pos.qty:.0f} 股，OPEN 计划被拒"
                 )
 
-        return RiskVerdict(True, "通过", suggested_qty=float(plan.qty))
+        return RiskVerdict(True, "通过", suggested_qty=qty)
 
     # ------------------------------------------------------------------
     # Properties

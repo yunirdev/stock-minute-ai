@@ -22,7 +22,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 # Keep python-dotenv loading too, so plain os.getenv(...) elsewhere still works.
-load_dotenv(_ENV_PATH)
+# override=True: .env 是本项目唯一权威配置源。不加 override 时
+# python-dotenv 默认让已存在的 OS/用户级环境变量"赢"，曾导致一个误设的系统级
+# FINNHUB_API_KEY（实际是粘错的 OpenAI key）静默覆盖 .env 里正确的值，且无任何报错提示。
+load_dotenv(_ENV_PATH, override=True)
 
 
 class Settings(BaseSettings):
@@ -35,7 +38,63 @@ class Settings(BaseSettings):
     alpaca_secret_key: str = Field(
         "", validation_alias=AliasChoices("ALPACA_API_SECRET", "ALPACA_SECRET_KEY"))
     alpaca_feed: str = Field(
-        "iex", validation_alias=AliasChoices("ALPACA_DATA_FEED", "ALPACA_FEED"))
+        "sip", validation_alias=AliasChoices("ALPACA_DATA_FEED", "ALPACA_FEED"))
+    min_ai_score: int = Field(65, validation_alias=AliasChoices("MIN_AI_SCORE"))
+    ai_score_db: str = Field("ai_states.duckdb", validation_alias=AliasChoices("AI_SCORE_DB"))
+    ai_score_max_age_minutes: float = Field(
+        30.0, validation_alias=AliasChoices("AI_SCORE_MAX_AGE_MINUTES")
+    )
+    ai_min_contributors: int = Field(
+        3, validation_alias=AliasChoices("AI_MIN_CONTRIBUTORS")
+    )
+    ai_min_weight_coverage: float = Field(
+        0.50, validation_alias=AliasChoices("AI_MIN_WEIGHT_COVERAGE")
+    )
+    allow_quant_without_ai: bool = Field(
+        False, validation_alias=AliasChoices("ALLOW_QUANT_WITHOUT_AI")
+    )
+    strategy_statistics_path: str = Field(
+        "conf/strategy_statistics.json",
+        validation_alias=AliasChoices("STRATEGY_STATISTICS_PATH"),
+    )
+    agent_cycle_interval_minutes: float = Field(
+        15.0, validation_alias=AliasChoices("AGENT_CYCLE_INTERVAL_MINUTES")
+    )
+    universe_max_symbols: int = Field(
+        20, validation_alias=AliasChoices("UNIVERSE_MAX_SYMBOLS")
+    )
+    universe_max_age_minutes: int = Field(
+        1440, validation_alias=AliasChoices("UNIVERSE_MAX_AGE_MINUTES")
+    )
+
+
+    daily_research_enabled: bool = Field(
+        True, validation_alias=AliasChoices('DAILY_RESEARCH_ENABLED')
+    )
+    daily_research_db: str = Field(
+        'ai_states.duckdb', validation_alias=AliasChoices('DAILY_RESEARCH_DB')
+    )
+    daily_research_max_age_hours: float = Field(
+        36.0, validation_alias=AliasChoices('DAILY_RESEARCH_MAX_AGE_HOURS')
+    )
+    daily_research_screen_limit: int = Field(
+        10, validation_alias=AliasChoices('DAILY_RESEARCH_SCREEN_LIMIT')
+    )
+    daily_research_deep_limit: int = Field(
+        5, validation_alias=AliasChoices('DAILY_RESEARCH_DEEP_LIMIT')
+    )
+    daily_research_close_hour_et: int = Field(
+        16, validation_alias=AliasChoices('DAILY_RESEARCH_CLOSE_HOUR_ET')
+    )
+    daily_research_close_minute_et: int = Field(
+        15, validation_alias=AliasChoices('DAILY_RESEARCH_CLOSE_MINUTE_ET')
+    )
+    morning_brief_hour_et: int = Field(
+        9, validation_alias=AliasChoices('MORNING_BRIEF_HOUR_ET')
+    )
+    daily_review_hour_et: int = Field(
+        16, validation_alias=AliasChoices('DAILY_REVIEW_HOUR_ET')
+    )
 
 
 # Loaded once at import — the one place .env is parsed for engine config.
@@ -80,12 +139,74 @@ class TradingConfig(BaseModel):
     # ---- Storage ------------------------------------------------------------
     db_path: str = "trade.duckdb"
 
-    # ---- Scheduler ----------------------------------------------------------
+    # ---- Runtime cadence ----------------------------------------------------
     poll_interval_secs: int = 30
     bars_lookback: int = 120                 # bars fetched per tick for indicator warm-up
 
-    # ---- Pending-order / gap-fill -------------------------------------------
-    pending_order_max_bars: int = 10
+    # ---- AI 自动虚拟盘交易 -------------------------------------------------------
+    # auto_trade_paper=True：
+    #   · 从 ai_score_db 读取最新 AI 综合分（0-100）
+    #   · 分数 ≥ min_ai_score 且确定性风控通过后下 LMT 单到 Alpaca paper
+    #   · 分数 < min_ai_score 或 DB 无数据 → REJECTED（不执行）
+    auto_trade_paper: bool = False
+    min_ai_score: int = Field(default_factory=lambda: settings.min_ai_score)
+    ai_score_db: str = Field(default_factory=lambda: settings.ai_score_db)
 
-    # ---- Execution gate (红线：默认关；只挂 LMT；需人工确认后再开) -----------
-    execution_enabled: bool = False
+    ai_score_max_age_minutes: float = Field(
+        default_factory=lambda: settings.ai_score_max_age_minutes
+    )
+    ai_min_contributors: int = Field(
+        default_factory=lambda: settings.ai_min_contributors
+    )
+    ai_min_weight_coverage: float = Field(
+        default_factory=lambda: settings.ai_min_weight_coverage
+    )
+    allow_quant_without_ai: bool = Field(
+        default_factory=lambda: settings.allow_quant_without_ai
+    )
+    strategy_statistics_path: str = Field(
+        default_factory=lambda: settings.strategy_statistics_path
+    )
+    agent_cycle_interval_minutes: float = Field(
+        default_factory=lambda: settings.agent_cycle_interval_minutes
+    )
+    universe_max_symbols: int = Field(
+        default_factory=lambda: settings.universe_max_symbols
+    )
+    universe_max_age_minutes: int = Field(
+        default_factory=lambda: settings.universe_max_age_minutes
+    )
+
+    daily_research_enabled: bool = Field(
+        default_factory=lambda: settings.daily_research_enabled
+    )
+    daily_research_db: str = Field(
+        default_factory=lambda: settings.daily_research_db
+    )
+    daily_research_max_age_hours: float = Field(
+        default_factory=lambda: settings.daily_research_max_age_hours
+    )
+    daily_research_screen_limit: int = Field(
+        default_factory=lambda: settings.daily_research_screen_limit
+    )
+    daily_research_deep_limit: int = Field(
+        default_factory=lambda: settings.daily_research_deep_limit
+    )
+    daily_research_close_hour_et: int = Field(
+        default_factory=lambda: settings.daily_research_close_hour_et
+    )
+    daily_research_close_minute_et: int = Field(
+        default_factory=lambda: settings.daily_research_close_minute_et
+    )
+    morning_brief_hour_et: int = Field(
+        default_factory=lambda: settings.morning_brief_hour_et
+    )
+    daily_review_hour_et: int = Field(
+        default_factory=lambda: settings.daily_review_hour_et
+    )
+
+    def model_post_init(self, __context: object) -> None:
+        if self.broker_type not in {"alpaca_paper", "alpaca_live"}:
+            raise ValueError("UNSUPPORTED_BROKER_TYPE")
+        if self.auto_trade_paper and self.broker_type != 'alpaca_paper':
+            raise ValueError('AUTO_TRADE_REQUIRES_ALPACA_PAPER')

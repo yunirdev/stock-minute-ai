@@ -21,7 +21,6 @@ trader/data_cache.py
 from __future__ import annotations
 
 import logging
-import os
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -93,6 +92,45 @@ def _parquet_path(symbol: str, timeframe: str) -> Path:
     return _BARS_DIR / f"{symbol}_{timeframe}.parquet"
 
 
+def _write_parquet(path: Path, df: pd.DataFrame) -> None:
+    try:
+        df.to_parquet(path, index=False, engine="pyarrow")
+        return
+    except ImportError:
+        pass
+
+    import duckdb
+
+    con = duckdb.connect(":memory:")
+    try:
+        con.register("bars_df", df)
+        target = path.as_posix().replace("'", "''")
+        con.execute(f"COPY bars_df TO '{target}' (FORMAT PARQUET)")
+    finally:
+        con.close()
+
+
+def _read_parquet(path: Path, columns: Optional[list[str]] = None) -> pd.DataFrame:
+    try:
+        return pd.read_parquet(path, engine="pyarrow", columns=columns)
+    except ImportError:
+        pass
+
+    import duckdb
+
+    col_sql = "*"
+    if columns:
+        col_sql = ", ".join(f'"{col}"' for col in columns)
+    con = duckdb.connect(":memory:")
+    try:
+        return con.execute(
+            f"SELECT {col_sql} FROM read_parquet(?)",
+            [str(path)],
+        ).df()
+    finally:
+        con.close()
+
+
 def _save_to_disk(symbol: str, timeframe: str, df: pd.DataFrame) -> None:
     """保存 DataFrame 到本地 Parquet 文件。"""
     if df.empty:
@@ -102,7 +140,7 @@ def _save_to_disk(symbol: str, timeframe: str, df: pd.DataFrame) -> None:
         out = df.copy()
         out["timestamp_utc"] = pd.to_datetime(out["timestamp_utc"], utc=True)
         out["timestamp"] = out["timestamp_utc"]
-        out.to_parquet(path, index=False, engine="pyarrow")
+        _write_parquet(path, out)
         logger.info("data_cache saved %s %s → %s (%d rows)", symbol, timeframe, path.name, len(out))
     except Exception as exc:
         logger.warning("data_cache save_disk %s %s: %s", symbol, timeframe, exc)
@@ -114,7 +152,7 @@ def _load_from_disk(symbol: str, timeframe: str) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
     try:
-        df = pd.read_parquet(path, engine="pyarrow")
+        df = _read_parquet(path)
         df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
         df["timestamp"] = df["timestamp_utc"]
         logger.info("data_cache load_disk %s %s ← %s (%d rows)", symbol, timeframe, path.name, len(df))
@@ -274,25 +312,139 @@ def get_bars(symbol: str, timeframe: str) -> pd.DataFrame:
     return df.copy() if df is not None else pd.DataFrame()
 
 
-def refresh_bars(symbol: str, timeframe: str) -> pd.DataFrame:
-    """
-    增量更新并返回最新 DataFrame。
-    - 本地文件存在 → 读取本地 + 追加最近几根 bar（yfinance 增量）
-    - 本地文件不存在 → 直接返回空 DataFrame，不联网
-    """
-    _ensure_loaded(symbol, timeframe)          # 本地文件 → 内存
-    _incremental_update(symbol, timeframe)     # 仅在本地文件存在时才追加新 bar
-    return get_bars(symbol, timeframe)
+def describe_cached_bars(
+    symbol: str,
+    timeframe: str,
+    *,
+    frame: pd.DataFrame | None = None,
+    captured_at: datetime | None = None,
+) -> dict:
+    """Describe and serialize the exact cache frame consumed by research."""
+    captured_at = (captured_at or datetime.now(timezone.utc)).astimezone(
+        timezone.utc
+    )
+    bars = get_bars(symbol, timeframe) if frame is None else frame.copy()
+    path = _parquet_path(symbol, timeframe)
+    required = {
+        "timestamp_utc",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+    }
+    normalized = bars.copy()
+    normalized.columns = [str(column).lower() for column in normalized.columns]
+    missing_columns = sorted(required - set(normalized.columns))
+    if missing_columns:
+        rows: list[dict] = []
+        data_start = None
+        data_end = None
+    else:
+        normalized["timestamp_utc"] = pd.to_datetime(
+            normalized["timestamp_utc"],
+            utc=True,
+        )
+        columns = [
+            column
+            for column in (
+                "symbol",
+                "timestamp_utc",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+            )
+            if column in normalized.columns
+        ]
+        rows = []
+        for raw in normalized[columns].to_dict(orient="records"):
+            row = {}
+            for key, value in raw.items():
+                if key == "timestamp_utc":
+                    row[key] = pd.Timestamp(value).isoformat()
+                elif pd.isna(value):
+                    row[key] = None
+                elif hasattr(value, "item"):
+                    row[key] = value.item()
+                else:
+                    row[key] = value
+            rows.append(row)
+        data_start = (
+            normalized["timestamp_utc"].min().to_pydatetime()
+            if not normalized.empty
+            else None
+        )
+        data_end = (
+            normalized["timestamp_utc"].max().to_pydatetime()
+            if not normalized.empty
+            else None
+        )
+
+    if normalized.empty:
+        status = "MISSING"
+        quality_score = 0.0
+        failure_code = "BAR_CACHE_EMPTY"
+    elif missing_columns:
+        status = "FAILED"
+        quality_score = 0.0
+        failure_code = "BAR_COLUMNS_MISSING"
+    elif not rows:
+        status = "MISSING"
+        quality_score = 0.0
+        failure_code = "BAR_CACHE_EMPTY"
+    elif len(rows) < 40:
+        status = "DEGRADED"
+        quality_score = min(len(rows) / 40.0, 1.0)
+        failure_code = "BAR_HISTORY_SHORT"
+    else:
+        status = "OK"
+        quality_score = 1.0
+        failure_code = ""
+    file_updated_at = (
+        datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        if path.exists()
+        else None
+    )
+    return {
+        "source": "local_bar_cache",
+        "status": status,
+        "as_of": data_end or captured_at,
+        "fetched_at": captured_at,
+        "quality_score": quality_score,
+        "coverage": ("ohlcv",),
+        "payload_version": "local-bars:v1",
+        "failure_code": failure_code,
+        "metadata": {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "row_count": len(rows),
+            "missing_columns": missing_columns,
+            "cache_file": str(path),
+            "file_updated_at": (
+                file_updated_at.isoformat()
+                if file_updated_at is not None
+                else None
+            ),
+            "data_start": (
+                data_start.isoformat() if data_start is not None else None
+            ),
+            "data_end": (
+                data_end.isoformat() if data_end is not None else None
+            ),
+        },
+        "payload": {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "columns": sorted(required),
+            "rows": rows,
+        },
+    }
 
 
-def is_warm(symbol: str, timeframe: str) -> bool:
-    """True 表示该 (symbol, timeframe) 已有数据（内存或本地文件均算）。"""
-    key = (symbol, timeframe)
-    with _CACHE_LOCK:
-        df = _CACHE.get(key)
-    if df is not None and not df.empty:
-        return True
-    return _parquet_path(symbol, timeframe).exists()
+
+
 
 
 def list_cached_files() -> list:
@@ -300,7 +452,7 @@ def list_cached_files() -> list:
     result = []
     for f in sorted(_BARS_DIR.glob("*.parquet")):
         try:
-            df = pd.read_parquet(f, engine="pyarrow", columns=["timestamp_utc"])
+            df = _read_parquet(f, columns=["timestamp_utc"])
             df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
             mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
             result.append({
@@ -315,6 +467,11 @@ def list_cached_files() -> list:
             result.append({"文件": f.name, "行数": "?", "起始": "?",
                            "截止": "?", "更新时间": "?", "大小(KB)": "?"})
     return result
+
+
+def list_cached_names() -> list[str]:
+    """只列缓存文件名，不读取 Parquet 内容。"""
+    return sorted(path.name for path in _BARS_DIR.glob("*.parquet"))
 
 
 # Timeframes Alpaca supports for bar history (1m excluded — free plan too shallow).
@@ -377,6 +534,34 @@ def _alpaca_fetch_bars(symbol: str, timeframe: str, start_str: str, end_str: str
     } for b in all_bars])
 
 
+def fetch_alpaca_bars_window(
+    symbol: str,
+    timeframe: str,
+    start: datetime,
+    end: datetime,
+) -> pd.DataFrame:
+    """Read one explicit Alpaca history window without mutating local cache."""
+    if start.tzinfo is None or start.utcoffset() is None:
+        raise ValueError("ALPACA_HISTORY_START_TIMEZONE_REQUIRED")
+    if end.tzinfo is None or end.utcoffset() is None:
+        raise ValueError("ALPACA_HISTORY_END_TIMEZONE_REQUIRED")
+    start_utc = start.astimezone(timezone.utc)
+    end_utc = end.astimezone(timezone.utc)
+    if start_utc >= end_utc:
+        raise ValueError("ALPACA_HISTORY_WINDOW_INVALID")
+    normalized_symbol = symbol.strip().upper()
+    if not normalized_symbol:
+        raise ValueError("ALPACA_HISTORY_SYMBOL_REQUIRED")
+    if timeframe not in _ALPACA_TF:
+        raise ValueError("ALPACA_HISTORY_TIMEFRAME_UNSUPPORTED")
+    return _alpaca_fetch_bars(
+        normalized_symbol,
+        timeframe,
+        start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        end_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+
+
 def _alpaca_fetch_full(symbol: str, timeframe: str) -> pd.DataFrame:
     """Full history from 2016 to now (free plan delay → end = now-20min)."""
     start_str = "2016-01-01T00:00:00Z"
@@ -389,7 +574,7 @@ def _alpaca_fetch_full(symbol: str, timeframe: str) -> pd.DataFrame:
 
 def upsert_bars(symbol: str, timeframe: str, df: pd.DataFrame) -> None:
     """Merge a fresh DataFrame from the live data feed into the in-memory cache
-    and flush to the local Parquet file.  Called by the Scheduler after each tick
+    and flush to the local Parquet file.  Called by the Runtime after each tick
     so that exploration/backtest panels always see the latest live bars."""
     if df is None or df.empty:
         return

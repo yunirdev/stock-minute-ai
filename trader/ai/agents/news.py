@@ -14,7 +14,7 @@ import logging
 from collections import defaultdict
 from typing import Dict, List
 
-from trader.contracts import AgentContext
+from trader.models import AgentContext
 from trader.models import Advisory, NewsEvent
 from .base import AgentBase
 

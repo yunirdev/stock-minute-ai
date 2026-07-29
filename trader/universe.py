@@ -23,7 +23,7 @@ _WATCHLIST_PATH = Path("conf/watchlist.json")
 
 
 class ConfigUniverseProvider:
-    """实现 UniverseProvider Protocol —— 从内置表 + 文件/env 读取标的池。"""
+    """实现 UniverseProvider —— 从内置表 + 文件/env 读取标的池。"""
 
     def get_universe(self, name: str = "default") -> List[str]:
         if name == "watchlist":

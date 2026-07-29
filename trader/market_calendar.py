@@ -1,67 +1,109 @@
-"""
-market_calendar.py
-美股交易时段判断（基于时区规则，不依赖外部服务）。
+﻿"""
+US equity market session helper.
 
-时段（美东时间 ET）：
-  pre    : 04:00 – 09:30
-  open   : 09:30 – 16:00
-  post   : 16:00 – 20:00
-  closed : 其余时间（含周末）
+The runtime only needs a coarse full-day session gate:
+pre / open / post / closed.  This module uses America/New_York so daylight
+saving time is handled correctly, and includes the standard full-day
+NYSE/Nasdaq holidays without requiring a network call.
 """
+
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Literal
-
-# UTC 偏移（EST=-5h，EDT=-4h；简化：用固定 -5，不做夏令时）
-_UTC_TO_ET_OFFSET = -5
+from zoneinfo import ZoneInfo
 
 
 SessionName = Literal["pre", "open", "post", "closed"]
 
+_NY = ZoneInfo("America/New_York")
+
 
 class SimpleMarketCalendar:
-    """实现 MarketCalendar Protocol —— 基于固定时区规则的时段判断。"""
+    """Implements the MarketCalendar protocol."""
 
     def session_now(self) -> SessionName:
         return session_at(datetime.now(timezone.utc))
 
 
 def session_at(dt: datetime) -> SessionName:
-    """给定 UTC datetime 返回美股时段（简化规则，不含节假日）。"""
-    if dt.tzinfo is not None:
-        # 转换为 UTC
-        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-
-    # 粗算美东时间
-    et_hour = dt.hour + _UTC_TO_ET_OFFSET
-    et_minute = dt.minute
-    # 转为分钟数（从当日 00:00 开始）
-    et_total = (et_hour % 24) * 60 + et_minute
-
-    # 周末（0=Mon … 6=Sun in datetime.weekday()）
-    # 注意 ET 转换后可能跨日，这里做简单处理
-    et_day = (dt + __import__("datetime").timedelta(hours=_UTC_TO_ET_OFFSET)).weekday()
-    if et_day >= 5:  # 周六=5, 周日=6
+    """Return the US equity session for a UTC or timezone-aware datetime."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    et = dt.astimezone(_NY)
+    if et.weekday() >= 5 or et.date() in market_holidays(et.year):
         return "closed"
 
-    # 时段（分钟）
-    pre_start   = 4 * 60           # 04:00
-    market_open = 9 * 60 + 30     # 09:30
-    market_close = 16 * 60        # 16:00
-    post_end     = 20 * 60        # 20:00
-
-    if pre_start <= et_total < market_open:
+    minute = et.hour * 60 + et.minute
+    if 4 * 60 <= minute < 9 * 60 + 30:
         return "pre"
-    elif market_open <= et_total < market_close:
+    if 9 * 60 + 30 <= minute < 16 * 60:
         return "open"
-    elif market_close <= et_total < post_end:
+    if 16 * 60 <= minute < 20 * 60:
         return "post"
+    return "closed"
+
+
+def market_holidays(year: int) -> set[date]:
+    """Standard full-day NYSE/Nasdaq market holidays for one calendar year."""
+    return {
+        _observed(date(year, 1, 1)),
+        _nth_weekday(year, 1, 0, 3),  # Martin Luther King Jr. Day
+        _nth_weekday(year, 2, 0, 3),  # Presidents' Day
+        _easter_date(year) - timedelta(days=2),  # Good Friday
+        _last_weekday(year, 5, 0),  # Memorial Day
+        _observed(date(year, 6, 19)),  # Juneteenth
+        _observed(date(year, 7, 4)),  # Independence Day
+        _nth_weekday(year, 9, 0, 1),  # Labor Day
+        _nth_weekday(year, 11, 3, 4),  # Thanksgiving
+        _observed(date(year, 12, 25)),  # Christmas
+    }
+
+
+def _observed(day: date) -> date:
+    if day.weekday() == 5:
+        return day - timedelta(days=1)
+    if day.weekday() == 6:
+        return day + timedelta(days=1)
+    return day
+
+
+def _nth_weekday(year: int, month: int, weekday: int, nth: int) -> date:
+    cur = date(year, month, 1)
+    while cur.weekday() != weekday:
+        cur += timedelta(days=1)
+    return cur + timedelta(days=7 * (nth - 1))
+
+
+def _last_weekday(year: int, month: int, weekday: int) -> date:
+    if month == 12:
+        cur = date(year + 1, 1, 1) - timedelta(days=1)
     else:
-        return "closed"
+        cur = date(year, month + 1, 1) - timedelta(days=1)
+    while cur.weekday() != weekday:
+        cur -= timedelta(days=1)
+    return cur
 
 
-# 默认实例
+def _easter_date(year: int) -> date:
+    """Gregorian Easter using the Meeus/Jones/Butcher algorithm."""
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    ell = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * ell) // 451
+    month = (h + ell - 7 * m + 114) // 31
+    day = ((h + ell - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
+
+
 _calendar = SimpleMarketCalendar()
 
 
