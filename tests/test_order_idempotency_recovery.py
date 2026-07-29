@@ -189,6 +189,44 @@ def test_order_status_failure_keeps_order_open_and_nonterminal(tmp_path):
     assert store.get_by_key(key)["state"] == OrderLifecycle.OPEN.value
 
 
+def test_get_fill_failure_keeps_order_open_and_never_applies_fill(tmp_path):
+    """A transient get_fill failure (status says FILLED, fill lookup errors)
+    must not mark the order done or touch the portfolio — otherwise the fill
+    is silently lost forever with no retry and no visible error.
+    """
+    db_path = str(tmp_path / "trade.duckdb")
+    store = OrderIntentStore(db_path)
+    plan = _plan()
+    key = idempotency_key(
+        plan.plan_id, plan.symbol, plan.side.value, plan.qty,
+        plan.entry_price, plan.action,
+    )
+    intent = OrderIntent(
+        intent_id="intent-open", signal_id=plan.plan_id, symbol=plan.symbol,
+        side=plan.side, qty=plan.qty, order_type="LMT",
+        limit_price=plan.entry_price, idempotency_key=key, plan_id=plan.plan_id,
+    )
+    store.persist(intent, key, plan.plan_id)
+    store.update(key, state=OrderLifecycle.OPEN.value, broker_order_id="broker-open")
+
+    apply_fill_calls = []
+    runtime = Runtime.__new__(Runtime)
+    runtime._broker = SimpleNamespace(
+        get_order_status=lambda _broker_id: OrderStatus.FILLED,
+        get_fill=lambda _broker_id: (_ for _ in ()).throw(TimeoutError("boom")),
+    )
+    runtime._order_store = store
+    runtime._open_orders = {"broker-open": intent}
+    runtime._portfolio = SimpleNamespace(
+        apply_fill=lambda fill: apply_fill_calls.append(fill)
+    )
+    runtime._poll_orders()
+
+    assert "broker-open" in runtime._open_orders
+    assert apply_fill_calls == []
+    assert store.get_by_key(key)["state"] == OrderLifecycle.OPEN.value
+
+
 def test_repeated_cumulative_partial_fills_apply_only_delta_and_finish(tmp_path):
     db_path = str(tmp_path / "trade.duckdb")
     config = _config(db_path)

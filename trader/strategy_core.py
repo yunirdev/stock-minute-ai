@@ -56,6 +56,74 @@ DEFAULT_STRATEGY_PARAMS: dict = dict(
     ta_n=14,
 )
 
+# Which kwargs each strategy actually reads, for UIs that want to expose
+# tunable parameters per strategy instead of always using the fixed default
+# above. (label, kwarg key, default value, step-or-"bool"). Grid strategies
+# default per strategy name rather than sharing one DEFAULT_STRATEGY_PARAMS entry.
+STRATEGY_PARAM_SPECS: dict[str, list[tuple[str, str, object, object]]] = {
+    "MACD零轴战法": [
+        ("快线周期", "macd_fast", DEFAULT_STRATEGY_PARAMS["macd_fast"], 1),
+        ("慢线周期", "macd_slow", DEFAULT_STRATEGY_PARAMS["macd_slow"], 1),
+    ],
+    "MACD信号线红绿柱": [
+        ("快线周期", "macd_fast", DEFAULT_STRATEGY_PARAMS["macd_fast"], 1),
+        ("慢线周期", "macd_slow", DEFAULT_STRATEGY_PARAMS["macd_slow"], 1),
+        ("信号线周期", "macd_signal", DEFAULT_STRATEGY_PARAMS["macd_signal"], 1),
+    ],
+    "RSI震荡战法(60买40卖)": [
+        ("RSI 周期", "rsi_n", DEFAULT_STRATEGY_PARAMS["rsi_n"], 1),
+    ],
+    "KDJ极值反转(J线探底)": [
+        ("KDJ 周期", "kdj_n", DEFAULT_STRATEGY_PARAMS["kdj_n"], 1),
+    ],
+    "布林带突破(上下轨)": [
+        ("窗口周期", "bb_n", DEFAULT_STRATEGY_PARAMS["bb_n"], 1),
+        ("标准差倍数", "bb_k", DEFAULT_STRATEGY_PARAMS["bb_k"], 0.1),
+    ],
+    "布林带均值回归(探底回升)": [
+        ("窗口周期", "bb_n", DEFAULT_STRATEGY_PARAMS["bb_n"], 1),
+        ("标准差倍数", "bb_k", DEFAULT_STRATEGY_PARAMS["bb_k"], 0.1),
+    ],
+    "CCI顺势指标(±100突破)": [
+        ("CCI 周期", "cci_n", DEFAULT_STRATEGY_PARAMS["cci_n"], 1),
+    ],
+    "唐奇安通道(20周突破)": [
+        ("通道周期", "donchian_n", DEFAULT_STRATEGY_PARAMS["donchian_n"], 1),
+    ],
+    "上周高低点(周K突破)": [
+        ("周窗口", "week_n", DEFAULT_STRATEGY_PARAMS["week_n"], 1),
+    ],
+    "半仓小网格(5%间距)": [
+        ("网格间距", "grid_pct", 0.05, 0.01),
+    ],
+    "半仓大网格(10%间距)": [
+        ("网格间距", "grid_pct", 0.10, 0.01),
+    ],
+    "BBI回踩不破做多(顺势二次上车)": [
+        ("回踩容差", "bbi_eps", DEFAULT_STRATEGY_PARAMS["bbi_eps"], 0.001),
+        ("要求突破确认", "bbi_breakout", DEFAULT_STRATEGY_PARAMS["bbi_breakout"], "bool"),
+    ],
+    "BBI回踩不破+斜率过滤": [
+        ("回踩容差", "bbi_eps", DEFAULT_STRATEGY_PARAMS["bbi_eps"], 0.001),
+        ("要求突破确认", "bbi_breakout", DEFAULT_STRATEGY_PARAMS["bbi_breakout"], "bool"),
+    ],
+    "BBI跌破反抽不过做空/卖出": [
+        ("反抽容差", "bbi_fail_eps", DEFAULT_STRATEGY_PARAMS["bbi_fail_eps"], 0.001),
+    ],
+    "ADX趋势过滤(ta)": [
+        ("ADX 周期", "ta_n", DEFAULT_STRATEGY_PARAMS["ta_n"], 1),
+    ],
+    "Stoch超买超卖(ta)": [
+        ("Stoch 周期", "ta_n", DEFAULT_STRATEGY_PARAMS["ta_n"], 1),
+    ],
+    "Williams %R反转(ta)": [
+        ("Williams 周期", "ta_n", DEFAULT_STRATEGY_PARAMS["ta_n"], 1),
+    ],
+    "MFI量价共振(ta)": [
+        ("MFI 周期", "ta_n", DEFAULT_STRATEGY_PARAMS["ta_n"], 1),
+    ],
+}
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -346,10 +414,10 @@ def compute_signals(df: pd.DataFrame, strategy: str, **kwargs) -> pd.DataFrame:
         out.loc[two_yin, "strat_exec_px"] = close
 
     elif strategy == "半仓小网格(5%间距)":
-        _apply_grid_signals_intrabar(out, high, low, 0.05)
+        _apply_grid_signals_intrabar(out, high, low, float(kwargs.get("grid_pct", 0.05)))
 
     elif strategy == "半仓大网格(10%间距)":
-        _apply_grid_signals_intrabar(out, high, low, 0.10)
+        _apply_grid_signals_intrabar(out, high, low, float(kwargs.get("grid_pct", 0.10)))
 
     elif strategy == "BBI上穿下穿(收盘确认)":
         bbi = _bbi_series(close)

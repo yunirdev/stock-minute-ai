@@ -3,7 +3,7 @@ risk_engine.py
 Pre-trade risk checks and real-time circuit breakers.
 
 Flow:
-    RiskEngine.evaluate(signal, equity, positions) -> RiskVerdict
+    RiskEngine.evaluate_plan(plan, equity, positions) -> RiskVerdict
     RiskEngine.check_equity(current_equity)         # daily DD circuit breaker
     RiskEngine.record_failure() / record_success()  # consecutive failure guard
 """
@@ -14,7 +14,7 @@ import math
 from typing import Dict, Mapping
 
 from .config import TradingConfig
-from .models import Position, RiskVerdict, Side, Signal, TradePlan
+from .models import Position, RiskVerdict, Side, TradePlan
 
 logger = logging.getLogger(__name__)
 
@@ -76,57 +76,6 @@ class RiskEngine:
     # ------------------------------------------------------------------
     # Pre-trade evaluation
     # ------------------------------------------------------------------
-
-    def evaluate(
-        self,
-        signal: Signal,
-        current_equity: float,
-        positions: Dict[str, Position],
-    ) -> RiskVerdict:
-        """
-        Evaluate a signal against all risk rules.
-        Returns RiskVerdict(approved=False, reason=...) to block, or
-        RiskVerdict(approved=True, suggested_qty=...) to allow.
-        """
-        if self._halted:
-            return RiskVerdict(False, "系统熔断中: " + self._halt_reason)
-
-        # Short-selling guard
-        if not self._cfg.risk.allow_short and signal.side == Side.SELL:
-            pos = positions.get(signal.symbol)
-            if pos is None or pos.qty <= 0:
-                return RiskVerdict(False, "不允许裸空仓")
-
-        price = signal.exec_price
-        if not (price > 0):
-            return RiskVerdict(False, f"执行价无效: {price}")
-
-        # Position size: max_position_pct * equity
-        max_value = current_equity * self._cfg.risk.max_position_pct
-        qty_by_size = max_value / price
-
-        # Risk-per-trade: max_trade_risk_pct * equity / (price * 1% stop)
-        risk_value = current_equity * self._cfg.risk.max_trade_risk_pct
-        qty_by_risk = risk_value / (price * 0.01)
-
-        qty = min(qty_by_size, qty_by_risk) * self._cfg.leverage
-
-        # For SELL: cap to actual position size (avoid over-selling / going short accidentally)
-        if signal.side == Side.SELL:
-            pos = positions.get(signal.symbol)
-            held = pos.qty if pos is not None else 0.0
-            qty = min(qty, held)
-
-        # Apply integer rounding for whole-share brokers
-        qty = max(int(qty), 0)
-
-        if qty < 1:
-            return RiskVerdict(
-                False,
-                f"建议仓位不足1股 (equity={current_equity:.0f}, price={price:.2f})",
-            )
-
-        return RiskVerdict(True, "通过", suggested_qty=float(qty))
 
     def evaluate_plan(
         self,

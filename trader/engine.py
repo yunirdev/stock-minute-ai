@@ -60,11 +60,6 @@ class SimResult:
         return len(self.trades)
 
     @property
-    def n_round_trips(self) -> int:
-        """完整平仓次数(有 realized_pnl 的腿)。"""
-        return sum(1 for t in self.trades if t.realized_pnl != 0.0 or t.side == "SELL")
-
-    @property
     def total_return(self) -> float:
         if self.initial_capital <= 0:
             return 0.0

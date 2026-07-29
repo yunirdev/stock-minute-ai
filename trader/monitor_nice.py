@@ -14,6 +14,7 @@ trader/monitor_nice.py
 
 from __future__ import annotations
 
+import html
 import json
 import inspect
 import logging
@@ -42,9 +43,13 @@ sys.path.insert(0, str(_ROOT))
 from trader.monitor_data import (  # noqa: E402
     DB_PATH,
     equity_df,
+    episode_review_outcome_counts,
     explain_order,
     fills_df,
     heartbeat,
+    latest_paper_maturity_status,
+    latest_strategy_release_event,
+    recent_news,
     live_alpaca_equity,
     live_alpaca_positions,
     latest_reconciliation,
@@ -54,8 +59,12 @@ from trader.monitor_data import (  # noqa: E402
     signals_df,
 )
 from trader.operations_observability import (  # noqa: E402
+    AsyncButtonActionRunner,
+    ActionJobResult,
+    BUTTON_ACTIONS,
     ButtonActionAuditStore,
     button_contract_manifest,
+    queue_view,
 )
 
 if sys.platform == "win32":
@@ -101,9 +110,7 @@ def _ui_health_report(report: UIHealthReport) -> dict:
         fingerprint = record_ui_health(report, DB_PATH)
         return {"accepted": True, "fingerprint": fingerprint}
     except Exception as exc:
-        logger.warning(
-            "UI health report persistence failed: %s", type(exc).__name__
-        )
+        logger.warning("UI health report persistence failed: %s", type(exc).__name__)
         return {"accepted": False}
 
 
@@ -120,6 +127,7 @@ def _order_explanation(plan_id: str) -> dict:
 
 _ACTION_AUDIT_STORE = ButtonActionAuditStore(DB_PATH)
 _ACTIVE_UI_ACTIONS: dict[str, str] = {}
+_ASYNC_ACTION_RUNNER = AsyncButtonActionRunner(_ACTION_AUDIT_STORE)
 
 
 def _audited_callback(action_id: str, callback):
@@ -162,6 +170,11 @@ def _audited_callback(action_id: str, callback):
     return _wrapped
 
 
+def _audited_job_callback(action_id: str, callback):
+    """Start a worker-backed UI action and leave it BUSY until work completes."""
+    return lambda: _ASYNC_ACTION_RUNNER.start(action_id, callback)
+
+
 ui.add_body_html(f"<script>{UI_HEALTH_SCRIPT}</script>")
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -169,18 +182,32 @@ ui.add_body_html(f"<script>{UI_HEALTH_SCRIPT}</script>")
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+# 当前代码里仍会被 _pref/_set_pref 读写的 key；不在这里的 key（旧引擎配置页、
+# 旧图表探索页、旧决策台遗留）不会被保存回 conf/ui_settings.json。
+_KNOWN_PREF_KEYS = {
+    "sys_sym", "sys_strat", "sys_tf", "sys_int", "sys_min_score", "sys_review_bias",
+    "fa_sym", "fa_tf", "fa_fac", "fa_fwd", "fa_nq",
+    "r_sym", "r_tf", "r_strat", "r_cap", "r_lev", "r_slip", "r_fill", "r_risk",
+    "sel_source", "sel_long_n", "sel_daily_n", "sel_decision_style",
+    "sel_scan_n", "sel_scan_keep_n", "sel_include_broad",
+    "active_tab",
+}
+
+
 def _load_prefs() -> dict:
     try:
-        return json.loads(_PREFS_PATH.read_text(encoding="utf-8"))
+        raw = json.loads(_PREFS_PATH.read_text(encoding="utf-8"))
     except Exception:
         return {}
+    return {k: v for k, v in raw.items() if k in _KNOWN_PREF_KEYS}
 
 
 def _save_prefs() -> None:
     try:
         _PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        clean = {k: v for k, v in _PREFS.items() if k in _KNOWN_PREF_KEYS}
         _PREFS_PATH.write_text(
-            json.dumps(_PREFS, ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(clean, ensure_ascii=False, indent=2), encoding="utf-8"
         )
     except Exception:
         pass
@@ -237,9 +264,13 @@ def _start_engine(
     if _engine_running():
         return "引擎已在运行"
     syms = ",".join(s.strip().upper() for s in symbols.split(",") if s.strip())
+    # Empty strategies is valid and intentional: ConsensusSelector treats an
+    # empty list as "use all STRATEGY_OPTIONS" (full 24-strategy consensus),
+    # so we must pass "" through explicitly rather than fall back to
+    # trader.main's single-strategy CLI default.
     strats = ",".join(s.strip() for s in strategies.split(",") if s.strip())
-    if not syms or not strats:
-        return "❌ 请填写标的与策略"
+    if not syms:
+        return "❌ 请填写标的（或先在「机会中心」生成决策池）"
     cmd = [
         sys.executable,
         "-m",
@@ -427,26 +458,7 @@ body{background:var(--bg);color:var(--fg);
 .qa-span-btn.sp-active{background:rgba(88,166,255,.15);color:var(--ai);
   border-color:rgba(88,166,255,.45);font-weight:600;}
 
-/* 决策台 */
-.cp-agent-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;width:100%;}
-@keyframes cp-pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.cp-mgr{background:var(--panel);border:1px solid rgba(88,166,255,.4);
-  border-radius:12px;padding:18px;width:100%;}
-.cp-pick-row{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px;}
-.cp-pick{padding:9px 14px;border-radius:8px;min-width:88px;text-align:center;}
-.cp-pick.buy{background:rgba(63,185,80,.12);border:1px solid rgba(63,185,80,.35);}
-.cp-pick.watch{background:rgba(210,153,34,.1);border:1px solid rgba(210,153,34,.3);}
-.cp-pick.avoid{background:rgba(248,81,73,.1);border:1px solid rgba(248,81,73,.25);}
-.cp-feed{background:var(--panel);border:1px solid var(--border);
-  border-radius:12px;padding:14px 16px;width:100%;}
-.cp-feed-row{display:flex;align-items:baseline;gap:9px;padding:5px 0;
-  border-bottom:1px solid #21262d;font-size:12.5px;}
-.cp-feed-row:last-child{border:none;}
-.cp-ts{color:var(--fg3);font-size:11px;min-width:65px;
-  font-family:var(--mono);flex-shrink:0;}
-.cp-tag{font-size:10px;font-weight:700;padding:2px 7px;border-radius:999px;flex-shrink:0;}
-
-/* 决策台详细报告 */
+/* 决策池详细报告 */
 .cp-report-wrap{display:flex;flex-direction:column;gap:8px;width:100%}
 .cp-report-sym{background:var(--panel);border:1px solid var(--border);border-radius:10px;overflow:hidden}
 .cp-report-sym[open]{border-color:rgba(88,166,255,.4)}
@@ -529,6 +541,10 @@ with ui.element("div").classes("qa-topbar"):
     with ui.element("div").classes("qa-stat"):
         ui.label("引擎").classes("l")
         top_engine = ui.label("—").classes("v")
+    with ui.element("div").classes("qa-stat").style("cursor:pointer") as top_tasks_stat:
+        ui.label("任务队列").classes("l")
+        top_tasks = ui.label("—").classes("v")
+    top_tasks_stat.on("click", lambda: _select("tasks"))
 
 with ui.element("div").classes("qa-body"):
     with ui.element("div").classes("qa-nav"):
@@ -585,7 +601,9 @@ def _empty(msg: str, icon: str = "∅"):
 
 
 def _make_table(col_specs: list):
-    cols = [{"name": f, "label": label, "field": f, "align": a} for f, label, a in col_specs]
+    cols = [
+        {"name": f, "label": label, "field": f, "align": a} for f, label, a in col_specs
+    ]
     return (
         ui.table(columns=cols, rows=[], row_key="__i", pagination=0)
         .props("flat dense")
@@ -883,7 +901,6 @@ def _render_overview():
     _page_head("总览", "账户权益与持仓 · 数据窗口 24 小时", badge="live")
 
     # ── 市场环境快捷条 ───────────────────────────────────────────────────────
-    import threading as _threading
 
     def _refresh_regime():
         def _work():
@@ -914,12 +931,14 @@ def _render_overview():
                         f"{regime.as_of.strftime('%H:%M UTC')}</span>"
                         f"</div>"
                     )
+                return bool(regime)
             except Exception as exc:
                 regime_bar.set_content(
                     f'<div style="font-size:12px;color:var(--neg)">市场环境获取失败: {exc}</div>'
                 )
+                raise
 
-        _threading.Thread(target=_work, daemon=True).start()
+        return _work()
 
     with ui.element("div").style(
         "display:flex;align-items:center;gap:10px;padding:8px 14px;"
@@ -932,10 +951,10 @@ def _render_overview():
         ui.element("div").style("flex:1")
         ui.button(
             "刷新市场环境",
-            on_click=_audited_callback("overview.refresh_regime", _refresh_regime),
-        ).props(
-            "unelevated dense flat outline"
-        ).style("font-size:11px;color:var(--fg3)")
+            on_click=_audited_job_callback("overview.refresh_regime", _refresh_regime),
+        ).props("unelevated dense flat outline").style(
+            "font-size:11px;color:var(--fg3)"
+        )
 
     with ui.element("div").classes("qa-card"):
         with ui.row().classes("items-center gap-3"):
@@ -949,7 +968,7 @@ def _render_overview():
             )
         ui.html(
             '<div class="qa-note">每天盘后或盘前只运行一次 TradingAgents；'
-            '盘中 Runtime 只更新价格、入场距离、持仓、订单和状态。</div>'
+            "盘中 Runtime 只更新价格、入场距离、持仓、订单和状态。</div>"
         )
         research_live = ui.html(
             live_research_html(live_monitor_snapshot(_DAILY_RESEARCH_DB))
@@ -958,7 +977,6 @@ def _render_overview():
         def _run_daily_research_now():
             run_research_btn.props("disable")
             research_status.set_text("研究运行中…")
-            import threading as _research_threading
 
             def _research_work():
                 try:
@@ -980,12 +998,12 @@ def _render_overview():
                         [
                             symbol.strip().upper()
                             for symbol in str(
-                                _pref('sys_sym', 'SPY,QQQ,AAPL,MSFT,NVDA')
-                            ).split(',')
+                                _pref("sys_sym", "SPY,QQQ,AAPL,MSFT,NVDA")
+                            ).split(",")
                             if symbol.strip()
                         ],
                         trading_date=research_target_date(now),
-                        timeframe=str(_pref('sys_tf', '5m')),
+                        timeframe=str(_pref("sys_tf", "5m")),
                         screen_limit=_settings.daily_research_screen_limit,
                         deep_limit=_settings.daily_research_deep_limit,
                         strategy_statistics_path=_settings.strategy_statistics_path,
@@ -1000,17 +1018,27 @@ def _render_overview():
                     research_live.set_content(
                         live_research_html(live_monitor_snapshot(_DAILY_RESEARCH_DB))
                     )
+                    status = str(result.status).upper()
+                    if status in {"FAILED", "ERROR"}:
+                        return ActionJobResult(
+                            state="ERROR",
+                            user_message=f"研究失败: {result.error_code or status}",
+                        )
+                    if int(result.completed_symbols or 0) == 0:
+                        return ActionJobResult(
+                            state="EMPTY", user_message="研究未产生可用结果"
+                        )
+                    return result
                 except Exception as exc:
                     research_status.set_text(f"研究失败: {exc}")
+                    raise
                 finally:
                     run_research_btn.props(remove="disable")
 
-            _research_threading.Thread(
-                target=_research_work, daemon=True
-            ).start()
+            return _research_work()
 
         run_research_btn.on_click(
-            _audited_callback("overview.run_research", _run_daily_research_now)
+            _audited_job_callback("overview.run_research", _run_daily_research_now)
         )
 
     with ui.element("div").classes("qa-kpi-row"):
@@ -1021,10 +1049,20 @@ def _render_overview():
         k_pos_n = _kpi("持仓数")
         k_pos_v = _kpi("持仓市值")
 
+    maturity = latest_paper_maturity_status()
+    if maturity is not None:
+        _tone = "neg" if maturity["has_anomaly"] else "pos"
+        _anomaly_note = "· 发现未解释异常" if maturity["has_anomaly"] else ""
+        ui.html(
+            f'<div class="qa-note" style="margin:-4px 0 8px">'
+            f"生产成熟度 · REAL "
+            f'<span class="{_tone}">{maturity["real_sessions"]}/{maturity["required_sessions"]}</span>'
+            f" · Paper 环境，不代表实盘授权 {_anomaly_note}</div>"
+        )
+
     # ── 权益曲线 ────────────────────────────────────────────────────────────
     _eq_span_key = "1D"
     _SPAN_OPTS = ["1D", "1W", "1M", "3M", "YTD", "All"]
-    _span_btns: dict[str, object] = {}
 
     with ui.element("div").classes("qa-card"):
         # 标题行 + 跨度选择器
@@ -1032,30 +1070,18 @@ def _render_overview():
             "display:flex;justify-content:space-between;align-items:center;width:100%;margin-bottom:4px"
         ):
             ui.label("组合收益 vs 基准").classes("qa-card-title")
-            with ui.element("div").style("display:flex;gap:4px"):
-                for _sl in _SPAN_OPTS:
 
-                    def _on_span(_sl=_sl):
-                        nonlocal _eq_span_key
-                        _eq_span_key = _sl
-                        for _b2 in _span_btns.values():
-                            _b2.classes(remove="sp-active")
-                        _span_btns[_sl].classes(add="sp-active")
-                        update()
+            span_sel = ui.select(
+                _SPAN_OPTS,
+                value="1D",
+            ).props("dense outlined dark").style("width:90px")
 
-                    _sbtn = (
-                        ui.button(
-                            _sl,
-                            on_click=_audited_callback(
-                                f"overview.span_{_sl.lower()}", _on_span
-                            ),
-                        )
-                        .props("flat no-caps dense")
-                        .classes("qa-span-btn")
-                    )
-                    if _sl == "1D":
-                        _sbtn.classes(add="sp-active")
-                    _span_btns[_sl] = _sbtn
+            def _on_span():
+                nonlocal _eq_span_key
+                _eq_span_key = span_sel.value
+                update()
+
+            span_sel.on_value_change(_audited_callback("overview.span_change", _on_span))
 
         # 超额收益摘要（动态更新）
         _perf_bar = ui.html('<div style="height:28px"></div>')
@@ -1090,6 +1116,35 @@ def _render_overview():
         ]
         ft = _make_table(fill_cols)
         ft_empty = ui.element("div")
+
+    with ui.element("div").classes("qa-card"):
+        ui.label("最新新闻").classes("qa-card-title")
+        ui.label(
+            "WSCN 快讯 · SEC 8-K · Finnhub · 本地价格异动 · 不受盘中/盘前/盘后限制"
+        ).classes("qa-card-sub")
+        news_area = ui.column().style("gap:4px;width:100%;margin-top:6px")
+
+    def _render_news():
+        news_area.clear()
+        news_df = recent_news(24, limit=20)
+        with news_area:
+            if news_df.empty:
+                _empty("过去 24 小时暂无新闻", "📰")
+                return
+            for _, row in news_df.iterrows():
+                symbol_html = (
+                    f'<span style="color:var(--ai);font-family:var(--mono)">{_he(row["symbol"])}</span> '
+                    if pd.notna(row.get("symbol"))
+                    else ""
+                )
+                ui.html(
+                    '<div class="qa-note" style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;font-size:12px">'
+                    f'<span style="color:var(--fg3);font-family:var(--mono)">{_fmt_time(row["ts"])}</span>'
+                    f"{symbol_html}"
+                    f'<b>{_he(row["title"])}</b>'
+                    f'<span style="color:var(--fg3);font-size:11px">{_he(row["source"])}</span>'
+                    "</div>"
+                )
 
     def update():
         nonlocal _eq_span_key
@@ -1241,6 +1296,8 @@ def _render_overview():
                 },
             )
 
+        _render_news()
+
     update()
     return update
 
@@ -1348,31 +1405,113 @@ def _render_activity():
         else:
             plan_id = str(recent_orders.iloc[0].get("plan_id") or "")
             explanation = explain_order(DB_PATH, plan_id)
-        order_explanation.set_content(
-            render_order_explanation_html(explanation)
-        )
+        order_explanation.set_content(render_order_explanation_html(explanation))
 
     update()
     return update
 
 
+def _render_model_schedule_settings():
+    from trader.ai.client import _DEFAULT_OLLAMA_URL, _ollama_list_models
+    from trader.config import settings
+    from trader.config_editor import EnvKeyNotWritableError, write_env_setting
+
+    with ui.element("div").classes("qa-card"):
+        ui.label("模型与调度参数").classes("qa-card-title")
+        ui.label(
+            "写入 .env，不涉及交易权限；重启引擎后生效"
+        ).classes("qa-card-sub")
+
+        def _save(key: str, value) -> None:
+            if value is None:
+                ui.notify(f"{key} 不能为空，未保存", type="warning")
+                return
+            try:
+                write_env_setting(key, value)
+                ui.notify(f"已保存 {key}，重启引擎生效", type="positive")
+            except EnvKeyNotWritableError:
+                ui.notify(f"{key} 不允许通过界面修改", type="negative")
+
+        base_url = os.getenv("OLLAMA_BASE_URL", _DEFAULT_OLLAMA_URL)
+        installed = [m["name"] for m in _ollama_list_models(base_url)]
+        current_model = os.getenv("OLLAMA_MODEL", "")
+        model_options = installed or ([current_model] if current_model else ["（本机 Ollama 不可达）"])
+        if current_model and current_model not in model_options:
+            model_options = [current_model] + model_options
+
+        with ui.row().classes("items-end gap-3 flex-wrap"):
+            model_sel = ui.select(
+                model_options,
+                value=current_model if current_model in model_options else model_options[0],
+                label="本地模型 (OLLAMA_MODEL)",
+            ).props("dark dense outlined").style("width:220px")
+            model_sel.on_value_change(lambda e: _save("OLLAMA_MODEL", e.value))
+
+            provider_sel = ui.select(
+                ["ollama", "anthropic", "stub"],
+                value=os.getenv("LLM_PROVIDER", "ollama"),
+                label="LLM 提供方",
+            ).props("dark dense outlined").style("width:140px")
+            provider_sel.on_value_change(lambda e: _save("LLM_PROVIDER", e.value))
+
+        _NUMERIC_ENV_FIELDS = [
+            ("每日研究触发时（美东）", "DAILY_RESEARCH_CLOSE_HOUR_ET", settings.daily_research_close_hour_et, 0, 23),
+            ("每日研究触发分", "DAILY_RESEARCH_CLOSE_MINUTE_ET", settings.daily_research_close_minute_et, 0, 59),
+            ("Runtime 轮询周期(分钟)", "AGENT_CYCLE_INTERVAL_MINUTES", settings.agent_cycle_interval_minutes, 1, None),
+            ("AI 采信阈值", "MIN_AI_SCORE", settings.min_ai_score, 0, 100),
+            ("AI 证据最大有效期(分钟)", "AI_SCORE_MAX_AGE_MINUTES", settings.ai_score_max_age_minutes, 1, None),
+            ("AI 最少贡献者数", "AI_MIN_CONTRIBUTORS", settings.ai_min_contributors, 1, None),
+            ("AI 最小权重覆盖率", "AI_MIN_WEIGHT_COVERAGE", settings.ai_min_weight_coverage, 0, 1),
+            ("每日筛选数量", "DAILY_RESEARCH_SCREEN_LIMIT", settings.daily_research_screen_limit, 1, None),
+            ("每日深度研究数量", "DAILY_RESEARCH_DEEP_LIMIT", settings.daily_research_deep_limit, 1, None),
+            ("Universe 最大标的数", "UNIVERSE_MAX_SYMBOLS", settings.universe_max_symbols, 1, None),
+            ("Universe 新鲜度上限(分钟)", "UNIVERSE_MAX_AGE_MINUTES", settings.universe_max_age_minutes, 1, None),
+        ]
+        with ui.row().classes("items-end gap-3 flex-wrap").style("margin-top:10px"):
+            for label, key, value, lo, hi in _NUMERIC_ENV_FIELDS:
+                field = ui.number(
+                    label, value=value, min=lo, max=hi
+                ).props("dark dense outlined").style("width:170px")
+                field.on_value_change(lambda e, k=key: _save(k, e.value))
+
+
 def _render_system():
     _page_head("系统运营 · 引擎与通知", "引擎控制、运行健康与外部通知", badge="live")
 
+    _render_model_schedule_settings()
+
     with ui.element("div").classes("qa-card"):
         ui.label("引擎控制").classes("qa-card-title")
-        ui.label("启动 / 停止实时交易引擎 (trader.main · Runtime 管道)").classes(
-            "qa-card-sub"
-        )
+        ui.label(
+            "启动 / 停止实时交易引擎 (trader.main · Runtime 管道)。"
+            "标的/策略留空 = 引擎自动使用「机会中心」当前决策池标的 + 全部 24 个策略共识投票。"
+        ).classes("qa-card-sub")
         with ui.row().classes("items-end gap-3 flex-wrap"):
+
+            def _default_pool_symbols() -> str:
+                try:
+                    from trader.selection_pools import decision_symbols
+
+                    return ", ".join(decision_symbols(limit=8))
+                except Exception:
+                    return ""
+
             sym_in = _persist(
-                ui.input("标的", value=_pref("sys_sym", "QQQ"))
+                ui.input(
+                    "标的（留空=当前决策池）",
+                    value=_pref("sys_sym", ""),
+                    placeholder=_default_pool_symbols() or "QQQ",
+                )
                 .props("dark dense outlined")
-                .style("width:120px"),
+                .style("width:200px"),
                 "sys_sym",
             )
             strat_in = _persist(
-                ui.input("策略", value=_pref("sys_strat", "上周高低点(周K突破)"))
+                ui.input(
+                    "策略（留空=全部24策略共识）",
+                    value=_pref("sys_strat", ""),
+                    placeholder="留空 = 全部策略共识",
+                )
                 .props("dark dense outlined")
                 .style("width:220px"),
                 "sys_strat",
@@ -1416,13 +1555,8 @@ def _render_system():
                 "sys_min_score",
             )
         ui.html(
-            '<div class="qa-note">'
-            "⚠️ AI 自动交易：每次打开平台都默认关闭，必须在本次会话显式勾选。"
-            "启用后仍要求当天冻结可信研究、当前策略信号、可靠 Holdout、"
-            "PaperDecision 与确定性风控全部通过，才会向 Alpaca Paper 提交 LMT 限价单。"
-            "不勾选 = DRY-RUN（只记日志，不下单）。"
-            "自动实盘不受支持；alpaca_live 与自动交易组合会 fail-closed。"
-            "</div>"
+            '<div class="qa-note">每次打开平台都默认关闭，需本次会话手动勾选。'
+            "不勾选 = DRY-RUN（只记日志，不下单）。自动实盘不受支持。</div>"
         )
         ui.html(
             '<div class="qa-note" style="margin-top:4px">总资产、现金、持仓全部以 Alpaca 账户为准；系统不会在本地覆盖账户权益。</div>'
@@ -1431,10 +1565,18 @@ def _render_system():
         with ui.row().classes("gap-3").style("margin-top:14px"):
 
             def _do_start():
+                resolved_symbols = (sym_in.value or "").strip()
+                if not resolved_symbols:
+                    try:
+                        from trader.selection_pools import decision_symbols
+
+                        resolved_symbols = ", ".join(decision_symbols(limit=8))
+                    except Exception:
+                        resolved_symbols = ""
                 ui.notify(
                     _start_engine(
-                        sym_in.value,
-                        strat_in.value,
+                        resolved_symbols or "QQQ",
+                        strat_in.value or "",
                         tf_in.value,
                         int_in.value,
                         auto_trade=bool(auto_trade_cb.value),
@@ -1449,16 +1591,12 @@ def _render_system():
                 "▶ 启动引擎",
                 on_click=_audited_callback("system.start", _do_start),
                 color="positive",
-            ).props(
-                "unelevated"
-            )
+            ).props("unelevated")
             ui.button(
                 "■ 停止",
                 on_click=_audited_callback("system.stop", _do_stop),
                 color="negative",
-            ).props(
-                "unelevated outline"
-            )
+            ).props("unelevated outline")
 
     # ── Discord 推送 ──────────────────────────────────────────────────────────
     with ui.element("div").classes("qa-card"):
@@ -1468,9 +1606,52 @@ def _render_system():
                 '<span style="font-size:11px;color:var(--qa-text-muted)">晨报 · 复盘 · 信号通知</span>'
             )
         ui.html(
-            '<div class="qa-note">引擎运行时会在每天美东 9AM 自动发送晨报，'
-            "下午 4:30 自动发送复盘。下方按钮可立即手动触发（用于测试 Discord 配置）。</div>"
+            '<div class="qa-note">引擎运行时会在下方设置的美东时间自动发送晨报/复盘。'
+            "下方按钮可立即手动触发（用于测试 Discord 配置）。</div>"
         )
+        with ui.row().classes("items-end gap-3 flex-wrap").style("margin-top:8px"):
+            from trader.config import settings as _settings
+            from trader.config_editor import (
+                EnvKeyNotWritableError as _EnvKeyNotWritableError,
+                write_env_setting as _write_env_setting,
+            )
+
+            def _save_schedule(key: str, value) -> None:
+                if value is None:
+                    ui.notify(f"{key} 不能为空，未保存", type="warning")
+                    return
+                try:
+                    _write_env_setting(key, int(value))
+                    ui.notify(f"已保存 {key}，重启引擎生效", type="positive")
+                except _EnvKeyNotWritableError:
+                    ui.notify(f"{key} 不允许通过界面修改", type="negative")
+
+            brief_hour_in = (
+                ui.number(
+                    "晨报发送时(美东)",
+                    value=_settings.morning_brief_hour_et,
+                    min=0,
+                    max=23,
+                )
+                .props("dark dense outlined")
+                .style("width:150px")
+            )
+            brief_hour_in.on_value_change(
+                lambda e: _save_schedule("MORNING_BRIEF_HOUR_ET", e.value)
+            )
+            review_hour_in = (
+                ui.number(
+                    "复盘发送时(美东)",
+                    value=_settings.daily_review_hour_et,
+                    min=0,
+                    max=23,
+                )
+                .props("dark dense outlined")
+                .style("width:150px")
+            )
+            review_hour_in.on_value_change(
+                lambda e: _save_schedule("DAILY_REVIEW_HOUR_ET", e.value)
+            )
         with ui.row().classes("gap-3 items-center flex-wrap").style("margin-top:10px"):
             _push_status = ui.html(
                 '<span style="font-size:12px;color:var(--qa-text-muted)">就绪</span>'
@@ -1494,144 +1675,162 @@ def _render_system():
                 _push_status.set_content(
                     '<span style="color:#d29922">晨报发送中…</span>'
                 )
-                import threading as _thr
+                try:
+                    from trader.morning_brief import send_morning_brief
 
-                def _work():
-                    try:
-                        from trader.morning_brief import send_morning_brief
-
-                        ok = send_morning_brief(symbols=_system_symbols())
-                        _push_status.set_content(
-                            '<span style="color:#3fb950">✓ 晨报已发送</span>'
-                            if ok
-                            else '<span style="color:#f85149">✗ 晨报发送失败</span>'
-                        )
-                    except Exception as exc:
-                        _push_status.set_content(
-                            f'<span style="color:#f85149">晨报错误: {exc}</span>'
-                        )
-
-                _thr.Thread(target=_work, daemon=True).start()
+                    ok = send_morning_brief(symbols=_system_symbols())
+                    _push_status.set_content(
+                        '<span style="color:#3fb950">✓ 晨报已发送</span>'
+                        if ok
+                        else '<span style="color:#f85149">✗ 晨报发送失败</span>'
+                    )
+                    return ok
+                except Exception as exc:
+                    _push_status.set_content(
+                        f'<span style="color:#f85149">晨报错误: {exc}</span>'
+                    )
+                    raise
 
             def _do_send_intraday():
                 _push_status.set_content(
                     '<span style="color:#d29922">盘中跟踪发送中…</span>'
                 )
-                import threading as _thr
+                try:
+                    from trader.manual_push import send_intraday_levels_push
 
-                def _work_i():
-                    try:
-                        from trader.manual_push import send_intraday_levels_push
-
-                        ok = send_intraday_levels_push(_system_symbols())
-                        _push_status.set_content(
-                            '<span style="color:#3fb950">✓ 盘中 OR/VWAP 已发送</span>'
-                            if ok
-                            else '<span style="color:#f85149">✗ 盘中 OR/VWAP 发送失败</span>'
-                        )
-                    except Exception as exc:
-                        _push_status.set_content(
-                            f'<span style="color:#f85149">盘中跟踪错误: {exc}</span>'
-                        )
-
-                _thr.Thread(target=_work_i, daemon=True).start()
+                    ok = send_intraday_levels_push(_system_symbols())
+                    _push_status.set_content(
+                        '<span style="color:#3fb950">✓ 盘中 OR/VWAP 已发送</span>'
+                        if ok
+                        else '<span style="color:#f85149">✗ 盘中 OR/VWAP 发送失败</span>'
+                    )
+                    return ok
+                except Exception as exc:
+                    _push_status.set_content(
+                        f'<span style="color:#f85149">盘中跟踪错误: {exc}</span>'
+                    )
+                    raise
 
             def _do_send_review():
                 _push_status.set_content(
                     '<span style="color:#d29922">复盘发送中…</span>'
                 )
-                import threading as _thr
+                try:
+                    from trader.discord_report import build_daily_review_message
+                    from trader.notify import make_notifier
+                    from trader.monitor_data import fills_df
 
-                def _work_r():
+                    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    pnl, cnt = 0.0, 0
                     try:
-                        from trader.discord_report import build_daily_review_message
-                        from trader.notify import make_notifier
-                        from trader.monitor_data import fills_df
-                        from datetime import datetime, timezone
+                        df = fills_df(24)
+                        if not df.empty and "realized_pnl" in df.columns:
+                            pnl = float(df["realized_pnl"].sum())
+                            cnt = len(df)
+                    except Exception:
+                        pass
 
-                        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                        pnl, cnt = 0.0, 0
-                        try:
-                            df = fills_df(24)
-                            if not df.empty and "realized_pnl" in df.columns:
-                                pnl = float(df["realized_pnl"].sum())
-                                cnt = len(df)
-                        except Exception:
-                            pass
-
-                        msg = build_daily_review_message(
-                            today=today,
-                            pnl=pnl,
-                            trade_count=cnt,
-                            symbols=_system_symbols(),
-                        )
-                        ok = make_notifier(
-                            external_send_enabled=True
-                        ).send(msg)
-                        _push_status.set_content(
-                            '<span style="color:#3fb950">✓ 复盘已发送</span>'
-                            if ok
-                            else '<span style="color:#f85149">✗ 复盘发送失败</span>'
-                        )
-                    except Exception as exc:
-                        _push_status.set_content(
-                            f'<span style="color:#f85149">复盘错误: {exc}</span>'
-                        )
-
-                _thr.Thread(target=_work_r, daemon=True).start()
+                    msg = build_daily_review_message(
+                        today=today,
+                        pnl=pnl,
+                        trade_count=cnt,
+                        symbols=_system_symbols(),
+                    )
+                    ok = make_notifier(external_send_enabled=True).send(msg)
+                    _push_status.set_content(
+                        '<span style="color:#3fb950">✓ 复盘已发送</span>'
+                        if ok
+                        else '<span style="color:#f85149">✗ 复盘发送失败</span>'
+                    )
+                    return ok
+                except Exception as exc:
+                    _push_status.set_content(
+                        f'<span style="color:#f85149">复盘错误: {exc}</span>'
+                    )
+                    raise
 
             def _do_send_direction_review():
                 _push_status.set_content(
                     '<span style="color:#d29922">方向复盘发送中…</span>'
                 )
-                import threading as _thr
+                try:
+                    from trader.manual_push import send_direction_review_push
 
-                def _work_dr():
-                    try:
-                        from trader.manual_push import send_direction_review_push
+                    ok = send_direction_review_push(
+                        _system_symbols(),
+                        bias=str(review_bias_sel.value or "中性"),
+                    )
+                    _push_status.set_content(
+                        '<span style="color:#3fb950">✓ 方向复盘已发送</span>'
+                        if ok
+                        else '<span style="color:#f85149">✗ 方向复盘发送失败</span>'
+                    )
+                    return ok
+                except Exception as exc:
+                    _push_status.set_content(
+                        f'<span style="color:#f85149">方向复盘错误: {exc}</span>'
+                    )
+                    raise
 
-                        ok = send_direction_review_push(
-                            _system_symbols(),
-                            bias=str(review_bias_sel.value or "中性"),
-                        )
-                        _push_status.set_content(
-                            '<span style="color:#3fb950">✓ 方向复盘已发送</span>'
-                            if ok
-                            else '<span style="color:#f85149">✗ 方向复盘发送失败</span>'
-                        )
-                    except Exception as exc:
-                        _push_status.set_content(
-                            f'<span style="color:#f85149">方向复盘错误: {exc}</span>'
-                        )
+            _DISCORD_REPORTS = {
+                "晨报": _do_send_brief,
+                "盘中 OR/VWAP": _do_send_intraday,
+                "每日复盘": _do_send_review,
+                "方向复盘": _do_send_direction_review,
+            }
+            report_type_sel = ui.select(
+                list(_DISCORD_REPORTS),
+                value="晨报",
+                label="报告类型",
+            ).props("dense outlined dark").style("width:150px")
 
-                _thr.Thread(target=_work_dr, daemon=True).start()
+            def _do_send_selected():
+                return _DISCORD_REPORTS[str(report_type_sel.value)]()
 
             ui.button(
-                "📨 立即发送晨报",
-                on_click=_audited_callback("discord.morning", _do_send_brief),
-            ).props(
-                "unelevated dense color=primary"
+                "📨 发送",
+                on_click=_audited_job_callback("discord.send", _do_send_selected),
+            ).props("unelevated dense color=primary")
+
+        with ui.row().classes("gap-3 items-end flex-wrap").style("margin-top:8px"):
+            stock_sym_in = (
+                ui.input("标的", placeholder="AAPL")
+                .props("dark dense outlined")
+                .style("width:120px")
             )
+
+            def _do_send_stock_analysis():
+                symbol = str(stock_sym_in.value or "").strip()
+                if not symbol:
+                    _push_status.set_content(
+                        '<span style="color:#f85149">请先填写标的代码</span>'
+                    )
+                    return False
+                _push_status.set_content(
+                    '<span style="color:#d29922">个股分析发送中…</span>'
+                )
+                try:
+                    from trader.manual_push import send_stock_analysis_push
+
+                    ok = send_stock_analysis_push(symbol)
+                    _push_status.set_content(
+                        '<span style="color:#3fb950">✓ 个股分析已发送</span>'
+                        if ok
+                        else '<span style="color:#f85149">✗ 个股分析发送失败</span>'
+                    )
+                    return ok
+                except Exception as exc:
+                    _push_status.set_content(
+                        f'<span style="color:#f85149">个股分析错误: {exc}</span>'
+                    )
+                    raise
+
             ui.button(
-                "📈 发送盘中 OR/VWAP",
-                on_click=_audited_callback("discord.intraday", _do_send_intraday),
-            ).props(
-                "unelevated dense color=accent"
-            )
-            ui.button(
-                "📋 立即发送复盘",
-                on_click=_audited_callback("discord.review", _do_send_review),
-            ).props(
-                "unelevated dense color=secondary"
-            )
-            ui.button(
-                "🧾 发送方向复盘",
-                on_click=_audited_callback(
-                    "discord.direction", _do_send_direction_review
+                "📤 发送个股分析",
+                on_click=_audited_job_callback(
+                    "discord.stock_analysis", _do_send_stock_analysis
                 ),
-            ).props(
-                "unelevated dense outline"
-            )
+            ).props("unelevated dense outline")
         ui.html(
             '<div class="qa-note" style="margin-top:6px">'
             "配置推送目标：在 .env 设置 <code>DISCORD_WEBHOOK_URL</code>"
@@ -1686,7 +1885,9 @@ def _render_system():
             ):
                 raw = report.get(key)
                 try:
-                    values = json.loads(raw) if isinstance(raw, str) else list(raw or [])
+                    values = (
+                        json.loads(raw) if isinstance(raw, str) else list(raw or [])
+                    )
                 except Exception:
                     values = [str(raw)] if raw else []
                 if values:
@@ -1695,10 +1896,10 @@ def _render_system():
             checked_at = _fmt_time(report.get("ts", ""))
             reconciliation_banner.set_content(
                 '<div style="margin:10px 0;padding:12px 14px;border-radius:8px;'
-                'background:rgba(248,81,73,.16);border:1px solid #f85149;'
+                "background:rgba(248,81,73,.16);border:1px solid #f85149;"
                 'color:#f85149;font-weight:600">🛑 启动对账失败，自动交易已阻断'
                 f'<div style="margin-top:5px;font-size:12px;font-weight:400">'
-                f'{_he(reason)} · 最近检查 {_he(checked_at)}</div></div>'
+                f"{_he(reason)} · 最近检查 {_he(checked_at)}</div></div>"
             )
             k_eng.set_text("对账阻断")
             k_eng.classes(remove="pos neg", add="neg")
@@ -1729,531 +1930,620 @@ def _render_research():
 
     cached_names = list_cached_names()
 
-    # ════════════════════════════════════════════════════════════════════════
-    # 一、因子分析
-    # ════════════════════════════════════════════════════════════════════════
-    ui.html(
-        '<div style="font-size:15px;font-weight:700;margin-bottom:12px">🔬 因子分析</div>'
-    )
-
-    try:
-        from trader.factors import FACTOR_REGISTRY
-        from trader.data_cache import get_bars as _get_bars
-    except Exception as exc:
-        ui.html(
-            f'<div style="color:var(--neg);font-size:13px">无法加载因子库: {exc}</div>'
-        )
-    else:
-        # 因子库展示
-        with ui.element("div").classes("qa-card"):
-            ui.label("因子库").classes("qa-card-title")
-            ui.label(
-                f"已注册 {len(FACTOR_REGISTRY)} 个因子，交易 Agent 可直接调用"
-            ).classes("qa-card-sub")
-            cats: dict = {}
-            for name, f in FACTOR_REGISTRY.items():
-                cats.setdefault(f.meta.category, []).append((name, f))
-            cat_colors = {
-                "momentum": "#58a6ff",
-                "trend": "#3fb950",
-                "volatility": "#d29922",
-                "volume": "#a5d6ff",
+    with ui.element("div").classes("qa-card"):
+        ui.label("最近复盘与候选状态").classes("qa-card-title")
+        ui.label(
+            "episode_reviews · strategy_release_events · 只读，发布事件不会自动修改 Runtime 生产参数"
+        ).classes("qa-card-sub")
+        outcome_df = episode_review_outcome_counts(50)
+        if outcome_df.empty:
+            _empty("暂无复盘记录", "🧬")
+        else:
+            _OUTCOME_LABELS = {
+                "SUCCESS": "成功",
+                "RISK_REJECTED": "风控拒绝",
+                "NO_FILL": "未成交",
+                "DATA_FAILURE": "数据故障",
+                "BROKER_FAILURE": "broker 故障",
             }
-            html_parts = []
-            for cat, items in cats.items():
-                color = cat_colors.get(cat, "#8b949e")
-                for name, f in items:
-                    html_parts.append(
-                        f'<div style="display:inline-flex;align-items:center;gap:6px;'
-                        f"background:var(--panel2);border:1px solid var(--border);"
-                        f'border-radius:6px;padding:5px 10px;margin:3px">'
-                        f'<span style="width:8px;height:8px;border-radius:50%;'
-                        f'background:{color};flex-shrink:0"></span>'
-                        f'<span style="font-weight:600;font-size:11px">{name}</span>'
-                        f'<span style="color:var(--fg3);font-size:10px">'
-                        f"{f.meta.description[:30]}</span></div>"
+            with ui.element("div").classes("qa-kpi-row"):
+                for _, row in outcome_df.iterrows():
+                    outcome_key = str(row["outcome"])
+                    _kpi(
+                        _OUTCOME_LABELS.get(outcome_key, outcome_key),
+                        str(int(row["count"])),
+                        tone="neg" if outcome_key != "SUCCESS" else "pos",
                     )
+        release = latest_strategy_release_event()
+        if release is None:
+            _empty("暂无策略发布/拒绝事件", "🧬")
+        else:
+            _event_type = str(release.get("event_type", "—"))
             ui.html(
-                '<div style="display:flex;flex-wrap:wrap;gap:2px">'
-                + "".join(html_parts)
-                + "</div>"
+                f'<div class="qa-note" style="margin-top:8px">'
+                f"最新发布事件 · <b>{html.escape(str(release.get('strategy_name', '—')))}</b> "
+                f"· {html.escape(_event_type)} "
+                f"· {html.escape(str(release.get('from_version', '—')))} → "
+                f"{html.escape(str(release.get('to_version', '—')))} "
+                f"· {html.escape(str(release.get('created_at', '—')))}</div>"
             )
 
-        # 因子分析控制区
-        fa_syms = sorted({name.rsplit("_", 1)[0] for name in cached_names}) or ["AAPL"]
-        fa_tfs = sorted(
-            {name.rsplit("_", 1)[1].replace(".parquet", "") for name in cached_names}
-        ) or ["5m"]
-        fa_factor_names = list(FACTOR_REGISTRY.keys())
+    with ui.row().classes("items-center gap-2").style("margin-bottom:10px"):
+        ui.label("研究工具").classes("qa-card-title")
+        research_mode_sel = ui.toggle(["因子分析", "回测"], value="因子分析").props("dense no-caps")
+    fa_section = ui.column().classes("w-full").style("gap:0")
+    bt_section = ui.column().classes("w-full").style("gap:0")
+    bt_section.set_visibility(False)
 
-        def _fa_valid(val, opts, default):
-            return val if val in opts else default
+    def _on_research_mode():
+        fa_section.set_visibility(research_mode_sel.value == "因子分析")
+        bt_section.set_visibility(research_mode_sel.value == "回测")
+
+    research_mode_sel.on_value_change(_on_research_mode)
+
+    with fa_section:
+        # ════════════════════════════════════════════════════════════════════════
+        # 一、因子分析
+        # ════════════════════════════════════════════════════════════════════════
+        ui.html(
+            '<div style="font-size:15px;font-weight:700;margin-bottom:12px">🔬 因子分析</div>'
+        )
+
+        try:
+            from trader.factors import FACTOR_REGISTRY
+            from trader.data_cache import get_bars as _get_bars
+        except Exception as exc:
+            ui.html(
+                f'<div style="color:var(--neg);font-size:13px">无法加载因子库: {exc}</div>'
+            )
+        else:
+            # 因子库展示
+            with ui.element("div").classes("qa-card"):
+                ui.label("因子库").classes("qa-card-title")
+                ui.label(
+                    f"已注册 {len(FACTOR_REGISTRY)} 个因子，交易 Agent 可直接调用"
+                ).classes("qa-card-sub")
+                cats: dict = {}
+                for name, f in FACTOR_REGISTRY.items():
+                    cats.setdefault(f.meta.category, []).append((name, f))
+                cat_colors = {
+                    "momentum": "#58a6ff",
+                    "trend": "#3fb950",
+                    "volatility": "#d29922",
+                    "volume": "#a5d6ff",
+                }
+                html_parts = []
+                for cat, items in cats.items():
+                    color = cat_colors.get(cat, "#8b949e")
+                    for name, f in items:
+                        html_parts.append(
+                            f'<div style="display:inline-flex;align-items:center;gap:6px;'
+                            f"background:var(--panel2);border:1px solid var(--border);"
+                            f'border-radius:6px;padding:5px 10px;margin:3px">'
+                            f'<span style="width:8px;height:8px;border-radius:50%;'
+                            f'background:{color};flex-shrink:0"></span>'
+                            f'<span style="font-weight:600;font-size:11px">{name}</span>'
+                            f'<span style="color:var(--fg3);font-size:10px">'
+                            f"{f.meta.description[:30]}</span></div>"
+                        )
+                ui.html(
+                    '<div style="display:flex;flex-wrap:wrap;gap:2px">'
+                    + "".join(html_parts)
+                    + "</div>"
+                )
+
+            # 因子分析控制区
+            fa_syms = sorted({name.rsplit("_", 1)[0] for name in cached_names}) or ["AAPL"]
+            fa_tfs = sorted(
+                {name.rsplit("_", 1)[1].replace(".parquet", "") for name in cached_names}
+            ) or ["5m"]
+            fa_factor_names = list(FACTOR_REGISTRY.keys())
+
+            def _fa_valid(val, opts, default):
+                return val if val in opts else default
+
+            with ui.element("div").classes("qa-card"):
+                ui.label("因子分析设置").classes("qa-card-title")
+                ui.label("选择因子和标的，分析 IC 和分位数收益率").classes("qa-card-sub")
+                with ui.row().classes("items-end gap-3 flex-wrap"):
+                    fa_sym_sel = _persist(
+                        ui.select(
+                            fa_syms,
+                            value=_fa_valid(
+                                _pref("fa_sym", fa_syms[0]), fa_syms, fa_syms[0]
+                            ),
+                            label="标的",
+                        )
+                        .props("dark dense outlined")
+                        .style("width:120px"),
+                        "fa_sym",
+                    )
+                    fa_tf_sel = _persist(
+                        ui.select(
+                            fa_tfs,
+                            value=_fa_valid(_pref("fa_tf", "5m"), fa_tfs, fa_tfs[0]),
+                            label="周期",
+                        )
+                        .props("dark dense outlined")
+                        .style("width:90px"),
+                        "fa_tf",
+                    )
+                    fa_fac_sel = _persist(
+                        ui.select(
+                            fa_factor_names,
+                            value=_fa_valid(
+                                _pref("fa_fac", "RSI_14"),
+                                fa_factor_names,
+                                fa_factor_names[0],
+                            ),
+                            label="因子",
+                        )
+                        .props("dark dense outlined")
+                        .style("width:160px"),
+                        "fa_fac",
+                    )
+                    fa_fwd_sel = _persist(
+                        ui.select(
+                            {1: "1 bar", 5: "5 bar", 10: "10 bar", 20: "20 bar"},
+                            value=_pref("fa_fwd", 5),
+                            label="前瞻期",
+                        )
+                        .props("dark dense outlined")
+                        .style("width:100px"),
+                        "fa_fwd",
+                    )
+                    fa_nq_sel = _persist(
+                        ui.select(
+                            {3: "三分位", 5: "五分位", 10: "十分位"},
+                            value=_pref("fa_nq", 5),
+                            label="分位数",
+                        )
+                        .props("dark dense outlined")
+                        .style("width:100px"),
+                        "fa_nq",
+                    )
+                    fa_run_btn = ui.button("▶ 分析", color="primary").props("unelevated")
+
+            fa_result = ui.column().style("gap:12px;width:100%")
+
+            fa_busy = False
+
+            async def _run_fa():
+                nonlocal fa_busy
+                if fa_busy:
+                    return
+                fa_busy = True
+                fa_run_btn.disable()
+                symbol = fa_sym_sel.value
+                timeframe = fa_tf_sel.value
+                factor = FACTOR_REGISTRY[fa_fac_sel.value]
+                fwd = int(fa_fwd_sel.value) if fa_fwd_sel.value else 5
+                nq = int(fa_nq_sel.value) if fa_nq_sel.value else 5
+                fa_result.clear()
+                with fa_result:
+                    ui.label("⏳ 计算中...").style("color:var(--fg3)")
+
+                def _calculate_fa():
+                    from trader.backtest.factor_analysis import run_factor_analysis
+
+                    df = _get_bars(symbol, timeframe)
+                    if df is None or df.empty:
+                        return None
+                    return run_factor_analysis(
+                        df,
+                        factor,
+                        symbol=symbol,
+                        forward_period=fwd,
+                        n_quantiles=nq,
+                    )
+
+                try:
+                    result = await asyncio.to_thread(_calculate_fa)
+                    if _state["tab"] != "research":
+                        return
+                    fa_result.clear()
+                    if result is None:
+                        with fa_result:
+                            _empty(f"无 {symbol} {timeframe} 本地数据", "📭")
+                        return
+                    with fa_result:
+                        ic_color = (
+                            "pos"
+                            if result.ic_mean > 0.03
+                            else "neg"
+                            if result.ic_mean < -0.03
+                            else ""
+                        )
+                        with ui.element("div").classes("qa-kpi-row"):
+                            _kpi("IC 均值", f"{result.ic_mean:.4f}", tone=ic_color)
+                            _kpi("IC 标准差", f"{result.ic_std:.4f}")
+                            _kpi(
+                                "ICIR",
+                                f"{result.icir:.3f}",
+                                tone="pos" if abs(result.icir) > 0.5 else "",
+                            )
+                            _kpi("有效样本", f"{result.n_valid:,}")
+                            _kpi("前瞻期", f"{result.forward_period} bar")
+                        with ui.element("div").classes("qa-card"):
+                            ui.label("滚动 IC (20 bar 窗口)").classes("qa-card-title")
+                            ui.label("IC > 0.05 = 因子有正向预测力").classes("qa-card-sub")
+                            ic = result.ic_series
+                            fig = go.Figure()
+                            fig.add_trace(
+                                go.Bar(
+                                    x=list(range(len(ic))),
+                                    y=ic.values.tolist(),
+                                    marker_color=[
+                                        "#3fb950" if v >= 0 else "#f85149"
+                                        for v in ic.values
+                                    ],
+                                )
+                            )
+                            fig.add_hline(
+                                y=0.05, line=dict(color="#3fb950", width=1, dash="dot")
+                            )
+                            fig.add_hline(
+                                y=-0.05, line=dict(color="#f85149", width=1, dash="dot")
+                            )
+                            fig.update_layout(
+                                height=200,
+                                margin=dict(l=8, r=8, t=8, b=8),
+                                paper_bgcolor="rgba(0,0,0,0)",
+                                plot_bgcolor="rgba(0,0,0,0)",
+                                font=dict(color="#8b949e", size=11),
+                                showlegend=False,
+                                uirevision="fa-ic",
+                                xaxis=dict(gridcolor="#21262d"),
+                                yaxis=dict(gridcolor="#21262d"),
+                            )
+                            ui.plotly(fig).classes("w-full")
+                        with ui.element("div").classes("qa-card"):
+                            qr = result.quantile_returns
+                            ui.label("分位数平均前瞻收益率 (%)").classes("qa-card-title")
+                            ui.label(
+                                f"Q1=因子最低组，Q{nq}=最高组；单调递增 = 因子正向有效"
+                            ).classes("qa-card-sub")
+                            fig2 = go.Figure()
+                            fig2.add_trace(
+                                go.Bar(
+                                    x=list(qr.index),
+                                    y=[round(v, 4) for v in qr.values],
+                                    marker_color=[
+                                        "#3fb950" if v >= 0 else "#f85149"
+                                        for v in qr.values
+                                    ],
+                                    text=[f"{v:.3f}%" for v in qr.values],
+                                    textposition="outside",
+                                )
+                            )
+                            fig2.update_layout(
+                                height=220,
+                                margin=dict(l=8, r=8, t=30, b=8),
+                                paper_bgcolor="rgba(0,0,0,0)",
+                                plot_bgcolor="rgba(0,0,0,0)",
+                                font=dict(color="#8b949e", size=11),
+                                showlegend=False,
+                                uirevision="fa-qr",
+                                xaxis=dict(gridcolor="#21262d"),
+                                yaxis=dict(gridcolor="#21262d"),
+                            )
+                            ui.plotly(fig2).classes("w-full")
+                except Exception as exc:
+                    if _state["tab"] == "research":
+                        fa_result.clear()
+                        with fa_result:
+                            _empty(f"因子分析失败: {exc}", "⚠️")
+                finally:
+                    fa_busy = False
+                    if _state["tab"] == "research":
+                        fa_run_btn.enable()
+
+            fa_run_btn.on_click(_audited_callback("factors.run", _run_fa))
+
+    with bt_section:
+        # ════════════════════════════════════════════════════════════════════════
+        # 二、策略回测
+        # ════════════════════════════════════════════════════════════════════════
+        ui.html('<div style="border-top:1px solid var(--border);margin:20px 0 12px"></div>')
+        ui.html(
+            '<div style="font-size:15px;font-weight:700;margin-bottom:12px">📉 策略回测</div>'
+        )
+
+        try:
+            from trader.data_cache import get_bars
+            from trader.strategy_core import (
+                DEFAULT_STRATEGY_PARAMS,
+                STRATEGY_OPTIONS,
+                STRATEGY_PARAM_SPECS,
+                compute_signals,
+            )
+            from trader.engine import simulate
+        except Exception as exc:
+            _empty(f"无法加载策略引擎: {exc}", "⚠️")
+            return None
+
+        symbols = sorted({name.rsplit("_", 1)[0] for name in cached_names}) or ["QQQ"]
+        tfs = sorted(
+            {name.rsplit("_", 1)[1].replace(".parquet", "") for name in cached_names}
+        ) or ["30m"]
+        strategies = list(STRATEGY_OPTIONS)
+
+        def _bt_valid(val, options, default):
+            return val if val in options else default
+
+        r_sym = _bt_valid(_pref("r_sym", symbols[0]), symbols, symbols[0])
+        r_tf = _bt_valid(_pref("r_tf", tfs[0]), tfs, tfs[0])
+        r_strat = _bt_valid(_pref("r_strat", "5/20均线金叉死叉"), strategies, strategies[0])
 
         with ui.element("div").classes("qa-card"):
-            ui.label("因子分析设置").classes("qa-card-title")
-            ui.label("选择因子和标的，分析 IC 和分位数收益率").classes("qa-card-sub")
+            ui.label("回测设置").classes("qa-card-title")
+            ui.label("数据严格本地优先 (bars/ Parquet)，不自动联网").classes("qa-card-sub")
             with ui.row().classes("items-end gap-3 flex-wrap"):
-                fa_sym_sel = _persist(
+                bt_sym_sel = _persist(
+                    ui.select(symbols, value=r_sym, label="标的")
+                    .props("dark dense outlined")
+                    .style("width:130px"),
+                    "r_sym",
+                )
+                bt_tf_sel = _persist(
+                    ui.select(tfs, value=r_tf, label="周期")
+                    .props("dark dense outlined")
+                    .style("width:95px"),
+                    "r_tf",
+                )
+                bt_strat_sel = _persist(
+                    ui.select(strategies, value=r_strat, label="策略")
+                    .props("dark dense outlined")
+                    .style("width:250px"),
+                    "r_strat",
+                )
+                bt_cap_in = _persist(
+                    ui.number("本金", value=_pref("r_cap", 10000), format="%.0f")
+                    .props("dark dense outlined")
+                    .style("width:110px"),
+                    "r_cap",
+                )
+                bt_lev_in = _persist(
+                    ui.number("杠杆", value=_pref("r_lev", 1.0), step=0.5, min=1.0)
+                    .props("dark dense outlined")
+                    .style("width:90px"),
+                    "r_lev",
+                )
+                bt_slip_in = _persist(
+                    ui.number(
+                        "单边滑点(bps)", value=_pref("r_slip", 5.0), step=1.0, min=0.0
+                    )
+                    .props("dark dense outlined")
+                    .style("width:125px"),
+                    "r_slip",
+                )
+                bt_fill_sel = _persist(
                     ui.select(
-                        fa_syms,
-                        value=_fa_valid(
-                            _pref("fa_sym", fa_syms[0]), fa_syms, fa_syms[0]
-                        ),
-                        label="标的",
+                        {"next_open": "下一开盘", "close": "当根收盘"},
+                        value=_pref("r_fill", "next_open"),
+                        label="成交",
                     )
                     .props("dark dense outlined")
                     .style("width:120px"),
-                    "fa_sym",
+                    "r_fill",
                 )
-                fa_tf_sel = _persist(
-                    ui.select(
-                        fa_tfs,
-                        value=_fa_valid(_pref("fa_tf", "5m"), fa_tfs, fa_tfs[0]),
-                        label="周期",
-                    )
-                    .props("dark dense outlined")
-                    .style("width:90px"),
-                    "fa_tf",
+                bt_risk_sw = _persist(
+                    ui.switch("风控熔断", value=_pref("r_risk", False)), "r_risk"
                 )
-                fa_fac_sel = _persist(
-                    ui.select(
-                        fa_factor_names,
-                        value=_fa_valid(
-                            _pref("fa_fac", "RSI_14"),
-                            fa_factor_names,
-                            fa_factor_names[0],
-                        ),
-                        label="因子",
-                    )
-                    .props("dark dense outlined")
-                    .style("width:160px"),
-                    "fa_fac",
-                )
-                fa_fwd_sel = _persist(
-                    ui.select(
-                        {1: "1 bar", 5: "5 bar", 10: "10 bar", 20: "20 bar"},
-                        value=_pref("fa_fwd", 5),
-                        label="前瞻期",
-                    )
-                    .props("dark dense outlined")
-                    .style("width:100px"),
-                    "fa_fwd",
-                )
-                fa_nq_sel = _persist(
-                    ui.select(
-                        {3: "三分位", 5: "五分位", 10: "十分位"},
-                        value=_pref("fa_nq", 5),
-                        label="分位数",
-                    )
-                    .props("dark dense outlined")
-                    .style("width:100px"),
-                    "fa_nq",
-                )
-                fa_run_btn = ui.button("▶ 分析", color="primary").props("unelevated")
+                bt_run_btn = ui.button("▶ 运行回测", color="primary").props("unelevated")
 
-        fa_result = ui.column().style("gap:12px;width:100%")
+            bt_param_row = ui.row().classes("items-end gap-3 flex-wrap").style(
+                "margin-top:8px"
+            )
+            bt_param_widgets: dict[str, object] = {}
 
-        fa_busy = False
+            def _rebuild_bt_params():
+                bt_param_row.clear()
+                bt_param_widgets.clear()
+                spec = STRATEGY_PARAM_SPECS.get(bt_strat_sel.value, [])
+                if not spec:
+                    return
+                with bt_param_row:
+                    ui.label("策略参数（仅作用于本次回测）:").style(
+                        "font-size:12px;color:var(--fg3)"
+                    )
+                    for label, key, default, kind in spec:
+                        if kind == "bool":
+                            widget = ui.switch(label, value=bool(default))
+                        else:
+                            widget = (
+                                ui.number(label, value=default, step=kind)
+                                .props("dark dense outlined")
+                                .style("width:130px")
+                            )
+                        bt_param_widgets[key] = widget
 
-        async def _run_fa():
-            nonlocal fa_busy
-            if fa_busy:
+            bt_strat_sel.on_value_change(_rebuild_bt_params)
+            _rebuild_bt_params()
+
+        bt_result = ui.column().style("gap:16px;width:100%")
+        with bt_result:
+            _empty("选择参数后点击“运行回测”", "▶")
+
+        bt_busy = False
+
+        async def _run():
+            nonlocal bt_busy
+            if bt_busy:
                 return
-            fa_busy = True
-            fa_run_btn.disable()
-            symbol = fa_sym_sel.value
-            timeframe = fa_tf_sel.value
-            factor = FACTOR_REGISTRY[fa_fac_sel.value]
-            fwd = int(fa_fwd_sel.value) if fa_fwd_sel.value else 5
-            nq = int(fa_nq_sel.value) if fa_nq_sel.value else 5
-            fa_result.clear()
-            with fa_result:
-                ui.label("⏳ 计算中...").style("color:var(--fg3)")
+            bt_busy = True
+            bt_run_btn.disable()
+            symbol = bt_sym_sel.value
+            timeframe = bt_tf_sel.value
+            strategy = bt_strat_sel.value
+            capital = float(bt_cap_in.value or 10000)
+            leverage = float(bt_lev_in.value or 1.0)
+            slippage_bps = float(bt_slip_in.value or 0.0)
+            fill = bt_fill_sel.value
+            risk_halt = bool(bt_risk_sw.value)
+            strategy_params = {
+                **DEFAULT_STRATEGY_PARAMS,
+                **{
+                    k: w.value
+                    for k, w in bt_param_widgets.items()
+                    if w.value is not None
+                },
+            }
+            bt_result.clear()
+            with bt_result:
+                ui.label("⏳ 正在回测...").style("color:var(--fg3)")
 
-            def _calculate_fa():
-                from trader.backtest.factor_analysis import run_factor_analysis
-
-                df = _get_bars(symbol, timeframe)
+            def _calculate_backtest():
+                df = get_bars(symbol, timeframe)
                 if df is None or df.empty:
                     return None
-                return run_factor_analysis(
-                    df,
-                    factor,
-                    symbol=symbol,
-                    forward_period=fwd,
-                    n_quantiles=nq,
+                df_sig = compute_signals(df.copy(), strategy, **strategy_params)
+                res = simulate(
+                    df_sig,
+                    capital=capital,
+                    leverage=leverage,
+                    slippage_bps=slippage_bps,
+                    fill=fill,
+                    risk_halt=risk_halt,
                 )
+                return df, df_sig, res
 
             try:
-                result = await asyncio.to_thread(_calculate_fa)
+                computed = await asyncio.to_thread(_calculate_backtest)
                 if _state["tab"] != "research":
                     return
-                fa_result.clear()
-                if result is None:
-                    with fa_result:
-                        _empty(f"无 {symbol} {timeframe} 本地数据", "📭")
+                bt_result.clear()
+                if computed is None:
+                    with bt_result:
+                        _empty(f"本地无 {symbol} {timeframe} 数据 — 请先下载", "📭")
                     return
-                with fa_result:
-                    ic_color = (
-                        "pos"
-                        if result.ic_mean > 0.03
-                        else "neg"
-                        if result.ic_mean < -0.03
-                        else ""
-                    )
+                df, df_sig, res = computed
+                with bt_result:
+                    tr = res.total_return
                     with ui.element("div").classes("qa-kpi-row"):
-                        _kpi("IC 均值", f"{result.ic_mean:.4f}", tone=ic_color)
-                        _kpi("IC 标准差", f"{result.ic_std:.4f}")
-                        _kpi(
-                            "ICIR",
-                            f"{result.icir:.3f}",
-                            tone="pos" if abs(result.icir) > 0.5 else "",
-                        )
-                        _kpi("有效样本", f"{result.n_valid:,}")
-                        _kpi("前瞻期", f"{result.forward_period} bar")
+                        _kpi("最终权益", _money(res.final_equity))
+                        _kpi("总收益", f"{tr:+.2%}", tone=("pos" if tr >= 0 else "neg"))
+                        _kpi("平仓次数", str(res.closed_trades))
+                        _kpi("胜率", f"{res.win_rate:.1%}" if res.closed_trades else "—")
+                        _kpi("数据根数", f"{len(df):,}")
+
                     with ui.element("div").classes("qa-card"):
-                        ui.label("滚动 IC (20 bar 窗口)").classes("qa-card-title")
-                        ui.label("IC > 0.05 = 因子有正向预测力").classes(
+                        ui.label("权益曲线").classes("qa-card-title")
+                        ui.label(f"{strategy} · {symbol} {timeframe}").classes(
                             "qa-card-sub"
                         )
-                        ic = result.ic_series
+                        if res.equity_curve is not None and not res.equity_curve.empty:
+                            fig = go.Figure()
+                            fig.add_trace(
+                                go.Scatter(
+                                    x=res.equity_curve.index.strftime("%Y-%m-%d %H:%M"),
+                                    y=res.equity_curve.values,
+                                    mode="lines",
+                                    line=dict(width=2, color="#58a6ff"),
+                                    name="权益",
+                                    fill="tozeroy",
+                                    fillcolor="rgba(88,166,255,0.08)",
+                                )
+                            )
+                            fig.add_hline(
+                                y=res.initial_capital,
+                                line=dict(width=1, dash="dot", color="#6e7681"),
+                            )
+                            fig.update_layout(
+                                height=260,
+                                margin=dict(l=8, r=8, t=8, b=8),
+                                paper_bgcolor="rgba(0,0,0,0)",
+                                plot_bgcolor="rgba(0,0,0,0)",
+                                font=dict(color="#8b949e", size=11),
+                                showlegend=False,
+                                uirevision="rs-eq",
+                                xaxis=dict(gridcolor="#21262d"),
+                                yaxis=dict(gridcolor="#21262d"),
+                            )
+                            ui.plotly(fig).classes("w-full")
+                        else:
+                            _empty("无权益曲线", "📈")
+
+                    with ui.element("div").classes("qa-card"):
+                        ui.label("K线与买卖点").classes("qa-card-title")
+                        n = min(len(df_sig), 320)
+                        d = df_sig.tail(n).reset_index(drop=True)
+                        ui.label(f"最近 {n} 根 · ▲买入 ▼卖出").classes("qa-card-sub")
+                        x = list(range(len(d)))
                         fig = go.Figure()
                         fig.add_trace(
-                            go.Bar(
-                                x=list(range(len(ic))),
-                                y=ic.values.tolist(),
-                                marker_color=[
-                                    "#3fb950" if v >= 0 else "#f85149"
-                                    for v in ic.values
-                                ],
+                            go.Candlestick(
+                                x=x,
+                                open=d["open"],
+                                high=d["high"],
+                                low=d["low"],
+                                close=d["close"],
+                                name="OHLC",
+                                increasing_line_color="#3fb950",
+                                decreasing_line_color="#f85149",
                             )
                         )
-                        fig.add_hline(
-                            y=0.05, line=dict(color="#3fb950", width=1, dash="dot")
-                        )
-                        fig.add_hline(
-                            y=-0.05, line=dict(color="#f85149", width=1, dash="dot")
-                        )
+                        buys = d.index[d["strat_signal"] == 1].tolist()
+                        sells = d.index[d["strat_signal"] == -1].tolist()
+                        if buys:
+                            fig.add_trace(
+                                go.Scatter(
+                                    x=buys,
+                                    y=d.loc[buys, "strat_exec_px"],
+                                    mode="markers",
+                                    name="买入",
+                                    marker=dict(
+                                        symbol="triangle-up", size=11, color="#3fb950"
+                                    ),
+                                )
+                            )
+                        if sells:
+                            fig.add_trace(
+                                go.Scatter(
+                                    x=sells,
+                                    y=d.loc[sells, "strat_exec_px"],
+                                    mode="markers",
+                                    name="卖出",
+                                    marker=dict(
+                                        symbol="triangle-down", size=11, color="#f85149"
+                                    ),
+                                )
+                            )
                         fig.update_layout(
-                            height=200,
+                            height=380,
                             margin=dict(l=8, r=8, t=8, b=8),
                             paper_bgcolor="rgba(0,0,0,0)",
                             plot_bgcolor="rgba(0,0,0,0)",
                             font=dict(color="#8b949e", size=11),
-                            showlegend=False,
-                            uirevision="fa-ic",
-                            xaxis=dict(gridcolor="#21262d"),
+                            uirevision="rs-kline",
+                            legend=dict(orientation="h", yanchor="bottom", y=1.01),
+                            xaxis=dict(
+                                gridcolor="#21262d", rangeslider=dict(visible=False)
+                            ),
                             yaxis=dict(gridcolor="#21262d"),
                         )
                         ui.plotly(fig).classes("w-full")
+
                     with ui.element("div").classes("qa-card"):
-                        qr = result.quantile_returns
-                        ui.label("分位数平均前瞻收益率 (%)").classes(
-                            "qa-card-title"
-                        )
+                        ui.label("深度研究 · Marimo").classes("qa-card-title")
                         ui.label(
-                            f"Q1=因子最低组，Q{nq}=最高组；单调递增 = 因子正向有效"
+                            "需要响应式多单元格探索时，用 Marimo notebook（同一引擎）"
                         ).classes("qa-card-sub")
-                        fig2 = go.Figure()
-                        fig2.add_trace(
-                            go.Bar(
-                                x=list(qr.index),
-                                y=[round(v, 4) for v in qr.values],
-                                marker_color=[
-                                    "#3fb950" if v >= 0 else "#f85149"
-                                    for v in qr.values
-                                ],
-                                text=[f"{v:.3f}%" for v in qr.values],
-                                textposition="outside",
-                            )
+                        ui.html(
+                            '<div class="qa-code">.venv\\Scripts\\marimo.exe edit notebooks/research.py</div>'
                         )
-                        fig2.update_layout(
-                            height=220,
-                            margin=dict(l=8, r=8, t=30, b=8),
-                            paper_bgcolor="rgba(0,0,0,0)",
-                            plot_bgcolor="rgba(0,0,0,0)",
-                            font=dict(color="#8b949e", size=11),
-                            showlegend=False,
-                            uirevision="fa-qr",
-                            xaxis=dict(gridcolor="#21262d"),
-                            yaxis=dict(gridcolor="#21262d"),
-                        )
-                        ui.plotly(fig2).classes("w-full")
+
             except Exception as exc:
                 if _state["tab"] == "research":
-                    fa_result.clear()
-                    with fa_result:
-                        _empty(f"因子分析失败: {exc}", "⚠️")
+                    bt_result.clear()
+                    with bt_result:
+                        _empty(f"回测失败: {exc}", "⚠️")
             finally:
-                fa_busy = False
+                bt_busy = False
                 if _state["tab"] == "research":
-                    fa_run_btn.enable()
+                    bt_run_btn.enable()
 
-        fa_run_btn.on_click(_audited_callback("factors.run", _run_fa))
-
-    # ════════════════════════════════════════════════════════════════════════
-    # 二、策略回测
-    # ════════════════════════════════════════════════════════════════════════
-    ui.html('<div style="border-top:1px solid var(--border);margin:20px 0 12px"></div>')
-    ui.html(
-        '<div style="font-size:15px;font-weight:700;margin-bottom:12px">📉 策略回测</div>'
-    )
-
-    try:
-        from trader.data_cache import get_bars
-        from trader.strategy_core import (
-            DEFAULT_STRATEGY_PARAMS,
-            STRATEGY_OPTIONS,
-            compute_signals,
-        )
-        from trader.engine import simulate
-    except Exception as exc:
-        _empty(f"无法加载策略引擎: {exc}", "⚠️")
-        return None
-
-    symbols = sorted({name.rsplit("_", 1)[0] for name in cached_names}) or ["QQQ"]
-    tfs = sorted(
-        {name.rsplit("_", 1)[1].replace(".parquet", "") for name in cached_names}
-    ) or ["30m"]
-    strategies = list(STRATEGY_OPTIONS)
-
-    def _bt_valid(val, options, default):
-        return val if val in options else default
-
-    r_sym = _bt_valid(_pref("r_sym", symbols[0]), symbols, symbols[0])
-    r_tf = _bt_valid(_pref("r_tf", tfs[0]), tfs, tfs[0])
-    r_strat = _bt_valid(_pref("r_strat", "5/20均线金叉死叉"), strategies, strategies[0])
-
-    with ui.element("div").classes("qa-card"):
-        ui.label("回测设置").classes("qa-card-title")
-        ui.label("数据严格本地优先 (bars/ Parquet)，不自动联网").classes("qa-card-sub")
-        with ui.row().classes("items-end gap-3 flex-wrap"):
-            bt_sym_sel = _persist(
-                ui.select(symbols, value=r_sym, label="标的")
-                .props("dark dense outlined")
-                .style("width:130px"),
-                "r_sym",
-            )
-            bt_tf_sel = _persist(
-                ui.select(tfs, value=r_tf, label="周期")
-                .props("dark dense outlined")
-                .style("width:95px"),
-                "r_tf",
-            )
-            bt_strat_sel = _persist(
-                ui.select(strategies, value=r_strat, label="策略")
-                .props("dark dense outlined")
-                .style("width:250px"),
-                "r_strat",
-            )
-            bt_cap_in = _persist(
-                ui.number("本金", value=_pref("r_cap", 10000), format="%.0f")
-                .props("dark dense outlined")
-                .style("width:110px"),
-                "r_cap",
-            )
-            bt_lev_in = _persist(
-                ui.number("杠杆", value=_pref("r_lev", 1.0), step=0.5, min=1.0)
-                .props("dark dense outlined")
-                .style("width:90px"),
-                "r_lev",
-            )
-            bt_slip_in = _persist(
-                ui.number(
-                    "单边滑点(bps)", value=_pref("r_slip", 5.0), step=1.0, min=0.0
-                )
-                .props("dark dense outlined")
-                .style("width:125px"),
-                "r_slip",
-            )
-            bt_fill_sel = _persist(
-                ui.select(
-                    {"next_open": "下一开盘", "close": "当根收盘"},
-                    value=_pref("r_fill", "next_open"),
-                    label="成交",
-                )
-                .props("dark dense outlined")
-                .style("width:120px"),
-                "r_fill",
-            )
-            bt_risk_sw = _persist(
-                ui.switch("风控熔断", value=_pref("r_risk", False)), "r_risk"
-            )
-            bt_run_btn = ui.button("▶ 运行回测", color="primary").props("unelevated")
-
-    bt_result = ui.column().style("gap:16px;width:100%")
-    with bt_result:
-        _empty("选择参数后点击“运行回测”", "▶")
-
-    bt_busy = False
-
-    async def _run():
-        nonlocal bt_busy
-        if bt_busy:
-            return
-        bt_busy = True
-        bt_run_btn.disable()
-        symbol = bt_sym_sel.value
-        timeframe = bt_tf_sel.value
-        strategy = bt_strat_sel.value
-        capital = float(bt_cap_in.value or 10000)
-        leverage = float(bt_lev_in.value or 1.0)
-        slippage_bps = float(bt_slip_in.value or 0.0)
-        fill = bt_fill_sel.value
-        risk_halt = bool(bt_risk_sw.value)
-        bt_result.clear()
-        with bt_result:
-            ui.label("⏳ 正在回测...").style("color:var(--fg3)")
-
-        def _calculate_backtest():
-            df = get_bars(symbol, timeframe)
-            if df is None or df.empty:
-                return None
-            df_sig = compute_signals(
-                df.copy(), strategy, **DEFAULT_STRATEGY_PARAMS
-            )
-            res = simulate(
-                df_sig,
-                capital=capital,
-                leverage=leverage,
-                slippage_bps=slippage_bps,
-                fill=fill,
-                risk_halt=risk_halt,
-            )
-            return df, df_sig, res
-
-        try:
-            computed = await asyncio.to_thread(_calculate_backtest)
-            if _state["tab"] != "research":
-                return
-            bt_result.clear()
-            if computed is None:
-                with bt_result:
-                    _empty(f"本地无 {symbol} {timeframe} 数据 — 请先下载", "📭")
-                return
-            df, df_sig, res = computed
-            with bt_result:
-                tr = res.total_return
-                with ui.element("div").classes("qa-kpi-row"):
-                    _kpi("最终权益", _money(res.final_equity))
-                    _kpi("总收益", f"{tr:+.2%}", tone=("pos" if tr >= 0 else "neg"))
-                    _kpi("平仓次数", str(res.closed_trades))
-                    _kpi("胜率", f"{res.win_rate:.1%}" if res.closed_trades else "—")
-                    _kpi("数据根数", f"{len(df):,}")
-
-                with ui.element("div").classes("qa-card"):
-                    ui.label("权益曲线").classes("qa-card-title")
-                    ui.label(
-                        f"{strategy} · {symbol} {timeframe}"
-                    ).classes("qa-card-sub")
-                    if res.equity_curve is not None and not res.equity_curve.empty:
-                        fig = go.Figure()
-                        fig.add_trace(
-                            go.Scatter(
-                                x=res.equity_curve.index.strftime("%Y-%m-%d %H:%M"),
-                                y=res.equity_curve.values,
-                                mode="lines",
-                                line=dict(width=2, color="#58a6ff"),
-                                name="权益",
-                                fill="tozeroy",
-                                fillcolor="rgba(88,166,255,0.08)",
-                            )
-                        )
-                        fig.add_hline(
-                            y=res.initial_capital,
-                            line=dict(width=1, dash="dot", color="#6e7681"),
-                        )
-                        fig.update_layout(
-                            height=260,
-                            margin=dict(l=8, r=8, t=8, b=8),
-                            paper_bgcolor="rgba(0,0,0,0)",
-                            plot_bgcolor="rgba(0,0,0,0)",
-                            font=dict(color="#8b949e", size=11),
-                            showlegend=False,
-                            uirevision="rs-eq",
-                            xaxis=dict(gridcolor="#21262d"),
-                            yaxis=dict(gridcolor="#21262d"),
-                        )
-                        ui.plotly(fig).classes("w-full")
-                    else:
-                        _empty("无权益曲线", "📈")
-
-                with ui.element("div").classes("qa-card"):
-                    ui.label("K线与买卖点").classes("qa-card-title")
-                    n = min(len(df_sig), 320)
-                    d = df_sig.tail(n).reset_index(drop=True)
-                    ui.label(f"最近 {n} 根 · ▲买入 ▼卖出").classes("qa-card-sub")
-                    x = list(range(len(d)))
-                    fig = go.Figure()
-                    fig.add_trace(
-                        go.Candlestick(
-                            x=x,
-                            open=d["open"],
-                            high=d["high"],
-                            low=d["low"],
-                            close=d["close"],
-                            name="OHLC",
-                            increasing_line_color="#3fb950",
-                            decreasing_line_color="#f85149",
-                        )
-                    )
-                    buys = d.index[d["strat_signal"] == 1].tolist()
-                    sells = d.index[d["strat_signal"] == -1].tolist()
-                    if buys:
-                        fig.add_trace(
-                            go.Scatter(
-                                x=buys,
-                                y=d.loc[buys, "strat_exec_px"],
-                                mode="markers",
-                                name="买入",
-                                marker=dict(symbol="triangle-up", size=11, color="#3fb950"),
-                            )
-                        )
-                    if sells:
-                        fig.add_trace(
-                            go.Scatter(
-                                x=sells,
-                                y=d.loc[sells, "strat_exec_px"],
-                                mode="markers",
-                                name="卖出",
-                                marker=dict(
-                                    symbol="triangle-down", size=11, color="#f85149"
-                                ),
-                            )
-                        )
-                    fig.update_layout(
-                        height=380,
-                        margin=dict(l=8, r=8, t=8, b=8),
-                        paper_bgcolor="rgba(0,0,0,0)",
-                        plot_bgcolor="rgba(0,0,0,0)",
-                        font=dict(color="#8b949e", size=11),
-                        uirevision="rs-kline",
-                        legend=dict(orientation="h", yanchor="bottom", y=1.01),
-                        xaxis=dict(gridcolor="#21262d", rangeslider=dict(visible=False)),
-                        yaxis=dict(gridcolor="#21262d"),
-                    )
-                    ui.plotly(fig).classes("w-full")
-
-                with ui.element("div").classes("qa-card"):
-                    ui.label("深度研究 · Marimo").classes("qa-card-title")
-                    ui.label(
-                        "需要响应式多单元格探索时，用 Marimo notebook（同一引擎）"
-                    ).classes("qa-card-sub")
-                    ui.html(
-                        '<div class="qa-code">.venv\\Scripts\\marimo.exe edit notebooks/research.py</div>'
-                    )
-
-        except Exception as exc:
-            if _state["tab"] == "research":
-                bt_result.clear()
-                with bt_result:
-                    _empty(f"回测失败: {exc}", "⚠️")
-        finally:
-            bt_busy = False
-            if _state["tab"] == "research":
-                bt_run_btn.enable()
-
-    bt_run_btn.on_click(_audited_callback("backtest.run", _run))
+        bt_run_btn.on_click(_audited_callback("backtest.run", _run))
     return None
 
 
@@ -2271,7 +2561,6 @@ def _render_selection_pools():
             LONG_TERM,
             build_daily_decision_pool,
             build_long_term_pool,
-            decision_symbols,
             load_decision_pool_report,
             load_selection_pool,
             rebuild_selection_pipeline,
@@ -2279,7 +2568,6 @@ def _render_selection_pools():
             save_selection_pools,
         )
         from trader.decision_trade_plans import (
-            executable_symbols,
             load_decision_trade_plan_report,
         )
         from trader.market_scan import load_market_scan_report, run_market_scan
@@ -2380,21 +2668,24 @@ def _render_selection_pools():
             build_all_btn = ui.button("全部重建：长期→决策", color="primary").props(
                 "unelevated dense"
             )
-            scan_btn = ui.button("全市场扫描", color="primary").props(
-                "unelevated dense outline"
-            )
-            build_long_btn = ui.button(
-                "更新长期池：最近扫描→长期", color="secondary"
-            ).props("unelevated dense outline")
-            build_daily_btn = ui.button(
-                "更新决策池：长期→决策", color="secondary"
-            ).props("unelevated dense outline")
-            send_btn = ui.button("送到决策台", color="positive").props(
-                "unelevated dense"
-            )
             status_html = ui.html(
                 '<span style="font-size:12px;color:var(--fg3)">就绪</span>'
             )
+        with ui.expansion("分步执行（高级）", icon="tune").classes("w-full").style(
+            "margin-top:8px"
+        ):
+            with ui.row().classes("items-center gap-3 flex-wrap").style(
+                "margin-top:6px"
+            ):
+                scan_btn = ui.button("全市场扫描", color="primary").props(
+                    "unelevated dense outline"
+                )
+                build_long_btn = ui.button(
+                    "更新长期池：最近扫描→长期", color="secondary"
+                ).props("unelevated dense outline")
+                build_daily_btn = ui.button(
+                    "更新决策池：长期→决策", color="secondary"
+                ).props("unelevated dense outline")
         progress_html = ui.html(_selection_progress_html(progress_state)).style(
             "margin-top:10px"
         )
@@ -2587,7 +2878,7 @@ def _render_selection_pools():
             _decision_trade_plan_report_html(load_decision_trade_plan_report())
         )
 
-    buttons = [build_all_btn, scan_btn, build_long_btn, build_daily_btn, send_btn]
+    buttons = [build_all_btn, scan_btn, build_long_btn, build_daily_btn]
 
     def _limits() -> tuple[int, int]:
         return (
@@ -2747,10 +3038,11 @@ def _render_selection_pools():
                 )
                 ui.notify(f"{label}失败", type="negative")
                 _finish_progress(str(exc))
+                raise
             finally:
                 _busy(False)
 
-        threading.Thread(target=_work, daemon=True).start()
+        return _work()
 
     def _run_scan() -> None:
         max_symbols, max_downloads, keep_n = _scan_limits()
@@ -2767,7 +3059,7 @@ def _render_selection_pools():
                 progress_callback=_progress_update,
             )
 
-        _run_job("全市场扫描", _job, ["market_scan"])
+        return _run_job("全市场扫描", _job, ["market_scan"])
 
     def _build_all() -> None:
         long_limit, daily_limit = _limits()
@@ -2776,7 +3068,7 @@ def _render_selection_pools():
             status_html.set_content(
                 '<span style="font-size:12px;color:var(--warn)">需要先运行全市场扫描，或手动输入候选源</span>'
             )
-            return
+            return False
 
         def _job():
             results = rebuild_selection_pipeline(
@@ -2791,7 +3083,7 @@ def _render_selection_pools():
             )
             save_selection_pools(results)
 
-        _run_job("全部重建", _job, [LONG_TERM, DAILY_DECISION])
+        return _run_job("全部重建", _job, [LONG_TERM, DAILY_DECISION])
 
     def _build_long() -> None:
         long_limit, _daily_limit = _limits()
@@ -2800,7 +3092,7 @@ def _render_selection_pools():
             status_html.set_content(
                 '<span style="font-size:12px;color:var(--warn)">需要先运行全市场扫描，或手动输入候选源</span>'
             )
-            return
+            return False
 
         def _job():
             result = build_long_term_pool(
@@ -2811,7 +3103,7 @@ def _render_selection_pools():
             )
             save_selection_pool(result)
 
-        _run_job("更新长期池", _job, [LONG_TERM])
+        return _run_job("更新长期池", _job, [LONG_TERM])
 
     def _build_daily() -> None:
         _long_limit, daily_limit = _limits()
@@ -2827,23 +3119,7 @@ def _render_selection_pools():
             )
             save_selection_pool(result)
 
-        _run_job("更新决策池", _job, [DAILY_DECISION])
-
-    def _send_to_cockpit() -> None:
-        _long_limit, daily_limit = _limits()
-        symbols = executable_symbols(limit=daily_limit) or decision_symbols(
-            limit=daily_limit
-        )
-        if not symbols:
-            ui.notify("决策池为空，请先更新决策池")
-            return
-        text = ",".join(symbols)
-        _set_pref("cp_syms", text)
-        status_html.set_content(
-            f'<span style="font-size:12px;color:var(--pos)">已送到决策台：{_he(text)}</span>'
-        )
-        ui.notify("已写入决策台股票")
-        _select("cockpit")
+        return _run_job("更新决策池", _job, [DAILY_DECISION])
 
     scan_search.on_value_change(lambda _e: _refresh_scan_table())
     scan_status.on_value_change(lambda _e: _refresh_scan_table())
@@ -2853,11 +3129,10 @@ def _render_selection_pools():
         _audited_callback("pool.clear_filter", _reset_scan_filters)
     )
     scan_table.on("rowClick", _on_scan_row)
-    scan_btn.on_click(_audited_callback("pool.full_scan", _run_scan))
-    build_all_btn.on_click(_audited_callback("pool.rebuild_all", _build_all))
-    build_long_btn.on_click(_audited_callback("pool.long_term", _build_long))
-    build_daily_btn.on_click(_audited_callback("pool.decision", _build_daily))
-    send_btn.on_click(_audited_callback("pool.send_decision", _send_to_cockpit))
+    scan_btn.on_click(_audited_job_callback("pool.full_scan", _run_scan))
+    build_all_btn.on_click(_audited_job_callback("pool.rebuild_all", _build_all))
+    build_long_btn.on_click(_audited_job_callback("pool.long_term", _build_long))
+    build_daily_btn.on_click(_audited_job_callback("pool.decision", _build_daily))
     ui.timer(
         1.0,
         lambda: progress_html.set_content(
@@ -2867,660 +3142,6 @@ def _render_selection_pools():
     _refresh_scan()
     _refresh_pools()
     return None
-
-
-def _render_cockpit():
-    _page_head("研究实验台", "旧版自定义 Agent · 仅手动研究，不进入生产 Runtime")
-
-    n_real_agents = sum(1 for _, meta in _AGENT_META.items() if not meta[3])
-    ui.html(
-        f'<div class="qa-note">'
-        f"这里保留旧版自定义 Agent 供手动对照研究，不再每 15 分钟进入生产 Runtime。"
-        f"点击「运行一轮」会触发 {n_real_agents} 个实验 agent（需 Ollama 在线）；"
-        f"正式路径请在总览运行每日 TradingAgents 研究。"
-        f"</div>"
-    )
-
-    try:
-        from trader.ai.manager import get_manager
-
-        mgr = get_manager()
-    except Exception as exc:
-        _empty(f"无法加载 AgentManager: {exc}", "⚠️")
-        return None
-
-    # ── ① Manager 决策区 ────────────────────────────────────────────────────
-    with ui.element("div").classes("cp-mgr"):
-        with ui.row().classes("items-center gap-3").style("margin:0;flex-wrap:wrap"):
-            ui.label("Manager 决策区").classes("qa-card-title").style("color:var(--ai)")
-            status_lbl = ui.label("空闲").style("font-size:12px;color:var(--fg3)")
-            ui.element("div").style("flex:1")
-            sym_in = (
-                ui.input(
-                    "候选源 / 决策区股票",
-                    value=_pref("cp_syms", "SPY,AAPL,NVDA,MSFT"),
-                )
-                .props("dark dense outlined")
-                .style("width:240px")
-            )
-            sym_in.on_value_change(lambda e: _set_pref("cp_syms", e.value))
-            daily_btn = ui.button("生成每日候选池", color="secondary").props(
-                "unelevated dense"
-            )
-            load_daily_btn = ui.button("载入每日候选", color="secondary").props(
-                "unelevated dense outline"
-            )
-            run_btn = ui.button("▶ 运行一轮", color="primary").props("unelevated dense")
-            reset_btn = ui.button("✕ 重置", color="negative").props(
-                "unelevated dense flat"
-            )
-            reset_btn.set_visibility(False)
-        # 进度条（运行时显示）
-        progress_el = ui.html("")
-        picks_html = ui.html(
-            '<div class="cp-pick-row">'
-            '<span style="color:var(--fg3);font-size:12px">运行后显示推荐</span>'
-            "</div>"
-        )
-        daily_pool_html = ui.html(
-            '<div style="margin-top:10px;color:var(--fg3);font-size:12px">'
-            "每日候选池未生成。可先填入较大候选源，再点击「生成每日候选池」。"
-            "</div>"
-        )
-
-    # ── ② Agent 状态面板（6 blocks）───────────────────────────────────────
-    decision_plan_html = ui.html(_cockpit_decision_plan_summary_html())
-
-    ui.label("Agent 状态").classes("qa-card-title").style("margin-top:4px")
-    agent_cards: dict = {}
-    with ui.element("div").classes("cp-agent-grid"):
-        for role in _AGENT_META:
-            agent_cards[role] = ui.html(_agent_card_html(role, None))
-
-    # ── ③ 活动流 ─────────────────────────────────────────────────────────
-    ui.label("实时活动流").classes("qa-card-title").style("margin-top:4px")
-    feed_el = ui.html(_feed_html([]))
-
-    # ── ④ 详细报告（按标的可展开，点击 › 查看各 agent 分析）──────────────
-    with (
-        ui.row()
-        .classes("items-center gap-3")
-        .style("margin-top:12px;margin-bottom:4px")
-    ):
-        ui.label("详细报告").classes("qa-card-title")
-
-        def _do_download():
-            import json as _json
-
-            data = _build_report_data(mgr, _AI_DB)
-            ts = datetime.now().strftime("%Y%m%d_%H%M")
-            content = _json.dumps(data, ensure_ascii=False, indent=2, default=str)
-            ui.download(content.encode("utf-8"), filename=f"ai_report_{ts}.json")
-
-        ui.button(
-            "↓ 导出 JSON",
-            on_click=_audited_callback("agent.export", _do_download),
-        ).props(
-            "unelevated dense flat outline"
-        ).style("color:var(--ai);border-color:rgba(88,166,255,.4);font-size:11px")
-    report_el = ui.html(_report_html([]))
-
-    # ── 重置逻辑（只绑定一次，避免多次 _do_run 叠加 handler）──────────────
-    def _force_reset():
-        _cockpit_run["running"] = False
-        _cockpit_run["stage"] = ""
-        _cockpit_run["start_time"] = None
-        reset_btn.set_visibility(False)
-        run_btn.props(remove="disable")
-        status_lbl.set_text("已重置")
-        status_lbl.style("color:var(--warn)")
-        logger.warning("Cockpit: 用户强制重置运行状态")
-        ui.notify("运行状态已重置", type="warning")
-
-    reset_btn.on_click(_audited_callback("agent.reset", _force_reset))  # 绑定一次
-
-    def _candidate_source_symbols() -> list[str]:
-        raw = (sym_in.value or "SPY,AAPL,NVDA,MSFT").strip()
-        return [s.strip().upper() for s in raw.split(",") if s.strip()]
-
-    def _apply_daily_candidates(rows) -> None:
-        from trader.daily_candidates import daily_candidate_symbols
-
-        symbols = daily_candidate_symbols(limit=8)
-        if not symbols:
-            symbols = [
-                row.symbol
-                for row in rows
-                if row.status not in {"AVOID_NOW", "MARKET_ANCHOR"}
-            ][:8]
-
-        if symbols:
-            text = ",".join(symbols)
-            sym_in.set_value(text)
-            _set_pref("cp_syms", text)
-
-        daily_pool_html.set_content(_daily_candidates_html(rows))
-        decision_plan_html.set_content(_cockpit_decision_plan_summary_html(symbols))
-
-    def _do_build_daily_candidates() -> None:
-        if _cockpit_run["running"]:
-            ui.notify("Agent 正在运行，等本轮结束后再生成每日候选")
-            return
-
-        source_symbols = _candidate_source_symbols()
-        if not source_symbols:
-            ui.notify("请先填写候选源股票")
-            return
-
-        daily_btn.props("disable")
-        daily_pool_html.set_content(
-            '<div style="margin-top:10px;color:var(--ai);font-size:12px">'
-            "每日候选池生成中...</div>"
-        )
-
-        import threading
-
-        def _bg_daily():
-            try:
-                from trader.daily_candidates import (
-                    build_daily_candidates,
-                    save_daily_candidates,
-                )
-
-                rows = build_daily_candidates(
-                    source_symbols,
-                    timeframe="5m",
-                    ai_db_path=_AI_DB,
-                    limit=12,
-                    include_anchors=True,
-                )
-                save_daily_candidates(rows)
-                _apply_daily_candidates(rows)
-                ui.notify("每日候选池已生成并回填到决策区")
-            except Exception as exc:
-                daily_pool_html.set_content(
-                    f'<div style="margin-top:10px;color:var(--neg);font-size:12px">'
-                    f"每日候选池生成失败: {_he(exc)}</div>"
-                )
-                ui.notify("每日候选池生成失败", type="negative")
-            finally:
-                daily_btn.props(remove="disable")
-
-        threading.Thread(target=_bg_daily, daemon=True).start()
-
-    def _do_load_daily_candidates() -> None:
-        from trader.daily_candidates import load_daily_candidates
-
-        rows = load_daily_candidates()
-        if not rows:
-            ui.notify("还没有保存的每日候选池")
-            return
-        _apply_daily_candidates(rows)
-        ui.notify("已载入每日候选池")
-
-    daily_btn.on_click(
-        _audited_callback("agent.generate", _do_build_daily_candidates)
-    )
-    load_daily_btn.on_click(
-        _audited_callback("agent.load", _do_load_daily_candidates)
-    )
-
-    # ── 运行按钮逻辑 ─────────────────────────────────────────────────────
-    def _do_run():
-        if _cockpit_run["running"]:
-            ui.notify("Agent 正在运行，请稍候")
-            return
-
-        raw_syms = (sym_in.value or "SPY,AAPL,NVDA").strip()
-        symbols = [s.strip().upper() for s in raw_syms.split(",") if s.strip()]
-        if not symbols:
-            ui.notify("请填写至少一个标的")
-            return
-
-        # 检查 LLM 可用性，每次运行时重建 client（保证 ollama serve 后立刻生效）
-        from trader.ai.client import make_client, StubLLMClient
-
-        fresh_client = make_client()
-        if isinstance(fresh_client, StubLLMClient):
-            import os
-
-            if not os.getenv("ANTHROPIC_API_KEY"):
-                ui.notify(
-                    "⚠️ Ollama 未运行且无 ANTHROPIC_API_KEY → 分数将全部为 50，无参考价值。"
-                    "请先在终端执行 ollama serve，再点运行。",
-                    type="warning",
-                    timeout=8000,
-                )
-        else:
-            # Ollama / Anthropic 可用 → 用新 client 重建 AgentManager
-            from trader.ai.manager import AgentManager
-
-            nonlocal mgr
-            mgr = AgentManager(client=fresh_client)
-
-        _cockpit_run["running"] = True
-        _cockpit_run["start_time"] = datetime.now(tz=timezone.utc)
-        run_btn.props("disable")
-        reset_btn.set_visibility(True)
-        status_lbl.set_text("运行中…")
-        status_lbl.style("color:var(--ai)")
-
-        # 立即标记所有 real agent 为 running（从 _AGENT_META 读取，非 stub）
-        mgr._init_db(_AI_DB)
-        real_roles = [r for r, meta in _AGENT_META.items() if not meta[3]]
-        for role in real_roles:
-            mgr._write_state(_AI_DB, role, "running", 0.0, None, {})
-
-        import threading
-
-        def _bg():
-            import pandas as pd  # noqa: E402
-            from trader.config import TradingConfig
-            from trader.models import AgentContext
-            from trader.data_cache import upsert_bars as _upsert
-            from trader.data_feed import AlpacaDataFeed
-            from trader.models import Candidate, utc_now as _now
-            from trader.selection import ConsensusSelector
-
-            import time as _time
-            import threading as _th
-
-            def _agent_watcher():
-                """后台监控线程：每 4s 读 DuckDB，把哪个 agent 在跑同步到 stage。"""
-                while _cockpit_run.get("running"):
-                    try:
-                        states = mgr.get_agent_states(_AI_DB)
-                        done_roles = [
-                            s["role"] for s in states if s["status"] == "done"
-                        ]
-                        run_roles = [
-                            s["role"] for s in states if s["status"] == "running"
-                        ]
-                        err_roles = [
-                            s["role"] for s in states if s["status"] == "error"
-                        ]
-                        total = len(states)
-                        n_done = len(done_roles)
-                        if run_roles:
-                            cur_cn = _ROLE_CN.get(run_roles[0], run_roles[0])
-                            extras = ""
-                            if err_roles:
-                                extras = f"  ⚠ {len(err_roles)} 个出错"
-                            _cockpit_run["stage"] = (
-                                f"AI: {cur_cn} 推理中…  已完成 {n_done}/{total}{extras}"
-                            )
-                        elif n_done + len(err_roles) == total and total > 0:
-                            _cockpit_run["stage"] = (
-                                f"AI: 全部完成 ({n_done}/{total})，汇总中…"
-                            )
-                    except Exception:
-                        pass
-                    _time.sleep(4)
-
-            try:
-                now = _now()
-                cfg = TradingConfig()
-
-                # ① K 线拉取：每个 symbol 独立更新 stage
-                n_sym = len(symbols)
-                try:
-                    feed = AlpacaDataFeed(cfg)
-                    for idx, sym in enumerate(symbols, 1):
-                        _cockpit_run["stage"] = f"拉取 K 线 {sym} ({idx}/{n_sym})…"
-                        try:
-                            raw = feed.fetch_bars(sym, n_bars=cfg.bars_lookback)
-                            if raw:
-                                rows = [
-                                    {
-                                        "timestamp_utc": b.timestamp,
-                                        "open": b.open,
-                                        "high": b.high,
-                                        "low": b.low,
-                                        "close": b.close,
-                                        "volume": b.volume,
-                                    }
-                                    for b in raw
-                                ]
-                                _upsert(sym, cfg.timeframe, pd.DataFrame(rows))
-                        except Exception as e:
-                            logger.warning("fetch_bars %s: %s", sym, e)
-                except Exception as e:
-                    logger.warning("AlpacaDataFeed 初始化失败 (离线?): %s", e)
-
-                # ② 策略打分
-                _cockpit_run["stage"] = f"策略打分… ({n_sym} 个标的)"
-                candidates = []
-                try:
-                    selector = ConsensusSelector(strategies=cfg.strategies)
-                    candidates = selector.select(
-                        universe=symbols,
-                        timeframe=cfg.timeframe,
-                        as_of=now,
-                    )
-                    logger.info("Cockpit selection: %d scored", len(candidates))
-                except Exception as e:
-                    logger.warning("ConsensusSelector 失败: %s", e)
-
-                # ③ 无数据标的 50 兜底
-                scored_syms = {c.symbol for c in candidates}
-                for s in symbols:
-                    if s not in scored_syms:
-                        candidates.append(
-                            Candidate(
-                                symbol=s,
-                                score=50.0,
-                                rank=len(candidates) + 1,
-                                reasons={"note": "no bar data"},
-                                as_of=now,
-                            )
-                        )
-                candidates.sort(key=lambda c: c.score, reverse=True)
-                for i, c in enumerate(candidates):
-                    c.rank = i + 1
-
-                # ④ 四路新闻（按源逐一显示进度）
-                from datetime import timedelta
-                from trader.news import (
-                    FinnhubSource,
-                    PriceMoveSource,
-                    SECEdgarSource,
-                    WallStreetCNSource,
-                )
-
-                news_events = []
-                _news_cfg = [
-                    (
-                        "华尔街见闻 (1/4)",
-                        WallStreetCNSource(
-                            universe=symbols, channels=["global", "us"], num=30
-                        ),
-                        now - timedelta(hours=4),
-                    ),
-                    (
-                        "SEC 8-K   (2/4)",
-                        SECEdgarSource(universe=symbols),
-                        now - timedelta(hours=20),
-                    ),
-                    (
-                        "Finnhub   (3/4)",
-                        FinnhubSource(universe=symbols),
-                        now - timedelta(hours=24),
-                    ),
-                    (
-                        "价格异动  (4/4)",
-                        PriceMoveSource(universe=symbols),
-                        now - timedelta(hours=4),
-                    ),
-                ]
-                for src_label, src_obj, src_since in _news_cfg:
-                    _cockpit_run["stage"] = f"拉取新闻：{src_label}…"
-                    try:
-                        batch = src_obj.poll(since=src_since)
-                        news_events.extend(batch)
-                        logger.info("Cockpit %s: %d 条", src_label, len(batch))
-                    except Exception as e:
-                        logger.warning("Cockpit %s poll 失败: %s", src_label, e)
-
-                # ⑤ AI Agent 分析（启动监控线程实时更新 stage）
-                n_agents = len(mgr._agents)
-                _cockpit_run["stage"] = f"AI: 准备分析 {n_agents} 个 agent…"
-                ctx = AgentContext(
-                    candidates=candidates,
-                    plans=[],
-                    news=news_events,
-                    positions={},
-                    equity=0.0,
-                    as_of=now,
-                    extra={},
-                )
-                watcher = _th.Thread(target=_agent_watcher, daemon=True)
-                watcher.start()
-                mgr.run_cycle(ctx, _AI_DB)
-
-                n_news = len(news_events)
-                n_cand = len(candidates)
-                _cockpit_run["last_run"] = _now()
-                _cockpit_run["stage"] = (
-                    f"完成  标的 {n_cand} 个 · 新闻 {n_news} 条 · Agent {n_agents} 个"
-                )
-
-                # Discord 推送 AI 分析结果（格式见 trader/discord_report.py）
-                try:
-                    from trader.discord_report import build_ai_analysis_messages
-                    from trader.notify import make_notifier
-
-                    report_data = _build_report_data(mgr, _AI_DB)
-                    notifier = make_notifier(external_send_enabled=True)
-                    for msg in build_ai_analysis_messages(report_data):
-                        notifier.send(msg)
-                except Exception as e:
-                    logger.warning("Discord AI 推送失败: %s", e)
-
-            except Exception as exc:
-                logger.error("AgentManager run_cycle 失败: %s", exc)
-                _cockpit_run["stage"] = "错误"
-            finally:
-                _cockpit_run["running"] = False
-
-        threading.Thread(target=_bg, daemon=True).start()
-
-    run_btn.on_click(_audited_callback("agent.run", _do_run))
-
-    # ── T1 选股结果 (ConsensusSelector) ─────────────────────────────────────
-    with ui.element("div").classes("qa-card"):
-        with ui.row().classes("items-center gap-3").style("margin-bottom:8px"):
-            ui.label("T1 选股 · 策略共识评分").classes("qa-card-title")
-            ui.label("score = 多头票数 / 总票数 × 100").style(
-                "font-size:12px;color:var(--fg3);flex:1"
-            )
-            _t1_run_btn = ui.button("▶ 运行选股", color="secondary").props(
-                "unelevated dense"
-            )
-        _t1_result = ui.column().style("gap:8px;width:100%")
-
-        def _do_t1():
-            _t1_result.clear()
-            with _t1_result:
-                ui.label("⏳ 正在运行...").style("color:var(--fg3);font-size:12px")
-
-            def _work():
-                try:
-                    from trader.selection import ConsensusSelector
-                    from trader.data_cache import list_cached_files
-
-                    files = list_cached_files()
-                    syms = sorted({f["文件"].rsplit("_", 1)[0] for f in files})
-                    if not syms:
-                        _t1_result.clear()
-                        with _t1_result:
-                            _empty("本地无缓存数据", "📭")
-                        return
-                    sel = ConsensusSelector()
-                    cands = sel.select(
-                        universe=syms, timeframe="5m", as_of=datetime.now(timezone.utc)
-                    )
-                    _t1_result.clear()
-                    with _t1_result:
-                        cols = [
-                            ("rank", "排名", "center"),
-                            ("symbol", "标的", "left"),
-                            ("score", "综合分", "right"),
-                            ("bull", "多票", "right"),
-                            ("bear", "空票", "right"),
-                        ]
-                        t1_tbl = _make_table(cols)
-                        rows = []
-                        for c in cands[:15]:
-                            votes = c.reasons.get("votes", {})
-                            bull = sum(1 for v in votes.values() if v > 0)
-                            bear = sum(1 for v in votes.values() if v < 0)
-                            rows.append(
-                                {
-                                    "rank": c.rank,
-                                    "symbol": c.symbol,
-                                    "score": f"{c.score:.1f}",
-                                    "bull": str(bull),
-                                    "bear": str(bear),
-                                }
-                            )
-                        t1_tbl.rows = rows
-                        t1_tbl.update()
-                except Exception as exc:
-                    _t1_result.clear()
-                    with _t1_result:
-                        _empty(f"选股失败: {exc}", "⚠️")
-
-            import threading
-
-            threading.Thread(target=_work, daemon=True).start()
-
-        _t1_run_btn.on_click(_audited_callback("selection.run", _do_t1))
-
-    # ── 增量更新函数（每 5s 由定时器调用）─────────────────────────────────
-    def update():
-        # 更新 agent 状态卡片
-        states = mgr.get_agent_states(_AI_DB)
-        by_role = {s["role"]: s for s in states}
-        for role in _AGENT_META:
-            agent_cards[role].set_content(_agent_card_html(role, by_role.get(role)))
-
-        # 更新 Manager 决策区 picks
-        scores = mgr.get_composite_scores(_AI_DB)
-        if scores:
-            inner = ""
-            for s in scores[:6]:
-                v = s["verdict"].lower()
-                cls = "buy" if v == "buy" else ("avoid" if v == "avoid" else "watch")
-                vc = {
-                    "buy": "var(--pos)",
-                    "avoid": "var(--neg)",
-                    "watch": "var(--warn)",
-                }.get(cls, "var(--fg2)")
-                inner += (
-                    f'<div class="cp-pick {cls}">'
-                    f'<div style="font-size:15px;font-weight:800;color:var(--fg)">{s["symbol"]}</div>'
-                    f'<div style="font-size:10.5px;font-weight:700;margin:2px 0;color:{vc}">{s["verdict"]}</div>'
-                    f'<div style="font-size:11px;color:var(--fg3)">综合 {s["composite_score"]:.0f}</div>'
-                    f"</div>"
-                )
-            picks_html.set_content(f'<div class="cp-pick-row">{inner}</div>')
-
-        # 进度条数据（复用已读取的 states，不重复查 DuckDB）
-        try:
-            n_total = len([r for r, m in _AGENT_META.items() if not m[3]])
-            n_done = sum(1 for s in states if s["status"] in ("done", "error"))
-            n_err = sum(1 for s in states if s["status"] == "error")
-            run_roles_l = [s["role"] for s in states if s["status"] == "running"]
-        except Exception:
-            n_total = n_real_agents
-            n_done = 0
-            n_err = 0
-            run_roles_l = []
-
-        # 更新运行状态 UI
-        if _cockpit_run["running"]:
-            stage = _cockpit_run.get("stage", "运行中…") or "运行中…"
-            start = _cockpit_run.get("start_time")
-            elapsed = ""
-            if start:
-                secs = int((datetime.now(tz=timezone.utc) - start).total_seconds())
-                elapsed = (
-                    f" [{secs}s]" if secs < 60 else f" [{secs // 60}m{secs % 60:02d}s]"
-                )
-                if secs > 2700:
-                    _cockpit_run["running"] = False
-                    _cockpit_run["stage"] = "超时"
-                    _cockpit_run["start_time"] = None
-                    logger.warning("Cockpit 运行超时 (%ds)，已自动重置", secs)
-            status_lbl.set_text(f"{stage}{elapsed}")
-            status_lbl.style("color:var(--ai)")
-            run_btn.props("disable")
-            reset_btn.set_visibility(True)
-
-            # 进度条
-            pct = int(n_done / n_total * 100) if n_total else 0
-            bar_color = "var(--neg)" if n_err else "var(--ai)"
-            err_note = (
-                f'<span style="color:var(--neg);margin-left:8px">⚠ {n_err} 个出错</span>'
-                if n_err
-                else ""
-            )
-            cur_cn = (
-                _ROLE_CN.get(run_roles_l[0], run_roles_l[0])
-                if run_roles_l
-                else "等待中"
-            )
-            progress_el.set_content(
-                f'<div style="margin-top:8px">'
-                f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">'
-                f'<span style="font-size:11px;color:var(--fg3)">Agent 进度</span>'
-                f'<span style="font-size:11px;color:var(--ai);font-family:var(--mono)">'
-                f"{n_done}/{n_total}</span>"
-                f'<span style="font-size:11px;color:var(--fg2)">· {cur_cn} 推理中…</span>'
-                f"{err_note}"
-                f"</div>"
-                f'<div style="background:var(--panel2);border-radius:3px;height:4px;overflow:hidden">'
-                f'<div style="background:{bar_color};height:100%;width:{pct}%;'
-                f'transition:width .4s ease;border-radius:3px"></div>'
-                f"</div>"
-                f"</div>"
-            )
-        else:
-            # 隐藏或显示完成态进度条
-            lr = _cockpit_run.get("last_run")
-            stage = _cockpit_run.get("stage", "")
-            if stage == "超时":
-                status_lbl.set_text("运行超时（已自动重置），见日志")
-                status_lbl.style("color:var(--warn)")
-            elif stage == "错误":
-                status_lbl.set_text("运行出错，见日志")
-                status_lbl.style("color:var(--neg)")
-            elif lr:
-                status_lbl.set_text(f"完成 {lr.strftime('%H:%M:%S')}")
-                status_lbl.style("color:var(--fg3)")
-            else:
-                status_lbl.set_text("空闲")
-                status_lbl.style("color:var(--fg3)")
-            run_btn.props(remove="disable")
-            reset_btn.set_visibility(False)
-            # 完成后显示最终结果进度条（全满绿）
-            if lr and n_total:
-                bar_color = "var(--neg)" if n_err else "var(--pos)"
-                err_note = (
-                    f'<span style="color:var(--neg);margin-left:8px">⚠ {n_err} 个出错</span>'
-                    if n_err
-                    else ""
-                )
-                progress_el.set_content(
-                    f'<div style="margin-top:8px">'
-                    f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">'
-                    f'<span style="font-size:11px;color:var(--fg3)">Agent 进度</span>'
-                    f'<span style="font-size:11px;color:var(--pos);font-family:var(--mono)">'
-                    f"{min(n_done, n_total)}/{n_total}</span>"
-                    f'<span style="font-size:11px;color:var(--fg3)">· 已完成</span>'
-                    f"{err_note}"
-                    f"</div>"
-                    f'<div style="background:var(--panel2);border-radius:3px;height:4px;overflow:hidden">'
-                    f'<div style="background:{bar_color};height:100%;width:100%;border-radius:3px"></div>'
-                    f"</div>"
-                    f"</div>"
-                )
-            else:
-                progress_el.set_content("")
-
-        # 更新活动流
-        feed_el.set_content(_feed_html(mgr.get_recent_advisories(_AI_DB, n=20)))
-
-        # 更新详细报告
-        report_el.set_content(_report_html(_build_report_data(mgr, _AI_DB)))
-
-    update()
-    return update
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 风控
-# ═══════════════════════════════════════════════════════════════════════════
 
 
 def _render_risk():
@@ -3645,15 +3266,11 @@ def _render_risk():
                     "🛑 触发急停",
                     on_click=_audited_callback("risk.trigger", _do_engage),
                     color="negative",
-                ).props(
-                    "unelevated"
-                )
+                ).props("unelevated")
                 ui.button(
                     "✓ 解除急停",
                     on_click=_audited_callback("risk.clear", _do_disengage),
-                ).props(
-                    "unelevated outline"
-                )
+                ).props("unelevated outline")
 
             ui.html(
                 '<div style="font-size:11px;color:var(--fg3);margin-top:8px">'
@@ -3805,7 +3422,6 @@ def _render_maintenance():
         "系统运营 · 诊断",
         "绩效复盘 · 异常检测 · 整改建议 · Discord 日报",
     )
-    import threading
 
     ui.html(
         '<div class="qa-note">读取 DuckDB 审计数据，生成绩效报告和参数校准建议；建议仅供参考，不会自动修改策略。'
@@ -3888,7 +3504,9 @@ def _render_maintenance():
 
                     with ui.element("div").classes("qa-card"):
                         ui.label("参数校准建议").classes("qa-card-title")
-                        ui.label("以下内容是复盘建议，不会自动修改策略参数").classes("qa-card-sub")
+                        ui.label("以下内容是复盘建议，不会自动修改策略参数").classes(
+                            "qa-card-sub"
+                        )
                         if suggestions:
                             pri_color = {
                                 "critical": "#f85149",
@@ -3920,274 +3538,21 @@ def _render_maintenance():
                                     f'<div style="color:var(--neg);font-size:12px">{e}</div>'
                                 )
 
+                if out.errors:
+                    return ActionJobResult(
+                        state="ERROR", user_message="维护分析存在错误"
+                    )
             except Exception as exc:
                 result_area_m.clear()
                 with result_area_m:
                     _empty(f"维护分析失败: {exc}", "⚠️")
 
-        threading.Thread(target=_work, daemon=True).start()
+                raise
 
-    run_btn_m.on_click(
-        _audited_callback("maintenance.run", lambda: _do_maintenance())
-    )
+        return _work()
+
+    run_btn_m.on_click(_audited_job_callback("maintenance.run", _do_maintenance))
     return None
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 决策台辅助函数
-# ═══════════════════════════════════════════════════════════════════════════
-
-_AGENT_META = {
-    # ── 算法轨（无 LLM，并行）────────────────────────────────────────────
-    "quant": ("🔢", "Quant Agent", "动量/HV/Beta → 因子打分(无LLM)", False),
-    "etf_flow": ("💸", "ETF Flow Agent", "ETF量价代理 → 资金流向(无LLM)", False),
-    "options": ("🎯", "Options Agent", "PCR/IV/Skew → 期权市场信号(无LLM)", False),
-    "elite_holdings": (
-        "👑",
-        "Elite Holdings Agent",
-        "ARK+Berkshire+Scion 13F + 国会(无LLM)",
-        False,
-    ),
-    # ── LLM 轨（GPU 串行）────────────────────────────────────────────────
-    "macro": ("🌍", "Macro Agent", "VIX/债券/美元/黄金 → 宏观环境", False),
-    "fundamental": (
-        "📊",
-        "Fundamental Agent",
-        "yfinance PE/增长/利润率 → 基本面",
-        False,
-    ),
-    "technical": ("📈", "Technical Agent", "TA 指标 → LLM 打分", False),
-    "news": ("📰", "News Agent", "WSCN/EDGAR/yfinance → 情绪", False),
-    "web_research": (
-        "🌐",
-        "WebResearch Agent",
-        "RSS/Twitter/Reddit → 热点(权重1%)",
-        False,
-    ),
-    # ── Phase 2（串行）───────────────────────────────────────────────────
-    "bull_bear": ("⚖️", "Bull/Bear Debate", "全信号 LLM 三轮辩论 → 最终裁决", False),
-    # ── 规划中────────────────────────────────────────────────────────────
-    "retail": ("💬", "Retail Sentiment", "⚠ 规划中: 情绪聚合", True),
-}
-
-_TAG_COLOR = {
-    "macro": "#a371f7",
-    "fundamental": "#f0883e",
-    "quant": "#1f6feb",
-    "etf_flow": "#0ea5e9",
-    "options": "#ff7b72",
-    "elite_holdings": "#ffd700",
-    "technical": "#3fb950",
-    "news": "#58a6ff",
-    "web_research": "#79c0ff",
-    "bull_bear": "#d29922",
-    "retail": "#ea4aaa",
-}
-
-_ROLE_CN = {
-    "quant": "量化因子",
-    "etf_flow": "ETF资金流",
-    "options": "期权信号",
-    "elite_holdings": "大咖持仓",
-    "macro": "宏观环境",
-    "fundamental": "基本面",
-    "technical": "技术分析",
-    "news": "新闻情绪",
-    "web_research": "热点研究",
-    "bull_bear": "多空辩论",
-}
-
-
-def _agent_card_html(role: str, state: dict | None) -> str:
-    icon, name, desc, stub = _AGENT_META.get(role, ("?", role, "", False))
-    if state is None:
-        status, score, last_run_str, summary = "idle", 0.0, "—", {}
-    else:
-        status = state.get("status", "idle")
-        score = float(state.get("last_score") or 0)
-        lr = state.get("last_run")
-        last_run_str = (
-            lr.strftime("%H:%M:%S")
-            if hasattr(lr, "strftime")
-            else (str(lr)[:8] if lr else "—")
-        )
-        summary = state.get("summary") or {}
-
-    color = {
-        "done": "#3fb950",
-        "running": "#58a6ff",
-        "error": "#f85149",
-        "timeout": "#d29922",
-    }.get(status, "#6e7681")
-    border = color if status not in ("idle",) else "var(--border)"
-    pulse = "animation:cp-pulse 1.2s infinite" if status == "running" else ""
-
-    bar_w = min(int(score), 100)
-    sym = summary.get("symbol", "")
-    if sym:
-        score_key = next(
-            (
-                k
-                for k in (
-                    "macro_score",
-                    "fundamental_score",
-                    "quant_score",
-                    "etf_score",
-                    "options_score",
-                    "elite_score",
-                    "technical_score",
-                    "news_score",
-                    "hotspot_score",
-                    "final_score",
-                )
-                if k in summary
-            ),
-            "",
-        )
-        score_val = summary.get(score_key, "")
-        trend = summary.get(
-            "trend", summary.get("sentiment", summary.get("verdict", ""))
-        )
-        label = score_key.replace("_score", "")
-        summary_txt = f"{sym}: {label}={score_val}{f' {trend}' if trend else ''}"[:48]
-    else:
-        summary_txt = (
-            "🔧 待实现" if stub else ("待运行" if status == "idle" else status)
-        )
-
-    stub_note = (
-        '<div style="color:#d29922;font-size:10px;margin-bottom:5px">🔧 本轮待实现</div>'
-        if stub
-        else ""
-    )
-
-    return (
-        f'<div style="background:var(--panel);border:1px solid {border};'
-        f'border-radius:12px;padding:15px;min-height:148px;box-sizing:border-box">'
-        f'<div style="display:flex;align-items:center;gap:7px;margin-bottom:8px">'
-        f'<span style="font-size:16px">{icon}</span>'
-        f'<span style="font-size:12.5px;font-weight:700;color:var(--fg)">{name}</span>'
-        f'<span style="width:7px;height:7px;border-radius:50%;background:{color};'
-        f'display:inline-block;margin-left:auto;{pulse}"></span>'
-        f"</div>"
-        f'<div style="font-size:11px;color:var(--fg3);margin-bottom:8px;line-height:1.4">{desc}</div>'
-        f"{stub_note}"
-        f'<div style="font-size:11.5px;color:var(--fg2);margin-bottom:8px;word-break:break-all">{summary_txt}</div>'
-        f'<div style="background:var(--border);border-radius:3px;height:3px;margin-bottom:7px">'
-        f'<div style="background:{color};border-radius:3px;height:3px;width:{bar_w}%;transition:width .5s"></div>'
-        f"</div>"
-        f'<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--fg3)">'
-        f"<span>{status}</span><span>{last_run_str}</span>"
-        f"</div>"
-        f"</div>"
-    )
-
-
-def _feed_html(advisories: list) -> str:
-    if not advisories:
-        return (
-            '<div class="cp-feed">'
-            '<span style="color:var(--fg3);font-size:12px">运行后显示活动记录</span>'
-            "</div>"
-        )
-    items = ""
-    for a in advisories:
-        ts = a["created_at"]
-        ts_str = (
-            ts.strftime("%H:%M:%S")
-            if hasattr(ts, "strftime")
-            else (str(ts)[:8] if ts else "—")
-        )
-        agent = a["agent"]
-        p = a["payload"]
-        sym = p.get("symbol", "")
-        k = a["kind"]
-        if k == "macro":
-            text = f"{sym} 宏观={p.get('macro_score', '?')} {p.get('regime', '')} VIX={p.get('vix_level', '?')}"
-        elif k == "fundamental":
-            text = f"{sym} 基本面={p.get('fundamental_score', '?')} {p.get('valuation', '')} {p.get('growth_quality', '')}"
-        elif k == "quant":
-            text = f"{sym} 因子分={p.get('quant_score', '?')} mom1m={p.get('momentum_1m_pct', '?')}% beta={p.get('beta', '?')}"
-        elif k == "etf_flow":
-            text = f"{sym} ETF流={p.get('etf_score', '?')} {p.get('market_flow', '')} 行业:{p.get('sector_flow', '')}"
-        elif k == "technical":
-            text = f"{sym} 技术分={p.get('technical_score', '?')} {p.get('trend', '')}"
-        elif k == "news":
-            text = (
-                f"{sym} 新闻分={p.get('news_score', '?')} ({p.get('sentiment', '?')})"
-            )
-        elif k == "bull_bear_debate":
-            text = f"{sym} → {p.get('verdict', '?')} score={p.get('final_score', '?')}"
-        elif k == "web_research":
-            ft = p.get("fintwit_mentions", 0)
-            text = f"{sym} 热点分={p.get('hotspot_score', '?')} {p.get('sentiment', '')} 大V提及:{ft}"
-        elif k == "options":
-            text = (
-                f"{sym} 期权分={p.get('options_score', '?')} "
-                f"PCR={p.get('pcr_vol', '?')} IV={p.get('atm_iv_pct', '?')}% "
-                f"{p.get('sentiment', '')}"
-            )
-        elif k == "elite_holdings":
-            sigs = ",".join(p.get("signals", [])[:2])
-            text = (
-                f"{sym} 大咖分={p.get('elite_score', '?')} "
-                f"{p.get('stance', '?')}" + (f" ({sigs})" if sigs else "")
-            )
-        else:
-            text = str(p)[:120]
-        color = _TAG_COLOR.get(agent, "#8b949e")
-        items += (
-            f'<div class="cp-feed-row">'
-            f'<span class="cp-ts">{ts_str}</span>'
-            f'<span class="cp-tag" style="background:{color}22;color:{color}">{agent}</span>'
-            f'<span style="color:var(--fg)">{text[:120]}</span>'
-            f"</div>"
-        )
-    return f'<div class="cp-feed">{items}</div>'
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 决策台报告辅助
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def _build_report_data(mgr, db_path: str) -> list:
-    """把最近 advisory 按 symbol 聚合，返回报告列表（按综合分降序）。"""
-    advisories = mgr.get_recent_advisories(db_path, n=200)
-    by_sym: dict = {}
-    for a in advisories:
-        sym = a["payload"].get("symbol", "")
-        if not sym:
-            continue
-        k = a["kind"]
-        by_sym.setdefault(sym, {})[k] = a["payload"]  # 同 kind 取最新（列表已倒序）
-
-    scores_map = {s["symbol"]: s for s in mgr.get_composite_scores(db_path)}
-    result = []
-    for sym, kinds in by_sym.items():
-        s = scores_map.get(sym, {})
-        result.append(
-            {
-                "symbol": sym,
-                "composite_score": s.get("composite_score", 50.0),
-                "verdict": s.get("verdict", "WATCHLIST"),
-                # 算法轨
-                "quant": kinds.get("quant"),
-                "etf_flow": kinds.get("etf_flow"),
-                "options": kinds.get("options"),
-                "elite_holdings": kinds.get("elite_holdings"),
-                # LLM 轨
-                "macro": kinds.get("macro"),
-                "fundamental": kinds.get("fundamental"),
-                "technical": kinds.get("technical"),
-                "news": kinds.get("news"),
-                "web_research": kinds.get("web_research"),
-                # Phase 2
-                "bull_bear": kinds.get("bull_bear_debate"),
-            }
-        )
-    result.sort(key=lambda x: x["composite_score"], reverse=True)
-    return result
 
 
 def _he(s) -> str:
@@ -4987,561 +4352,117 @@ def _decision_item_thesis(kind: str, direction: str) -> str:
     return "入池逻辑：当前分数进入候选范围，但还需要盘中触发条件确认。"
 
 
-def _cockpit_decision_plan_summary_html(symbols: list[str] | None = None) -> str:
-    try:
-        from trader.decision_trade_plans import load_decision_trade_plan_report
+_TASK_STATE_LABELS = {
+    "BUSY": ("处理中", ""),
+    "SUCCESS": ("成功", "pos"),
+    "EMPTY": ("空结果", ""),
+    "ERROR": ("失败", "neg"),
+}
 
-        report = load_decision_trade_plan_report()
-    except Exception as exc:
-        return (
-            '<div style="margin-top:10px;color:var(--neg);font-size:12px">'
-            f"无法加载决策计划：{_he(exc)}</div>"
+
+def _render_tasks():
+    _page_head("任务中心", "AI 任务队列 · 全部动作活动日志", badge="live")
+
+    with ui.element("div").classes("qa-card"):
+        ui.label("AI 任务队列").classes("qa-card-title")
+        ui.label(
+            "后台任务严格按到达顺序依次执行，不会并发抢占同一份数据；"
+            "预计时间基于该动作最近历史耗时估算。"
+        ).classes("qa-card-sub")
+        queue_area = ui.column().style("gap:8px;width:100%;margin-top:8px")
+
+    with ui.element("div").classes("qa-card").style("margin-top:12px"):
+        ui.label("活动日志").classes("qa-card-title")
+        ui.label("全部按钮动作的执行历史，含成功/空结果/失败与耗时。").classes(
+            "qa-card-sub"
         )
-
-    plans = list(getattr(report, "plans", []) or [])
-    if symbols:
-        wanted = {str(symbol).upper() for symbol in symbols}
-        plans = [
-            plan for plan in plans if str(getattr(plan, "symbol", "")).upper() in wanted
-        ]
-    if not plans:
-        return (
-            '<div style="margin-top:10px;color:var(--fg3);font-size:12px">'
-            "暂无决策池交易计划。可先到选股池更新决策池，再送到决策台。</div>"
-        )
-
-    rows = []
-    action_label = {
-        "TRADE_READY": "可交易",
-        "WAIT_TRIGGER": "等触发",
-        "HEDGE_ONLY": "对冲参考",
-        "REVIEW_ONLY": "仅复核",
-        "BLOCKED": "阻断",
-    }
-    action_color = {
-        "TRADE_READY": "var(--pos)",
-        "WAIT_TRIGGER": "var(--warn)",
-        "HEDGE_ONLY": "var(--ai)",
-        "REVIEW_ONLY": "var(--fg3)",
-        "BLOCKED": "var(--neg)",
-    }
-    for plan in plans[:7]:
-        action = str(getattr(plan, "action", "") or "")
-        color = action_color.get(action, "var(--fg3)")
-        label = action_label.get(action, action or "未知")
-        symbol = _he(getattr(plan, "symbol", ""))
-        trigger = _he(getattr(plan, "entry_trigger", "") or "等待盘中确认")
-        stop = _fmt_num(getattr(plan, "stop_loss", None), 2)
-        target = _fmt_num(getattr(plan, "take_profit", None), 2)
-        weight = _fmt_num(getattr(plan, "suggested_weight_pct", None), 1)
-        blocked = _he(getattr(plan, "blocked_reason", "") or "")
-        block_html = (
-            f'<span style="color:var(--neg)"> · {blocked}</span>' if blocked else ""
-        )
-        rows.append(
-            '<div style="border-top:1px solid #21262d;padding:7px 0">'
-            '<div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap">'
-            f'<b style="font-size:13px;color:var(--fg)">{symbol}</b>'
-            f'<span class="cp-report-rtag" style="color:{color};background:rgba(255,255,255,.04)">{_he(label)}</span>'
-            f'<span style="font-size:11px;color:var(--fg3)">止损 {stop} · 止盈 {target} · 仓位 {weight}%{block_html}</span>'
-            "</div>"
-            f'<div style="font-size:11.5px;color:var(--fg2);line-height:1.4;margin-top:3px">触发：{trigger}</div>'
-            "</div>"
-        )
-
-    return (
-        '<div style="margin-top:10px;background:rgba(255,255,255,.02);border:1px solid var(--border);'
-        'border-radius:8px;padding:10px 12px">'
-        '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px">'
-        '<b style="color:var(--fg);font-size:13px">决策池交易计划</b>'
-        f'<span style="color:var(--fg3);font-size:11px">{_he(getattr(report, "updated_at", "") or "—")}</span>'
-        "</div>" + "".join(rows) + "</div>"
-    )
-
-
-def _daily_candidates_html(rows) -> str:
-    if not rows:
-        return (
-            '<div style="margin-top:10px;color:var(--fg3);font-size:12px">'
-            "每日候选池为空</div>"
-        )
-
-    status_color = {
-        "ENTRY_READY": "var(--pos)",
-        "WAIT_BREAKOUT": "var(--warn)",
-        "WATCH": "var(--ai)",
-        "MARKET_ANCHOR": "var(--fg3)",
-        "BENCH": "var(--fg3)",
-        "AVOID_NOW": "var(--neg)",
-    }
-    status_label = {
-        "ENTRY_READY": "可入下一轮",
-        "WAIT_BREAKOUT": "等突破",
-        "WATCH": "观察",
-        "MARKET_ANCHOR": "市场锚点",
-        "BENCH": "备用",
-        "AVOID_NOW": "暂避",
-    }
-
-    items = []
-    for row in rows[:12]:
-        color = status_color.get(row.status, "var(--fg3)")
-        label = status_label.get(row.status, row.status)
-        reasons = "；".join(getattr(row, "reasons", [])[:2]) or "无明确理由"
-        risks = "；".join(getattr(row, "risk_flags", [])[:2])
-        score = float(getattr(row, "score", 0) or 0)
-        rank = int(getattr(row, "rank", 0) or 0)
-        confidence = getattr(row, "data_confidence", "低")
-        symbol = _he(getattr(row, "symbol", ""))
-        risk_html = (
-            f'<div style="color:var(--warn);font-size:11px;margin-top:3px">风险：{_he(risks)}</div>'
-            if risks
-            else ""
-        )
-        items.append(
-            f'<div style="border-top:1px solid #21262d;padding:8px 0">'
-            f'<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
-            f'<span style="font-family:var(--mono);color:var(--fg3);font-size:11px">#{rank}</span>'
-            f'<b style="color:var(--fg);font-size:13px">{symbol}</b>'
-            f'<span style="font-family:var(--mono);color:{color};font-size:12px">{score:.1f}</span>'
-            f'<span class="cp-report-rtag" style="color:{color};background:rgba(255,255,255,.04)">'
-            f"{_he(label)}</span>"
-            f'<span style="color:var(--fg3);font-size:11px">置信 {_he(confidence)}</span>'
-            f"</div>"
-            f'<div style="color:var(--fg2);font-size:11.5px;margin-top:4px;line-height:1.45">'
-            f"{_he(reasons)}</div>"
-            f"{risk_html}"
-            f"</div>"
-        )
-
-    return (
-        '<div style="margin-top:10px;background:rgba(255,255,255,.02);'
-        'border:1px solid var(--border);border-radius:8px;padding:10px 12px">'
-        '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px">'
-        '<b style="color:var(--fg);font-size:13px">每日候选池</b>'
-        '<span style="color:var(--fg3);font-size:11px">三层评分：基础质量 / AI / 今日技术</span>'
-        "</div>" + "".join(items) + "</div>"
-    )
-
-
-def _report_html(report_data: list) -> str:
-    """把报告数据列表渲染成可展开的 HTML（<details>/<summary>）。"""
-    if not report_data:
-        return (
-            '<div style="color:var(--fg3);font-size:13px;padding:14px 2px">'
-            "运行一轮后显示详细报告</div>"
-        )
-
-    parts = []
-    for r in report_data:
-        sym = _he(r["symbol"])
-        composite = r["composite_score"]
-        verdict = r.get("verdict", "WATCHLIST")
-        v_color = {"BUY": "var(--pos)", "AVOID": "var(--neg)"}.get(
-            verdict, "var(--warn)"
-        )
-        sections = []
-
-        # ── ① BullBear 辩论（最具操作价值，排首位）─────────────────────────
-        bb = r.get("bull_bear")
-        if bb:
-            bull = bb.get("bull", {})
-            bear = bb.get("bear", {})
-            key_fac = _he(bb.get("key_factor", ""))
-            suggested = _he(bb.get("suggested_action", ""))
-            final_sc = bb.get("final_score", "?")
-            upside = bull.get("upside_target", 0)
-            stop_pct = bear.get("stop_loss_pct", 0)
-
-            bull_cats = _rtags(bull.get("catalysts", []), "pos")
-            bear_ris = _rtags(bear.get("risks", []), "neg")
-            upside_h = (
-                (
-                    f'<div class="cp-report-meta" style="margin-top:4px">'
-                    f"目标价 ${float(upside):.2f}</div>"
-                )
-                if upside
-                else ""
+        with ui.row().classes("items-end gap-3 flex-wrap").style("margin-top:8px"):
+            categories = ["全部"] + sorted({a.category for a in BUTTON_ACTIONS})
+            cat_sel = (
+                ui.select(categories, value="全部", label="分类")
+                .props("dark dense outlined")
+                .style("width:140px")
             )
-            stop_h = (
-                (
-                    f'<div class="cp-report-meta" style="margin-top:4px">'
-                    f"建议止损 {float(stop_pct):.1f}%</div>"
-                )
-                if stop_pct
-                else ""
+            search_in = (
+                ui.input("搜索动作名称", placeholder="例如：个股分析")
+                .props("dark dense outlined clearable")
+                .style("width:220px")
             )
+        log_area = ui.column().style("gap:2px;width:100%;margin-top:10px")
 
-            sections.append(
-                f'<div class="cp-report-section">'
-                f'<div class="cp-report-sec-title">⚖️ 多空辩论裁决'
-                f'  <span class="cp-report-score-badge" style="color:{v_color}">{_he(verdict)}</span>'
-                f'  <span class="cp-report-score-badge">综合 {final_sc}</span>'
-                f"</div>"
-                + (
-                    f'<div class="cp-report-key-factor">关键因素：{key_fac}</div>'
-                    if key_fac
-                    else ""
-                )
-                + (
-                    f'<div class="cp-report-suggested">建议：{suggested}</div>'
-                    if suggested
-                    else ""
-                )
-                + f'<div class="cp-report-debate-row">'
-                f'<div class="cp-report-bull-box">'
-                f'<div class="cp-report-debate-label pos">'
-                f"多方  bull_score={bull.get('score', '?')}"
-                + (
-                    f'  <span class="cp-report-rtag pos">{_he(bull.get("time_horizon", ""))}</span>'
-                    if bull.get("time_horizon")
-                    else ""
-                )
-                + f"</div>"
-                f'<div class="cp-report-thesis">{_he(bull.get("thesis", ""))}</div>'
-                + (
-                    f'<div style="margin-top:6px">{bull_cats}</div>'
-                    if bull_cats
-                    else ""
-                )
-                + upside_h
-                + f"</div>"
-                f'<div class="cp-report-bear-box">'
-                f'<div class="cp-report-debate-label neg">空方  bear_score={bear.get("score", "?")}</div>'
-                f'<div class="cp-report-thesis">{_he(bear.get("thesis", ""))}</div>'
-                + (f'<div style="margin-top:6px">{bear_ris}</div>' if bear_ris else "")
-                + stop_h
-                + "</div>"
-                "</div>"
-                "</div>"
+    def _render_queue():
+        queue_area.clear()
+        view = queue_view(_ASYNC_ACTION_RUNNER, _ACTION_AUDIT_STORE)
+        with queue_area:
+            if not view["items"]:
+                _empty("当前没有排队或执行中的任务", "🕒")
+                return
+            ui.html(
+                '<div class="qa-note">队列全部完成预计还需 '
+                f'<b>{format_health_age(view["total_seconds"])}</b></div>'
             )
-
-        # ── ② 技术分析 ───────────────────────────────────────────────────────
-        tech = r.get("technical")
-        if tech:
-            sig_tags = _rtags(tech.get("key_signals", []))
-            reasoning = _he(tech.get("reasoning", ""))
-            sections.append(
-                f'<div class="cp-report-section">'
-                f'<div class="cp-report-sec-title">📈 技术分析'
-                f'  <span class="cp-report-score-badge">{tech.get("technical_score", "?")} 分</span>'
-                f'  <span class="cp-report-rtag">{_he(tech.get("trend", "?"))}</span>'
-                f'  <span class="cp-report-rtag">{_he(tech.get("momentum", "?"))} momentum</span>'
-                f"</div>"
-                f'<div class="cp-report-meta">'
-                f"现价 ${tech.get('close', '?')} | 1日涨跌 {tech.get('change_1d_pct', '?')}% "
-                f"| 量比 {tech.get('vol_ratio', '?')}x</div>"
-                + (f'<div style="margin-top:6px">{sig_tags}</div>' if sig_tags else "")
-                + (
-                    f'<div class="cp-report-reasoning">{reasoning}</div>'
-                    if reasoning
-                    else ""
-                )
-                + "</div>"
-            )
-
-        # ── ③ 新闻情绪 ───────────────────────────────────────────────────────
-        news = r.get("news")
-        if news:
-            cat_tags = _rtags(news.get("catalysts", []), "pos")
-            risk_tags = _rtags(news.get("risk_flags", []), "neg")
-            reasoning = _he(news.get("reasoning", ""))
-            sections.append(
-                f'<div class="cp-report-section">'
-                f'<div class="cp-report-sec-title">📰 新闻情绪'
-                f'  <span class="cp-report-score-badge">{news.get("news_score", "?")} 分</span>'
-                f'  <span class="cp-report-rtag">{_he(news.get("sentiment", "?"))}</span>'
-                f'  <span class="cp-report-meta" style="display:inline">'
-                f"  {news.get('news_count', '?')} 条</span>"
-                f"</div>"
-                + (f'<div style="margin-top:4px">{cat_tags}</div>' if cat_tags else "")
-                + (
-                    f'<div style="margin-top:4px">{risk_tags}</div>'
-                    if risk_tags
-                    else ""
-                )
-                + (
-                    f'<div class="cp-report-reasoning">{reasoning}</div>'
-                    if reasoning
-                    else ""
-                )
-                + "</div>"
-            )
-
-        # ── ④ 热点研究 ───────────────────────────────────────────────────────
-        web = r.get("web_research")
-        if web:
-            hs_html = ""
-            for h in web.get("hotspots", [])[:4]:
-                sig = h.get("signal", "neutral")
-                cls = "pos" if sig == "bullish" else ("neg" if sig == "bearish" else "")
-                hs_html += f'<span class="cp-report-rtag {cls}">{_he(h.get("topic", ""))}</span>'
-            risk_tags = _rtags(web.get("risk_flags", []), "neg")
-            summary = _he(web.get("summary", ""))
-            # Fintwit 大V 提及统计
-            fintwit_cnt = web.get("fintwit_mentions", 0)
-            fintwit_accs = web.get("fintwit_accounts", 0)
-            fintwit_html = ""
-            if fintwit_accs:
-                fintwit_html = (
-                    f'<div class="cp-report-meta" style="margin-top:4px">'
-                    f"🐦 Fintwit大V ({fintwit_accs}账号扫描)："
-                    + (
-                        f'<span style="color:#3fb950;font-weight:600">{fintwit_cnt} 条提及</span>'
-                        if fintwit_cnt > 0
-                        else '<span style="color:var(--fg3)">无提及</span>'
+            for position, item in enumerate(view["items"]):
+                if item["status"] == "RUNNING":
+                    status_html = (
+                        '<span class="qa-badge live">▶ 执行中</span>'
+                        f' 已耗时 {format_health_age(item["elapsed_seconds"])}'
+                        f' · 预计还需 {format_health_age(item["eta_seconds"])}'
                     )
-                    + "</div>"
-                )
-            sections.append(
-                f'<div class="cp-report-section">'
-                f'<div class="cp-report-sec-title">🌐 热点研究'
-                f'  <span class="cp-report-score-badge">{web.get("hotspot_score", "?")} 分</span>'
-                f'  <span class="cp-report-rtag">{_he(web.get("sentiment", "?"))}</span>'
-                f"</div>"
-                f'<div class="cp-report-meta">{web.get("sources_count", "?")} 条来源 '
-                f"(RSS + Twitter + Reddit)</div>"
-                + fintwit_html
-                + (f'<div style="margin-top:6px">{hs_html}</div>' if hs_html else "")
-                + (
-                    f'<div style="margin-top:4px">{risk_tags}</div>'
-                    if risk_tags
-                    else ""
-                )
-                + (
-                    f'<div class="cp-report-reasoning">{summary}</div>'
-                    if summary
-                    else ""
-                )
-                + "</div>"
-            )
-
-        # ── ⑤ 宏观环境 ───────────────────────────────────────────────────────
-        macro = r.get("macro")
-        if macro:
-            kf_tags = _rtags(macro.get("key_factors", []))
-            sections.append(
-                f'<div class="cp-report-section">'
-                f'<div class="cp-report-sec-title">🌍 宏观环境'
-                f'  <span class="cp-report-score-badge">{macro.get("macro_score", "?")} 分</span>'
-                f'  <span class="cp-report-rtag">{_he(macro.get("regime", "?"))}</span>'
-                f"</div>"
-                f'<div class="cp-report-meta">'
-                f"VIX={macro.get('vix_level', '?')} | VIX制度={_he(macro.get('vix_regime', '?'))}"
-                f" | 利率={_he(macro.get('rate_outlook', '?'))} | 美元={_he(macro.get('dollar_signal', '?'))}"
-                f" | 流动性={_he(macro.get('liquidity', '?'))}</div>"
-                + (f'<div style="margin-top:6px">{kf_tags}</div>' if kf_tags else "")
-                + (
-                    f'<div class="cp-report-reasoning">{_he(macro.get("reasoning", ""))}</div>'
-                    if macro.get("reasoning")
-                    else ""
-                )
-                + "</div>"
-            )
-
-        # ── ⑥ 基本面 ─────────────────────────────────────────────────────────
-        fund = r.get("fundamental")
-        if fund:
-            str_tags = _rtags(fund.get("key_strengths", []), "pos")
-            risk_tags = _rtags(fund.get("key_risks", []), "neg")
-            sections.append(
-                f'<div class="cp-report-section">'
-                f'<div class="cp-report-sec-title">📊 基本面'
-                f'  <span class="cp-report-score-badge">{fund.get("fundamental_score", "?")} 分</span>'
-                f'  <span class="cp-report-rtag">{_he(fund.get("valuation", "?"))}</span>'
-                f'  <span class="cp-report-rtag">{_he(fund.get("growth_quality", "?"))} growth</span>'
-                f"</div>"
-                f'<div class="cp-report-meta">'
-                f"ForwardPE={fund.get('pe_forward', '?')}x | 营收增速={fund.get('revenue_growth_pct', '?')}%"
-                f" | 净利润率={fund.get('profit_margin_pct', '?')}% | D/E={fund.get('debt_equity', '?')}%"
-                f" | 行业={_he(fund.get('sector', ''))}"
-                f"</div>"
-                + (f'<div style="margin-top:6px">{str_tags}</div>' if str_tags else "")
-                + (
-                    f'<div style="margin-top:4px">{risk_tags}</div>'
-                    if risk_tags
-                    else ""
-                )
-                + (
-                    f'<div class="cp-report-reasoning">{_he(fund.get("reasoning", ""))}</div>'
-                    if fund.get("reasoning")
-                    else ""
-                )
-                + "</div>"
-            )
-
-        # ── ⑦ 量化因子 ───────────────────────────────────────────────────────
-        quant = r.get("quant")
-        if quant:
-            factors = quant.get("factors_used", [])
-            fact_html = " ".join(
-                f'<span class="cp-report-rtag">{_he(f)}</span>' for f in factors[:5]
-            )
-            sections.append(
-                f'<div class="cp-report-section">'
-                f'<div class="cp-report-sec-title">🔢 量化因子'
-                f'  <span class="cp-report-score-badge">{quant.get("quant_score", "?")} 分</span>'
-                f'  <span class="cp-report-meta" style="display:inline">纯算法</span>'
-                f"</div>"
-                f'<div class="cp-report-meta">'
-                f"动量1m={quant.get('momentum_1m_pct', '?')}% | 动量3m={quant.get('momentum_3m_pct', '?')}%"
-                f" | HV比={quant.get('hv_ratio', '?')} | 量比={quant.get('vol_ratio', '?')}x"
-                f" | RSI={quant.get('rsi', '?')} | Beta={quant.get('beta', '?')}"
-                f"</div>"
-                + (
-                    f'<div style="margin-top:6px">{fact_html}</div>'
-                    if fact_html
-                    else ""
-                )
-                + "</div>"
-            )
-
-        # ── ⑧ ETF 资金流 ─────────────────────────────────────────────────────
-        etf = r.get("etf_flow")
-        if etf:
-            sections.append(
-                f'<div class="cp-report-section">'
-                f'<div class="cp-report-sec-title">💸 ETF 资金流'
-                f'  <span class="cp-report-score-badge">{etf.get("etf_score", "?")} 分</span>'
-                f'  <span class="cp-report-rtag">{_he(etf.get("market_flow", "?"))}</span>'
-                f"</div>"
-                f'<div class="cp-report-meta">'
-                f"市场流向={_he(etf.get('market_flow', '?'))} | 行业={_he(etf.get('sector', '?'))}"
-                f" | 行业ETF={_he(etf.get('sector_etf', 'N/A'))} | 行业流向={_he(etf.get('sector_flow', '?'))}"
-                f"</div>"
-                f'<div class="cp-report-meta" style="color:var(--warn);margin-top:4px">'
-                f"⚠ 代理指标（量价），非真实申购赎回数据</div>" + "</div>"
-            )
-
-        # ── ⑨ 期权市场 ───────────────────────────────────────────────────────
-        opts = r.get("options")
-        if opts:
-            factors_html = " ".join(
-                f'<span class="cp-report-rtag">{_he(f)}</span>'
-                for f in opts.get("factors_used", [])[:5]
-            )
-            sections.append(
-                f'<div class="cp-report-section">'
-                f'<div class="cp-report-sec-title">🎯 期权市场'
-                f'  <span class="cp-report-score-badge">{opts.get("options_score", "?")} 分</span>'
-                f'  <span class="cp-report-rtag">{_he(opts.get("sentiment", "?"))}</span>'
-                f"</div>"
-                f'<div class="cp-report-meta">'
-                f"PCR={opts.get('pcr_vol', '?')} | ATM IV={opts.get('atm_iv_pct', '?')}%"
-                f" | IV Skew={opts.get('iv_skew_pct', '?')}%"
-                f" | Max Pain差={opts.get('max_pain_diff_pct', '?')}%"
-                f" | 到期={_he(opts.get('expiry', '?'))}"
-                f"</div>"
-                + (
-                    f'<div style="margin-top:6px">{factors_html}</div>'
-                    if factors_html
-                    else ""
-                )
-                + '<div class="cp-report-meta" style="color:var(--warn);margin-top:4px">'
-                "⚠ PCR/IV含散户期权，仅供方向参考</div>" + "</div>"
-            )
-
-        # ── ⑩ 大咖持仓 ───────────────────────────────────────────────────────
-        elite = r.get("elite_holdings")
-        if elite:
-            sig_tags = _rtags(elite.get("signals", []))
-
-            # Berkshire（Buffett）
-            berk = elite.get("berkshire", {})
-            berk_html = ""
-            if berk.get("held"):
-                action = berk.get("action", "")
-                chg = berk.get("change_pct")
-                berk_html = (
-                    f'<div class="cp-report-meta" style="margin-top:4px">'
-                    f"🏛 Berkshire(Buffett): {_he(action)}"
-                    + (f" ({chg:+.1f}%)" if chg is not None else " (新建仓)")
-                    + "</div>"
+                else:
+                    status_html = (
+                        f'<span style="color:var(--fg3)">⏳ 排队中（第 {position} 位）</span>'
+                        f' · 预计 {format_health_age(item["eta_seconds"])} 后完成'
+                    )
+                ui.html(
+                    '<div class="qa-note" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">'
+                    f'<b>{_he(item["label"])}</b>'
+                    f'<span style="color:var(--fg3);font-size:11px">{_he(item["category"])}</span>'
+                    f"{status_html}"
+                    "</div>"
                 )
 
-            # Scion（Burry）
-            scion = elite.get("scion", {})
-            scion_html = ""
-            if scion.get("held"):
-                action_s = scion.get("action", "")
-                chg_s = scion.get("change_pct")
-                scion_html = (
-                    f'<div class="cp-report-meta" style="margin-top:4px">'
-                    f"🐻 Scion(Burry): {_he(action_s)}"
-                    + (f" ({chg_s:+.1f}%)" if chg_s is not None else " (集中持仓)")
-                    + "</div>"
-                )
-
-            # ARK Invest（Cathie Wood）
-            ark = elite.get("ark", {})
-            ark_html = ""
-            held_by = ark.get("held_by", [])
-            if held_by:
-                ark_action = []
-                if ark.get("recent_buy"):
-                    ark_action.append("近期买入↑")
-                if ark.get("recent_sell"):
-                    ark_action.append("近期卖出↓")
-                ark_act_str = " / ".join(ark_action) if ark_action else "持仓"
-                wt = ark.get("weight", 0)
-                ark_html = (
-                    f'<div class="cp-report-meta" style="margin-top:4px">'
-                    f"🚀 ARK(Wood): {','.join(held_by)}"
-                    + (f" 权重{wt:.2f}%" if wt else "")
-                    + f" — {ark_act_str}"
-                    + "</div>"
-                )
-
-            # 国会交易新闻
-            congress = elite.get("congress_news", [])
-            news_html = "".join(
-                f'<div class="cp-report-reasoning" style="margin-top:2px">{_he(n[:120])}</div>'
-                for n in congress[:2]
-            )
-
-            sections.append(
-                f'<div class="cp-report-section">'
-                f'<div class="cp-report-sec-title">👑 大咖持仓'
-                f'  <span class="cp-report-score-badge">{elite.get("elite_score", "?")} 分</span>'
-                f'  <span class="cp-report-rtag">{_he(elite.get("stance", "?"))}</span>'
-                f"</div>"
-                + (f'<div style="margin-top:6px">{sig_tags}</div>' if sig_tags else "")
-                + ark_html
-                + berk_html
-                + scion_html
-                + (
-                    '<div class="cp-report-meta" style="margin-top:4px">国会交易新闻：</div>'
-                    + news_html
-                    if congress
-                    else ""
-                )
-                + '<div class="cp-report-meta" style="color:var(--warn);margin-top:4px">'
-                "⚠ ARK每日更新；13F季报滞后45天；国会数据来自Twitter</div>" + "</div>"
-            )
-
-        if not sections:
-            sections = [
-                '<div class="cp-report-section" style="color:var(--fg3);font-size:12px">'
-                "暂无分析数据</div>"
+    def _render_log():
+        log_area.clear()
+        category = None if cat_sel.value == "全部" else cat_sel.value
+        rows = _ACTION_AUDIT_STORE.recent(limit=200, category=category)
+        query = (search_in.value or "").strip()
+        if query:
+            rows = [
+                r
+                for r in rows
+                if query in r["label"] or query in r["action_id"]
             ]
+        with log_area:
+            if not rows:
+                _empty("暂无匹配的活动记录", "📋")
+                return
+            for row in rows[:100]:
+                state_label, tone = _TASK_STATE_LABELS.get(row["state"], (row["state"], ""))
+                duration = (
+                    format_health_age(row["duration_seconds"])
+                    if row["duration_seconds"] is not None
+                    else "—"
+                )
+                ui.html(
+                    '<div class="qa-note" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:12px">'
+                    f'<span style="color:var(--fg3);font-family:var(--mono)">{_fmt_time(row["started_at"])}</span>'
+                    f'<b>{_he(row["label"])}</b>'
+                    f'<span style="color:var(--fg3)">{_he(row["category"])}</span>'
+                    f'<span class="{tone}">{state_label}</span>'
+                    f'<span style="color:var(--fg3)">耗时 {duration}</span>'
+                    f'<span style="color:var(--fg3);flex:1;min-width:120px">{_he(row["user_message"])}</span>'
+                    "</div>"
+                )
 
-        parts.append(
-            f'<details class="cp-report-sym">'
-            f'<summary class="cp-report-summary">'
-            f'<span class="cp-report-sym-name">{sym}</span>'
-            f'<span class="cp-report-verdict-badge" style="color:{v_color}">{_he(verdict)}</span>'
-            f'<span class="cp-report-composite">综合 {composite:.0f} 分</span>'
-            f'<span class="cp-report-chevron">›</span>'
-            f"</summary>"
-            f'<div class="cp-report-body">{"".join(sections)}</div>'
-            f"</details>"
-        )
+    cat_sel.on_value_change(lambda e: _render_log())
+    search_in.on_value_change(lambda e: _render_log())
 
-    return '<div class="cp-report-wrap">' + "".join(parts) + "</div>"
+    def update():
+        _render_queue()
+        _render_log()
 
-
-# 决策台运行状态（模块级，跨导航切换保持）
-_cockpit_run = {"running": False, "last_run": None, "stage": "", "start_time": None}
+    update()
+    return update
 
 
 def _render_operations():
@@ -5551,8 +4472,10 @@ def _render_operations():
         "集中管理 Runtime、风险、通知、诊断与恢复",
         badge="live",
     )
-    with ui.element("div").classes("qa-grid").style(
-        "grid-template-columns:repeat(auto-fit,minmax(240px,1fr))"
+    with (
+        ui.element("div")
+        .classes("qa-grid")
+        .style("grid-template-columns:repeat(auto-fit,minmax(240px,1fr))")
     ):
         with ui.element("div").classes("qa-card"):
             ui.label("引擎与通知").classes("qa-card-title")
@@ -5574,13 +4497,22 @@ def _render_operations():
             risk_link.on("click", lambda: _select("risk"))
         with ui.element("div").classes("qa-card"):
             ui.label("诊断与复盘").classes("qa-card-title")
-            ui.label(
-                "运行异常检测、查看绩效复盘和只读整改建议。"
-            ).classes("qa-card-sub")
+            ui.label("运行异常检测、查看绩效复盘和只读整改建议。").classes(
+                "qa-card-sub"
+            )
             maintenance_link = ui.element("div").classes("qa-nav-item")
             with maintenance_link:
                 ui.label("进入诊断与复盘")
             maintenance_link.on("click", lambda: _select("maintenance"))
+        with ui.element("div").classes("qa-card"):
+            ui.label("任务中心").classes("qa-card-title")
+            ui.label(
+                "AI 任务队列（排队/执行中/预计时间）与全部动作活动日志，按类型筛选。"
+            ).classes("qa-card-sub")
+            tasks_link = ui.element("div").classes("qa-nav-item")
+            with tasks_link:
+                ui.label("进入任务中心")
+            tasks_link.on("click", lambda: _select("tasks"))
     with ui.element("div").classes("qa-card").style("margin-top:12px"):
         ui.label("平台边界").classes("qa-card-title")
         ui.label(
@@ -5597,13 +4529,13 @@ def _render_operations():
 _RENDERERS = {
     "overview": _render_overview,
     "activity": _render_activity,
-    "cockpit": _render_cockpit,
     "selection": _render_selection_pools,
     "research": _render_research,
     "operations": _render_operations,
     "risk": _render_risk,
     "maintenance": _render_maintenance,
     "system": _render_system,
+    "tasks": _render_tasks,
 }
 
 # 旧 tab 名称 → 新名称（保留用户偏好跨版本兼容）
@@ -5644,6 +4576,10 @@ def _update_topbar():
     running = _engine_running()
     top_engine.set_text("● 运行中" if running else "○ 停止")
     top_engine.classes(remove="pos neg", add="pos" if running else "neg")
+    snapshot = _ASYNC_ACTION_RUNNER.queue_snapshot()
+    pending_count = len(snapshot["queued"]) + (1 if snapshot["current"] else 0)
+    top_tasks.set_text(f"{pending_count} 个" if pending_count else "空闲")
+    top_tasks.classes(remove="pos neg ai", add="ai" if pending_count else "")
     hb = heartbeat()
     if hb is not None:
         secs = (datetime.now(timezone.utc) - hb).total_seconds()
@@ -5687,7 +4623,7 @@ def _tick():
             pass
 
 
-_initial_tab = "overview"
+_initial_tab = _pref("active_tab", "overview")
 _select(
     _TAB_MIGRATION.get(
         _initial_tab, _initial_tab if _initial_tab in _RENDERERS else "overview"

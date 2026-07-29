@@ -99,23 +99,36 @@ class AlpacaBroker:
             self._client.cancel_order_by_id(broker_order_id)
             return True
         except Exception as exc:
+            # Raise, don't return False: False reads as "broker confirmed
+            # the cancel did not happen," but a query failure means we
+            # genuinely don't know — a caller retrying on False could
+            # double-submit if the cancel had actually gone through.
             logger.warning("ALPACA 撤单失败 %s: %s", broker_order_id, exc)
-            return False
+            raise
 
     def get_order_status(self, broker_order_id: str) -> OrderStatus:
         try:
             o = self._client.get_order_by_id(broker_order_id)
             return _map_status(o.status)
         except Exception as exc:
+            # Raise, don't return OrderStatus.FAILED: FAILED is not a status
+            # Alpaca itself produces here, so a future caller could easily
+            # start treating it as a real rejection — turning every transient
+            # timeout into a permanent order-failed decision. Match
+            # get_positions/get_account_cash/get_account_equity/get_fill.
             logger.warning("ALPACA 查询订单失败 %s: %s", broker_order_id, exc)
-            return OrderStatus.FAILED
+            raise
 
     def get_fill(self, broker_order_id: str) -> Optional[Fill]:
         try:
             o = self._client.get_order_by_id(broker_order_id)
         except Exception as exc:
+            # Must raise, not return None: the caller (Runtime._poll_orders)
+            # would misread a transient query failure as "confirmed no fill"
+            # and could mark an actually-filled order done without ever
+            # calling portfolio.apply_fill — a silent, permanent fill loss.
             logger.warning("ALPACA 查询成交失败 %s: %s", broker_order_id, exc)
-            return None
+            raise
         filled_qty = float(o.filled_qty or 0)
         if filled_qty <= 0:
             return None
@@ -181,5 +194,12 @@ class AlpacaBroker:
             acct = self._client.get_account()
             return float(acct.equity)
         except Exception as exc:
+            # Must raise, not return 0.0: a transient timeout misreported as
+            # "$0 equity" reads as a -100% daily drawdown to RiskEngine and
+            # trips the circuit breaker permanently (no auto-recovery), which
+            # actually happened in production. get_positions/get_account_cash
+            # already raise on failure — this brings equity in line with them
+            # so Runtime's existing broker.snapshot except-and-skip-this-tick
+            # handler in _tick() catches it instead.
             logger.warning("ALPACA 查询权益失败: %s", exc)
-            return 0.0
+            raise

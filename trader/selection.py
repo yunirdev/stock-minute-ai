@@ -65,16 +65,24 @@ class ConsensusSelector:
             return None
 
         votes: Dict[str, int] = {}
+        errored_strategies: List[str] = []
         for strat in self._strategies:
             try:
                 result = compute_signals(df.copy(), strat)
                 sig = int(result.iloc[-1].get("strat_signal", 0))
                 if sig != 0:
                     votes[strat] = sig  # +1 看多, -1 看空
-            except Exception:
-                pass
+            except Exception as exc:
+                # A strategy that errors is NOT the same as one that computed
+                # and genuinely voted neutral — counting it in the denominator
+                # silently dilutes the consensus score. Exclude it and record
+                # which ones failed so a systematic data issue is visible
+                # (e.g. in the UI/audit) instead of just quietly lowering
+                # scores across the board.
+                logger.warning("selection %s 策略 %s 跳过: %s", symbol, strat, exc)
+                errored_strategies.append(strat)
 
-        total = len(self._strategies)
+        total = len(self._strategies) - len(errored_strategies)
         bull = sum(1 for v in votes.values() if v > 0)
         score = round(100.0 * bull / total, 1) if total > 0 else 50.0
 
@@ -82,7 +90,11 @@ class ConsensusSelector:
             symbol=symbol,
             score=score,
             rank=0,  # filled after sort
-            reasons={"votes": votes, "total_strategies": total},
+            reasons={
+                "votes": votes,
+                "total_strategies": total,
+                "errored_strategies": errored_strategies,
+            },
             as_of=as_of or utc_now(),
         )
 

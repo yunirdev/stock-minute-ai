@@ -39,7 +39,14 @@ from .models import (
     TradePlan,
     utc_now,
 )
-from .news import FinnhubSource, PriceMoveSource, SECEdgarSource, WallStreetCNSource
+from .news import (
+    FinnhubSource,
+    NewsEventStore,
+    PriceMoveSource,
+    SECEdgarSource,
+    WallStreetCNSource,
+    poll_all_sources,
+)
 from .notify import DiscordNotifier
 from .plan import ATRPlanner
 from .portfolio import Portfolio
@@ -202,6 +209,7 @@ class Runtime:
         )
         self._sec = SECEdgarSource(universe=config.symbols)
         self._finnhub = FinnhubSource(universe=config.symbols)
+        self._news_store = NewsEventStore(config.db_path)
         self._reviewer = SimpleReviewer(db_path=config.db_path)
 
         self._running = False
@@ -748,6 +756,11 @@ class Runtime:
         # 6b. 晨报（美东 9AM，每天一次，不受市场时段限制）
         self._maybe_morning_brief(ts)
 
+        # 6c. 新闻事件：四路合并（WSCN + SEC 8-K + Finnhub + 价格异动），不受市场
+        # 时段限制 —— SEC 8-K、WSCN 快讯盘前盘后都可能发布，PriceMoveSource 读的是
+        # 本地 bars 缓存，都不需要等本轮实时 K 线拉取成功。
+        self._poll_news(ts)
+
         # 7. 市场时段判断
         session = self._calendar.session_now()
         if session == "closed":
@@ -759,44 +772,14 @@ class Runtime:
                 ts, session, equity, positions, message="market closed"
             )
             return
-        if session != "open":
-            logger.info("market session=%s — no new trade plans outside regular hours", session)
-            self._portfolio.snapshot_external_equity(equity)
-            self._audit.log_heartbeat(self._tick_count, equity)
-            self._publish_runtime_status(ts, session, equity, positions)
-            return
 
-        # 8. 拉取 K 线，更新数据缓存
-        raw_bars_map: Dict[str, list] = {}   # symbol → alpaca bar list
-        model_bars: Dict[str, Bar] = {}       # symbol → 最新 trader.models.Bar（给 pos_monitor 用）
-
-        for symbol in self._cfg.symbols:
-            try:
-                raw = self._feed.fetch_bars(symbol, n_bars=self._cfg.bars_lookback)
-                if len(raw) < 30:
-                    logger.warning("%s: 仅 %d 根 K 线，跳过", symbol, len(raw))
-                    continue
-                latest_bar = _alpaca_bar_to_model(raw[-1], symbol, self._cfg.timeframe)
-                if not _latest_bar_is_fresh(latest_bar, self._cfg.timeframe, now=ts):
-                    logger.warning(
-                        "%s: stale latest bar %s — skip live decision",
-                        symbol, latest_bar.timestamp,
-                    )
-                    continue
-                raw_bars_map[symbol] = raw
-                rows = [
-                    {"timestamp_utc": b.timestamp,
-                     "open": b.open, "high": b.high, "low": b.low,
-                     "close": b.close, "volume": b.volume}
-                    for b in raw
-                ]
-                _dc_upsert(symbol, self._cfg.timeframe, pd.DataFrame(rows))
-                model_bars[symbol] = latest_bar
-            except Exception as exc:
-                logger.warning("fetch_bars %s 失败: %s", symbol, exc)
+        # 8. 拉取 K 线，更新本地缓存 —— 盘前/盘中/盘后都刷新（feed=sip 账号下
+        # Alpaca 本就包含盘前盘后成交），供 UI 图表/回测/新闻异动侦测使用；
+        # 是否进入选股/下单只由下面单独的 session=="open" 判断控制，不受影响。
+        raw_bars_map, model_bars = self._fetch_and_cache_bars(ts)
 
         if not raw_bars_map:
-            logger.warning("无可用 K 线数据，跳过 selection")
+            logger.warning("无可用 K 线数据")
             self._portfolio.snapshot_external_equity(equity)
             self._audit.log_heartbeat(self._tick_count, equity)
             self._publish_runtime_status(
@@ -804,23 +787,12 @@ class Runtime:
             )
             return
 
-        # 9. 新闻事件：四路合并（WSCN + SEC 8-K + Finnhub + 价格异动）
-        from datetime import timedelta
-        news = []
-        _news_sources = [
-            ("wscn",    self._wscn,       ts),
-            ("sec",     self._sec,        ts - timedelta(hours=20)),  # 8-K 可能盘前发
-            ("finnhub", self._finnhub,    ts - timedelta(hours=4)),
-            ("price",   self._price_news, ts),
-        ]
-        for src_name, src, since_dt in _news_sources:
-            try:
-                batch = src.poll(since=since_dt)
-                news.extend(batch)
-                if batch:
-                    logger.info("新闻 [%s]: %d 条", src_name, len(batch))
-            except Exception as exc:
-                logger.warning("news.poll [%s] 失败: %s", src_name, exc)
+        if session != "open":
+            logger.info("market session=%s — no new trade plans outside regular hours", session)
+            self._portfolio.snapshot_external_equity(equity)
+            self._audit.log_heartbeat(self._tick_count, equity)
+            self._publish_runtime_status(ts, session, equity, positions)
+            return
 
         # 10. 持仓监控：止损/止盈触发 → 生成 CLOSE 计划并立即执行
         if self._live_plans and model_bars:
@@ -963,6 +935,7 @@ class Runtime:
             return
 
         # 13. 仓位分配（EqualWeightAllocator 填 qty / target_weight）
+        pending_buy_notional: Dict[str, float] = {}
         try:
             pending_buy_notional = (
                 self._order_store.pending_buy_notional_by_symbol()
@@ -1301,14 +1274,15 @@ class Runtime:
                 0.0,
                 self._portfolio.positions,
             )
-            key = prepared_intent.idempotency_key
-            row = self._order_store.get_by_key(key)
-            if row is not None:
-                adjustment = self._position_adjustment_store.link_order(
-                    adjustment.adjustment_id,
-                    order_intent_id=str(row["intent_id"]),
-                    order_idempotency_key=key,
-                )
+            if prepared_intent is not None:
+                key = prepared_intent.idempotency_key
+                row = self._order_store.get_by_key(key)
+                if row is not None:
+                    adjustment = self._position_adjustment_store.link_order(
+                        adjustment.adjustment_id,
+                        order_intent_id=str(row["intent_id"]),
+                        order_idempotency_key=key,
+                    )
         return adjustment
 
     def _submit_pipeline_intent(
@@ -1455,7 +1429,15 @@ class Runtime:
                 logger.warning("get_order_status %s 失败: %s", broker_id, exc)
                 continue
             if status in (OrderStatus.FILLED, OrderStatus.PARTIAL):
-                fill = self._broker.get_fill(broker_id)
+                try:
+                    fill = self._broker.get_fill(broker_id)
+                except Exception as exc:
+                    # Do not mark this order done on a failed fill lookup —
+                    # leave it in _open_orders so the next tick retries.
+                    # Applying a fill or removing the order without one would
+                    # silently lose the fill (see get_fill's docstring note).
+                    logger.warning("get_fill %s 失败: %s", broker_id, exc)
+                    continue
                 if fill is not None:
                     fill.intent_id = intent.intent_id
                     cumulative_filled_qty = float(fill.filled_qty)
@@ -1499,6 +1481,16 @@ class Runtime:
                     self._live_plans.pop(fill.symbol, None)
                     self._monitor_plans.pop(fill.symbol, None)
                 if status == OrderStatus.FILLED:
+                    if fill is None:
+                        # Broker reports FILLED but has no fill details yet
+                        # (a benign race between status and fill endpoints) —
+                        # retry next tick instead of marking done without
+                        # ever having applied the fill.
+                        logger.warning(
+                            "%s status=FILLED but get_fill returned None — retry next tick",
+                            broker_id,
+                        )
+                        continue
                     adjustment_store = getattr(
                         self,
                         "_position_adjustment_store",
@@ -1575,12 +1567,64 @@ class Runtime:
         except Exception as exc:
             logger.warning("晨报发送失败: %s", exc)
 
+    def _fetch_and_cache_bars(
+        self, ts: datetime
+    ) -> tuple[Dict[str, list], Dict[str, Bar]]:
+        """Fetch latest bars per symbol and upsert them into the local cache.
+
+        Called every tick regardless of market session — this is data
+        acquisition for monitoring/display/research, not a trading decision.
+        Symbols with too few bars or a stale latest bar are simply omitted
+        from the returned maps (extended-hours liquidity is naturally
+        sparser, so gaps are expected, not an error).
+        """
+        raw_bars_map: Dict[str, list] = {}
+        model_bars: Dict[str, Bar] = {}
+        for symbol in self._cfg.symbols:
+            try:
+                raw = self._feed.fetch_bars(symbol, n_bars=self._cfg.bars_lookback)
+                if len(raw) < 30:
+                    logger.warning("%s: 仅 %d 根 K 线，跳过", symbol, len(raw))
+                    continue
+                latest_bar = _alpaca_bar_to_model(raw[-1], symbol, self._cfg.timeframe)
+                if not _latest_bar_is_fresh(latest_bar, self._cfg.timeframe, now=ts):
+                    logger.warning(
+                        "%s: stale latest bar %s — skip live decision",
+                        symbol, latest_bar.timestamp,
+                    )
+                    continue
+                raw_bars_map[symbol] = raw
+                rows = [
+                    {"timestamp_utc": b.timestamp,
+                     "open": b.open, "high": b.high, "low": b.low,
+                     "close": b.close, "volume": b.volume}
+                    for b in raw
+                ]
+                _dc_upsert(symbol, self._cfg.timeframe, pd.DataFrame(rows))
+                model_bars[symbol] = latest_bar
+            except Exception as exc:
+                logger.warning("fetch_bars %s 失败: %s", symbol, exc)
+        return raw_bars_map, model_bars
+
+    def _poll_news(self, ts: datetime) -> None:
+        """Poll and persist news every tick, independent of market session."""
+        news_sources = [
+            ("wscn", self._wscn, ts),
+            ("sec", self._sec, ts - timedelta(hours=20)),  # 8-K 可能盘前发
+            ("finnhub", self._finnhub, ts - timedelta(hours=4)),
+            ("price", self._price_news, ts),
+        ]
+        poll_all_sources(news_sources, self._news_store, now=ts)
+
     def _maybe_daily_review(self, ts: datetime) -> None:
-        """每日 21:00 UTC（≈ 美东 16:00）后触发一次复盘，当天只运行一次。"""
+        """每日美东 daily_review_hour_et 点（.env 可配置，默认 16）后触发一次复盘，当天只运行一次。"""
         today = ts.strftime("%Y-%m-%d")
         if today == self._last_review_date:
             return
-        if ts.hour < 21:
+        review_hour_et = ts.astimezone(ZoneInfo("America/New_York")).replace(
+            hour=self._cfg.daily_review_hour_et, minute=0, second=0, microsecond=0
+        )
+        if ts < review_hour_et.astimezone(timezone.utc):
             return
         self._last_review_date = today
         try:

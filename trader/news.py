@@ -5,7 +5,6 @@ news.py
   - WallStreetCNSource：华尔街见闻 7x24 快讯 API（全球/外汇/黄金等频道）。
   - SECEdgarSource：SEC EDGAR 8-K 实时申报流（无需 API key）。
   - FinnhubSource：Finnhub 公司新闻 API（需 FINNHUB_API_KEY，无 key 则静默跳过）。
-  - NewsSourceStub：占位，返回空列表。
 """
 from __future__ import annotations
 
@@ -16,7 +15,10 @@ import time as _time
 import urllib.request as _ur
 import xml.etree.ElementTree as _ET
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set
+from pathlib import Path
+from typing import Dict, List, Optional, Protocol, Set, Tuple
+
+import duckdb
 
 from .data_cache import get_bars
 from .models import NewsEvent, new_id, utc_now
@@ -400,8 +402,102 @@ class FinnhubSource:
         )
 
 
-class NewsSourceStub:
-    """占位实现，始终返回空列表。"""
+class NewsSource(Protocol):
+    def poll(self, since: datetime) -> List[NewsEvent]: ...
 
-    def poll(self, since: datetime) -> List[NewsEvent]:
-        return []
+
+class NewsEventStore:
+    """Durable, deduplicated storage for polled NewsEvent objects.
+
+    Previously every poll() result was fetched and immediately discarded —
+    no persistence, no UI, no downstream consumer. This gives news events a
+    real destination so `poll_all_sources` results are actually visible.
+    """
+
+    def __init__(self, db_path: str | Path) -> None:
+        self.db_path = str(db_path)
+        connection = duckdb.connect(self.db_path)
+        try:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS news_events (
+                    event_id TEXT PRIMARY KEY,
+                    kind TEXT,
+                    symbol TEXT,
+                    title TEXT,
+                    summary TEXT,
+                    url TEXT,
+                    severity DOUBLE,
+                    ts TIMESTAMPTZ,
+                    source TEXT,
+                    recorded_at TIMESTAMPTZ
+                )
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def record_batch(self, events: List[NewsEvent], *, recorded_at: datetime) -> int:
+        """Insert new events, silently skipping ones already recorded (by event_id).
+
+        Returns the number of events attempted (DuckDB's ON CONFLICT DO
+        NOTHING doesn't expose an affected-row count for plain INSERT), so
+        this is an upper bound on how many were actually new.
+        """
+        if not events:
+            return 0
+        connection = duckdb.connect(self.db_path)
+        try:
+            for event in events:
+                connection.execute(
+                    """
+                    INSERT INTO news_events VALUES (?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT (event_id) DO NOTHING
+                    """,
+                    [
+                        event.event_id,
+                        event.kind,
+                        event.symbol,
+                        event.title,
+                        event.summary,
+                        event.url,
+                        event.severity,
+                        event.ts,
+                        event.source,
+                        recorded_at,
+                    ],
+                )
+            connection.commit()
+        finally:
+            connection.close()
+        return len(events)
+
+
+def poll_all_sources(
+    sources: List[Tuple[str, NewsSource, datetime]],
+    store: Optional[NewsEventStore] = None,
+    *,
+    now: datetime,
+) -> List[NewsEvent]:
+    """Poll every (name, source, since) tuple, tolerating per-source failures.
+
+    A single failing source (e.g. Finnhub rate-limited) must not block the
+    others. Successfully polled events are persisted via `store` when given.
+    Callers should invoke this unconditionally every tick — these sources
+    are independent of market hours (SEC 8-K filings, wire news, and price
+    moves against the local bar cache can all happen pre/post market).
+    """
+    all_events: List[NewsEvent] = []
+    for name, source, since in sources:
+        try:
+            batch = source.poll(since=since)
+        except Exception as exc:
+            logger.warning("news.poll [%s] 失败: %s", name, exc)
+            continue
+        if batch:
+            logger.info("新闻 [%s]: %d 条", name, len(batch))
+        all_events.extend(batch)
+    if store is not None and all_events:
+        store.record_batch(all_events, recorded_at=now)
+    return all_events

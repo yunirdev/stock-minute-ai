@@ -80,7 +80,7 @@ Entrypoints:
 - data_hub_shadow.py: read-only real-source double-read quality runner
 - data_hub_replay.py: historical correctness evidence, separate from live quality
 - monitor_nice.py and monitor_data.py: UI and read models
-- operations_observability.py and discord_delivery.py: 31-action UI contracts,
+- operations_observability.py and discord_delivery.py: 17-action UI contracts,
   explainability, authorization, delivery, and audit evidence
 - operational_recovery.py and closed_loop_delivery.py: verified database
   recovery and frozen complete-loop delivery evidence
@@ -147,8 +147,9 @@ cleanup unless the task explicitly asks for it.
 - Connected the remaining evidence architecture to production callers: Runtime
   now freezes natural REAL maturity evidence, produces verified daily trade/AI
   DuckDB backups, and turns closed trade episodes into frozen reviews and
-  conservative strategy candidates. All 31 NiceGUI actions use durable
-  BUSY/SUCCESS/EMPTY/ERROR auditing, and every Discord send uses the central
+  conservative strategy candidates. All 24 active NiceGUI actions use durable
+  BUSY/SUCCESS/EMPTY/ERROR auditing; worker-backed actions stay BUSY until the
+  worker reaches its real terminal outcome. Every Discord send uses the central
   authorization, redaction, deduplication, and delivery-audit gateway.
 - Added the complete I-stage architecture: immutable scheduled Paper sessions
   prevent skipped failure days; 60-session REAL/SYNTHETIC maturity gates track
@@ -158,7 +159,7 @@ cleanup unless the task explicitly asks for it.
   requires 60 REAL sessions plus REAL resilience evidence and never authorizes
   live trading.
 - Added H-stage observability, notification, recovery, and frozen delivery
-  contracts. All 31 NiceGUI actions support SUCCESS/EMPTY/ERROR/BUSY audit
+  contracts. All 24 active NiceGUI actions support SUCCESS/EMPTY/ERROR/BUSY audit
   states; Discord external sends fail closed without authorization; DuckDB
   backups are hash/read-only verified; complete Paper evidence binds snapshot
   through strategy candidate. The activity page renders the latest order's
@@ -273,7 +274,7 @@ cleanup unless the task explicitly asks for it.
   worker results fail closed. Legacy item rows remain readable with empty links.
 - The current delivery target and acceptance contract now cover the complete
   Paper loop, quantitative/replay evidence, controlled strategy-candidate
-  iteration, and all 31 rendered NiceGUI button actions. D01 remains the next
+  iteration, and all 24 rendered NiceGUI button actions. D01 remains the next
   implementation task; A–C alone are not considered complete-loop delivery.
 - Accelerated Data Hub evidence now replays 20 historical sessions from the
   local research cache against fresh Alpaca daily bars in dedicated tables.

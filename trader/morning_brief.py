@@ -1,6 +1,6 @@
 """
 trader/morning_brief.py
-每日晨报 Discord 推送 — 美东时间 9:00 AM 前自动触发，发 4 条消息。
+每日晨报 Discord 推送 — 美东时间可配置小时自动触发（默认 9AM），发 4 条消息。
 
 消息 1 — 今日作战卡
   风险档位 · 建议仓位 · 开盘策略 · 事件风险 · 重点观察/谨慎标的
@@ -15,9 +15,9 @@ trader/morning_brief.py
   自选股盘前异动 · 模拟账户快照（权益/仓位/浮盈）
 
 调用方式：
-  runtime.py 每天美东 9AM 自动触发（UTC 13h 或 14h）
+  runtime.py 每天美东 MORNING_BRIEF_HOUR_ET 点（.env 可配置，默认 9）自动触发一次
   手动测试：uv run python -m trader.morning_brief
-  UI：系统 Tab → 「立即发送晨报」
+  UI：系统 Tab → Discord 推送 → 报告类型选「晨报」→ 发送
 """
 
 from __future__ import annotations
@@ -32,15 +32,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+from .config import settings
 from .models import Notification
 
 logger = logging.getLogger(__name__)
 
 _ROOT = Path(__file__).resolve().parents[1]
 _DB_PATH = str(_ROOT / "trade.duckdb")
-
-# 美东 9AM = UTC 13h (EDT夏令时) 或 14h (EST冬令时)
-_BRIEF_UTC_HOURS = {13, 14}
 
 try:
     _PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
@@ -155,7 +153,8 @@ _ALL_BATCH = (
 
 def should_send_brief(now_utc: datetime, last_date: Optional[str]) -> bool:
     today = now_utc.astimezone(_PACIFIC_TZ).strftime("%Y-%m-%d")
-    return now_utc.hour in _BRIEF_UTC_HOURS and today != last_date
+    now_et = now_utc.astimezone(_EASTERN_TZ)
+    return now_et.hour == settings.morning_brief_hour_et and today != last_date
 
 
 def send_morning_brief(

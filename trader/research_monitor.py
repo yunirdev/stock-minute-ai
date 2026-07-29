@@ -17,12 +17,14 @@ def daily_research_monitor(db_path: str) -> dict[str, Any]:
         return {"run": None, "items": []}
     try:
         con = duckdb.connect(str(source), read_only=True)
+    except Exception:
+        return {"run": None, "items": []}
+    try:
         tables = {
             str(row[0])
             for row in con.execute("SHOW TABLES").fetchall()
         }
         if "daily_research_runs" not in tables:
-            con.close()
             return {"run": None, "items": []}
         run_row = con.execute(
             """
@@ -34,7 +36,6 @@ def daily_research_monitor(db_path: str) -> dict[str, Any]:
             """
         ).fetchone()
         if run_row is None:
-            con.close()
             return {"run": None, "items": []}
         item_rows = con.execute(
             """
@@ -46,9 +47,10 @@ def daily_research_monitor(db_path: str) -> dict[str, Any]:
             """,
             [run_row[0]],
         ).fetchall()
-        con.close()
     except Exception:
         return {"run": None, "items": []}
+    finally:
+        con.close()
     run = {
         "run_id": run_row[0],
         "trading_date": run_row[1],

@@ -37,10 +37,12 @@ class HeartbeatWatchdog:
         try:
             import duckdb
             conn = duckdb.connect(self._db_path, read_only=True)
-            row = conn.execute(
-                "SELECT MAX(ts) FROM heartbeat"
-            ).fetchone()
-            conn.close()
+            try:
+                row = conn.execute(
+                    "SELECT MAX(ts) FROM heartbeat"
+                ).fetchone()
+            finally:
+                conn.close()
             if row and row[0]:
                 last_hb = row[0]
                 if isinstance(last_hb, str):
@@ -80,8 +82,14 @@ class FileKillSwitch:
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
             return bool(data.get("engaged", False))
-        except Exception:
-            return False
+        except Exception as exc:
+            # Fail closed: a state file that can't be read/parsed (corrupt,
+            # or caught mid-write by engage()) must NOT be treated as "not
+            # engaged" — that would silently defeat the emergency stop for
+            # as long as the corruption persists, with no alert. Prefer a
+            # false-positive halt over a false-negative "trading continues."
+            logger.error("KillSwitch 状态文件读取失败，按已激活处理: %s", exc)
+            return True
 
     def engage(self, reason: str = "手动急停") -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)

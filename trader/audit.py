@@ -301,15 +301,22 @@ class AuditLog:
         # Write to DuckDB (best-effort — may fail if another process holds the lock)
         try:
             conn = self._connect()
-            conn.execute("DELETE FROM heartbeat")
-            conn.execute(
-                "INSERT INTO heartbeat VALUES (?,?,?)",
-                [now, tick_count, equity],
-            )
-            conn.commit()
-            conn.close()
+            try:
+                conn.execute("DELETE FROM heartbeat")
+                conn.execute(
+                    "INSERT INTO heartbeat VALUES (?,?,?)",
+                    [now, tick_count, equity],
+                )
+                conn.commit()
+            finally:
+                conn.close()
         except Exception as _exc:
-            logger.debug("heartbeat DuckDB write skipped: %s", _exc)
+            # WARNING, not debug: HeartbeatWatchdog reads this table to detect a
+            # hung engine. A silent debug-level swallow here previously let the
+            # DuckDB write fail every tick for a full day undetected, while the
+            # watchdog kept firing CRITICAL staleness alerts against a table
+            # nobody could see was never being updated.
+            logger.warning("heartbeat DuckDB write skipped: %s", _exc)
         # Always write JSON sidecar — no file locking, readable by Streamlit
         try:
             _HEARTBEAT_FILE.write_text(

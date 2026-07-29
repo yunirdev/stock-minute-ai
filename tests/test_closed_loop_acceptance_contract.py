@@ -26,23 +26,16 @@ def test_nicegui_button_inventory_matches_acceptance_contract():
     contract = ACCEPTANCE.read_text(encoding="utf-8")
     calls = _button_calls()
     inline_handlers = sum(
-        any(keyword.arg == "on_click" for keyword in call.keywords)
-        for call in calls
+        any(keyword.arg == "on_click" for keyword in call.keywords) for call in calls
     )
     assigned_handlers = len(re.findall(r"\.on_click\(", source))
-    span_match = re.search(
-        r'_SPAN_OPTS\s*=\s*\[(?P<values>[^\]]+)\]',
-        source,
-    )
 
-    assert span_match is not None
-    span_actions = len(re.findall(r'"[^"]+"', span_match["values"]))
-    assert len(calls) == 26
-    assert inline_handlers == 11
-    assert assigned_handlers == 15
+    assert len(calls) == 16
+    assert inline_handlers == 7
+    assert assigned_handlers == 9
     assert inline_handlers + assigned_handlers == len(calls)
-    assert len(calls) - 1 + span_actions == 31
-    assert "31 个按钮动作" in contract
+    assert len(BUTTON_ACTIONS) == 17
+    assert "17 个按钮动作" in contract
     assert "实盘下单请改" not in source
     assert "自动实盘不受支持" in source
     assert 'os.getenv("QUANT_HOST", "127.0.0.1")' in source
@@ -50,19 +43,13 @@ def test_nicegui_button_inventory_matches_acceptance_contract():
     assert '@app.get("/api/ui-actions")' in source
     assert '@app.get("/api/order-explanation/{plan_id}")' in source
     assert "最新订单完整解释" in source
-    static_action_ids = {
-        action.action_id
-        for action in BUTTON_ACTIONS
-        if not action.action_id.startswith("overview.span_")
-    }
     assert all(
         re.search(
-            rf'_audited_callback\(\s*"{re.escape(action_id)}"',
+            rf'_audited_(?:job_)?callback\(\s*"{re.escape(action.action_id)}"',
             source,
         )
-        for action_id in static_action_ids
+        for action in BUTTON_ACTIONS
     )
-    assert 'f"overview.span_{_sl.lower()}"' in source
 
 
 def test_closed_loop_stages_and_next_task_are_authoritative():

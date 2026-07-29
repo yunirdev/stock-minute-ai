@@ -89,6 +89,12 @@ class Settings(BaseSettings):
     daily_research_close_minute_et: int = Field(
         15, validation_alias=AliasChoices('DAILY_RESEARCH_CLOSE_MINUTE_ET')
     )
+    morning_brief_hour_et: int = Field(
+        9, validation_alias=AliasChoices('MORNING_BRIEF_HOUR_ET')
+    )
+    daily_review_hour_et: int = Field(
+        16, validation_alias=AliasChoices('DAILY_REVIEW_HOUR_ET')
+    )
 
 
 # Loaded once at import — the one place .env is parsed for engine config.
@@ -191,6 +197,12 @@ class TradingConfig(BaseModel):
     )
     daily_research_close_minute_et: int = Field(
         default_factory=lambda: settings.daily_research_close_minute_et
+    )
+    morning_brief_hour_et: int = Field(
+        default_factory=lambda: settings.morning_brief_hour_et
+    )
+    daily_review_hour_et: int = Field(
+        default_factory=lambda: settings.daily_review_hour_et
     )
 
     def model_post_init(self, __context: object) -> None:

@@ -99,7 +99,6 @@ def rebuild_selection_pipeline(
     source: Iterable[str] | str | None = None,
     *,
     long_limit: int = 100,
-    weekly_limit: int = 25,
     daily_limit: int = DECISION_MAX_SIZE,
     decision_style: str = DECISION_STYLE_STANDARD,
     ai_db_path: Optional[str] = None,

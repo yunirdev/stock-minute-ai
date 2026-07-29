@@ -89,7 +89,8 @@ Without --auto-trade, plans are recorded as DRY_RUN. With it, qualifying plans a
    evidence after 20:00 ET. At the same cutoff it creates one idempotent,
    checksummed, read-verified backup of the trade and AI DuckDB files under
    `backups/YYYY-MM-DD/`; source databases are never overwritten.
-9. All 31 rendered NiceGUI actions use the durable action-audit gateway.
+9. All 24 rendered NiceGUI actions use the durable action-audit gateway;
+   worker-backed actions remain BUSY until their real outcome is known.
    Discord delivery is routed through one authorization/redaction/idempotency
    gateway and remains externally disabled unless
    `DISCORD_EXTERNAL_SEND_ENABLED=true` or an explicit UI/manual send is used.
