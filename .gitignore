@@ -45,6 +45,10 @@ archive/
 # Local tooling / generated package metadata
 .serena/
 *.egg-info/
+.claude/
+.coverage
+.coverage.*
+htmlcov/
 
 # External downloaded projects and binaries
 /github/
