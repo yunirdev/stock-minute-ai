@@ -131,8 +131,11 @@ def test_notifier_routes_authorized_send_through_audit(tmp_path, monkeypatch):
         lambda note: calls.append(note.title) or True,
     )
     note = Notification(title="Daily", body="ok", kind="review")
-    assert notifier.send(note) is True
-    assert notifier.send(note) is True
+    first = notifier.send(note)
+    assert first and first.status == "SENT"
+    # 第二次是幂等命中：仍然报告已送达，但不会再发一遍
+    second = notifier.send(note)
+    assert second and second.status == "SENT"
     assert calls == ["Daily"]
 
 
@@ -153,7 +156,7 @@ def test_notifier_fails_closed_without_external_authorization(
         "_send_webhook",
         lambda note: calls.append(note.title) or True,
     )
-    assert notifier.send(
-        Notification(title="Daily", body="ok", kind="review")
-    ) is False
+    outcome = notifier.send(Notification(title="Daily", body="ok", kind="review"))
+    assert not outcome
+    assert outcome.status == "BLOCKED"
     assert calls == []

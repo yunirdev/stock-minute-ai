@@ -75,12 +75,19 @@ class TestNotify:
         result = console_notifier.send(sample_notification)
         assert result is True
 
-    def test_discord_notifier_degrades_without_url(self, sample_notification):
+    def test_discord_notifier_reports_dry_run_without_url(self, sample_notification):
+        """没配 Discord 时必须如实说"没发出去"，不能报成功。
+
+        这个断言原来是 ``assert result is True``——把"降级到 console 打印"
+        当成了投递成功。监控台据此把"✓ 晨报已发送"显示给用户，而实际上一个
+        字都没离开这台机器。
+        """
         from trader.notify import DiscordNotifier
         # 显式传入三个空字符串，阻止从环境变量读取真实凭据（否则会真实发送到 Discord）
         n = DiscordNotifier(bot_token="", channel_id="", webhook_url="")
-        result = n.send(sample_notification)  # should fall back to console
-        assert result is True
+        result = n.send(sample_notification)
+        assert not result
+        assert result.status == "DRY_RUN"
 
 
 # ---------------------------------------------------------------------------

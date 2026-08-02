@@ -617,6 +617,14 @@ class Notification:
     kind: str = "info"                  # selection | plan | review | news | alert | info
     fields: Dict[str, Any] = field(default_factory=dict)
     plan_id: Optional[str] = None       # 若是计划推送，带 plan_id 支持审计追踪
+    #: 业务去重身份，例如 "morning_brief:1:2026-08-03"、"daily_review:2026-08-03"。
+    #:
+    #: 不填时推送层回退到"内容哈希"去重，那种方式只能挡住逐字节相同的重复。
+    #: 实测过一次教训：晨报在 31 秒内被推了两遍，四条里只有一条因为正文碰巧
+    #: 一字不差被挡下，其余三条因为行情数字动了几位就被当成新消息放行了。而
+    #: 且那次是两个进程各自持有内存里的"今天发过了"标记，落盘也救不了——只有
+    #: 业务身份能跨进程去重。报告类 builder 都应该填这个字段。
+    dedupe_key: Optional[str] = None
 
 
 @dataclass

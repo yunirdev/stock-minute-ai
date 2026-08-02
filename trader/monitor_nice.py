@@ -54,7 +54,7 @@ from trader.monitor_data import (  # noqa: E402
     live_alpaca_positions,
     latest_reconciliation,
     orders_df,
-    risk_events_df,
+    plan_risk_events_df,
     render_order_explanation_html,
     signals_df,
 )
@@ -168,6 +168,27 @@ def _audited_callback(action_id: str, callback):
             _ACTIVE_UI_ACTIONS.pop(action_id, None)
 
     return _wrapped
+
+
+def _push_result_html(label: str, outcome) -> str:
+    """把推送结果渲染成状态条。
+
+    以前只有"✓ 已发送 / ✗ 发送失败"两档，而 send() 在没配 Discord 时返回的
+    是 console 打印的结果（True），于是这里稳稳地显示绿色的"已发送"——用户
+    完全没法知道消息其实一个字都没发出去。现在三种非成功状态各有各的说法。
+    """
+    status = getattr(outcome, "status", "SENT" if outcome else "FAILED")
+    style = {
+        "SENT": ("#3fb950", f"✓ {label}已发送"),
+        "DRY_RUN": ("#d29922", f"⚠ {label}未发送：未配置 Discord，仅打印到本地日志"),
+        "BLOCKED": ("#d29922", f"⚠ {label}未发送：外发未授权"),
+        "FAILED": ("#f85149", f"✗ {label}发送失败"),
+    }.get(status, ("#f85149", f"✗ {label}发送失败（{status}）"))
+    color, text = style
+    detail = getattr(outcome, "detail", "")
+    if detail and status == "FAILED":
+        text += f"（{detail}）"
+    return f'<span style="color:{color}">{text}</span>'
 
 
 def _audited_job_callback(action_id: str, callback):
@@ -1320,6 +1341,7 @@ def _render_activity():
     risk_cols = [
         ("ts", "时间", "left"),
         ("symbol", "标的", "left"),
+        ("action", "动作", "center"),
         ("verdict", "裁决", "center"),
         ("reason", "原因", "left"),
     ]
@@ -1339,7 +1361,7 @@ def _render_activity():
         sig_e = ui.element("div")
     with ui.element("div").classes("qa-card"):
         ui.label("风控事件").classes("qa-card-title")
-        ui.label("risk_events").classes("qa-card-sub")
+        ui.label("plan_risk_events").classes("qa-card-sub")
         risk_t = _make_table(risk_cols)
         risk_e = ui.element("div")
     with ui.element("div").classes("qa-card"):
@@ -1381,7 +1403,7 @@ def _render_activity():
         _refresh_one(
             risk_t,
             risk_e,
-            risk_events_df(24),
+            plan_risk_events_df(24),
             risk_cols,
             {"ts": _fmt_time},
             "🛡️",
@@ -1457,7 +1479,10 @@ def _render_model_schedule_settings():
         _NUMERIC_ENV_FIELDS = [
             ("每日研究触发时（美东）", "DAILY_RESEARCH_CLOSE_HOUR_ET", settings.daily_research_close_hour_et, 0, 23),
             ("每日研究触发分", "DAILY_RESEARCH_CLOSE_MINUTE_ET", settings.daily_research_close_minute_et, 0, 59),
-            ("Runtime 轮询周期(分钟)", "AGENT_CYCLE_INTERVAL_MINUTES", settings.agent_cycle_interval_minutes, 1, None),
+            # AGENT_CYCLE_INTERVAL_MINUTES 这一项已移除：它是死配置，没有任何
+            # 代码读取它，但界面上却标着"Runtime 轮询周期(分钟)"，让人以为在
+            # 调引擎的 tick 频率。真正的轮询间隔是「系统」页的「间隔(秒)」
+            # （-> trader.main --interval -> TradingConfig.poll_interval_secs）。
             ("AI 采信阈值", "MIN_AI_SCORE", settings.min_ai_score, 0, 100),
             ("AI 证据最大有效期(分钟)", "AI_SCORE_MAX_AGE_MINUTES", settings.ai_score_max_age_minutes, 1, None),
             ("AI 最少贡献者数", "AI_MIN_CONTRIBUTORS", settings.ai_min_contributors, 1, None),
@@ -1679,11 +1704,7 @@ def _render_system():
                     from trader.morning_brief import send_morning_brief
 
                     ok = send_morning_brief(symbols=_system_symbols())
-                    _push_status.set_content(
-                        '<span style="color:#3fb950">✓ 晨报已发送</span>'
-                        if ok
-                        else '<span style="color:#f85149">✗ 晨报发送失败</span>'
-                    )
+                    _push_status.set_content(_push_result_html("晨报", ok))
                     return ok
                 except Exception as exc:
                     _push_status.set_content(
@@ -1699,11 +1720,7 @@ def _render_system():
                     from trader.manual_push import send_intraday_levels_push
 
                     ok = send_intraday_levels_push(_system_symbols())
-                    _push_status.set_content(
-                        '<span style="color:#3fb950">✓ 盘中 OR/VWAP 已发送</span>'
-                        if ok
-                        else '<span style="color:#f85149">✗ 盘中 OR/VWAP 发送失败</span>'
-                    )
+                    _push_status.set_content(_push_result_html("盘中 OR/VWAP", ok))
                     return ok
                 except Exception as exc:
                     _push_status.set_content(
@@ -1737,11 +1754,7 @@ def _render_system():
                         symbols=_system_symbols(),
                     )
                     ok = make_notifier(external_send_enabled=True).send(msg)
-                    _push_status.set_content(
-                        '<span style="color:#3fb950">✓ 复盘已发送</span>'
-                        if ok
-                        else '<span style="color:#f85149">✗ 复盘发送失败</span>'
-                    )
+                    _push_status.set_content(_push_result_html("复盘", ok))
                     return ok
                 except Exception as exc:
                     _push_status.set_content(
@@ -1760,11 +1773,7 @@ def _render_system():
                         _system_symbols(),
                         bias=str(review_bias_sel.value or "中性"),
                     )
-                    _push_status.set_content(
-                        '<span style="color:#3fb950">✓ 方向复盘已发送</span>'
-                        if ok
-                        else '<span style="color:#f85149">✗ 方向复盘发送失败</span>'
-                    )
+                    _push_status.set_content(_push_result_html("方向复盘", ok))
                     return ok
                 except Exception as exc:
                     _push_status.set_content(
@@ -1813,11 +1822,7 @@ def _render_system():
                     from trader.manual_push import send_stock_analysis_push
 
                     ok = send_stock_analysis_push(symbol)
-                    _push_status.set_content(
-                        '<span style="color:#3fb950">✓ 个股分析已发送</span>'
-                        if ok
-                        else '<span style="color:#f85149">✗ 个股分析发送失败</span>'
-                    )
+                    _push_status.set_content(_push_result_html("个股分析", ok))
                     return ok
                 except Exception as exc:
                     _push_status.set_content(
@@ -3350,9 +3355,10 @@ def _render_risk():
         except Exception:
             pass
 
-        # 风控事件 + 整体状态
+        # 风控事件（拒单）+ 整体状态 —— 只统计 verdict=BLOCKED 的裁决，
+        # 通过的评估不算"事件"
         try:
-            re = risk_events_df(24)
+            re = plan_risk_events_df(24, blocked_only=True)
             cnt = 0 if re.empty else len(re)
             k_events.set_text(str(cnt))
 
@@ -3372,24 +3378,19 @@ def _render_risk():
                     "✓ 过去 24h 无风控事件</div>"
                 )
             else:
-                _level_style = {
-                    "CRITICAL": "background:rgba(248,81,73,.18);color:#f85149",
-                    "WARNING": "background:rgba(210,153,34,.15);color:#d29922",
-                    "INFO": "color:var(--fg2)",
-                }
                 rows_html = ""
                 for _, row in re.iterrows():
-                    lvl = str(row.get("level", "INFO")).upper()
-                    style = _level_style.get(lvl, "color:var(--fg2)")
                     ts = _fmt_time(row.get("ts", ""))
-                    etype = str(row.get("event_type", ""))
-                    det = str(row.get("detail", ""))[:80]
+                    sym = str(row.get("symbol", ""))
+                    act = f"{row.get('side', '')} {row.get('action', '')}".strip()
+                    reason = str(row.get("reason", ""))[:80]
                     rows_html += (
-                        f'<tr style="{style};border-bottom:1px solid var(--border)">'
+                        '<tr style="background:rgba(248,81,73,.12);color:#f85149;'
+                        'border-bottom:1px solid var(--border)">'
                         f'<td style="padding:6px 8px;font-family:var(--mono);font-size:11px">{ts}</td>'
-                        f'<td style="padding:6px 8px;font-weight:600;font-size:11px">{lvl}</td>'
-                        f'<td style="padding:6px 8px;font-size:12px">{etype}</td>'
-                        f'<td style="padding:6px 8px;font-size:12px">{det}</td>'
+                        f'<td style="padding:6px 8px;font-weight:600;font-size:11px">{sym}</td>'
+                        f'<td style="padding:6px 8px;font-size:12px">{act}</td>'
+                        f'<td style="padding:6px 8px;font-size:12px">{reason}</td>'
                         f"</tr>"
                     )
                 events_area.set_content(f"""
@@ -3398,9 +3399,9 @@ def _render_risk():
                     <tr style="color:var(--fg3);font-size:11px;text-transform:uppercase;
                                letter-spacing:.04em;border-bottom:1px solid var(--border)">
                       <th style="text-align:left;padding:5px 8px">时间</th>
-                      <th style="text-align:left;padding:5px 8px">级别</th>
-                      <th style="text-align:left;padding:5px 8px">类型</th>
-                      <th style="text-align:left;padding:5px 8px">详情</th>
+                      <th style="text-align:left;padding:5px 8px">标的</th>
+                      <th style="text-align:left;padding:5px 8px">动作</th>
+                      <th style="text-align:left;padding:5px 8px">原因</th>
                     </tr>
                   </thead>
                   <tbody>{rows_html}</tbody>

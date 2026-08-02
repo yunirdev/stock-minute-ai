@@ -95,6 +95,8 @@ def build_daily_research_message(run: Any, items: list[Any]) -> Notification:
         body="\n".join(lines),
         kind="ai",
         fields=fields,
+        # 一个研究批次只播报一次。run_id 本身就是批次的唯一身份。
+        dedupe_key=f"daily_research:{getattr(run, 'run_id', '') or '—'}",
     )
 
 
@@ -164,6 +166,12 @@ def build_signal_report_message(report: Any) -> Notification:
             ),
         },
         plan_id=str(getattr(report, "plan_id", "") or ""),
+        # 信号状态机每次跃迁产生一个新版本，(signal_id, version) 就是这条播报
+        # 的天然身份——重试投递不会在频道里刷出第二条。
+        dedupe_key=(
+            f"signal:{getattr(report, 'signal_id', '')}"
+            f":{getattr(report, 'version', 0)}"
+        ),
     )
 
 

@@ -88,6 +88,13 @@ def test_morning_brief_keeps_four_messages_with_action_card(monkeypatch):
 
     assert len(msgs) == 4
     assert "今日交易作战卡" in msgs[0].title
+
+    # 四条各自声明独立的业务去重身份：2026-08-02 那次事故里，同一份晨报在 31
+    # 秒内推了两遍，靠内容哈希只挡住了正文碰巧一字不差的那一条。
+    keys = [m.dedupe_key for m in msgs]
+    assert all(keys), "晨报消息必须声明 dedupe_key，否则跨进程重复挡不住"
+    assert len(set(keys)) == 4, "四条消息的身份不能撞车"
+    assert all(k.startswith("morning_brief:") for k in keys)
     for text in (
         "方向倾向",
         "风险档位",

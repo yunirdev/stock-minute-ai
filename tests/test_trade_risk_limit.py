@@ -9,7 +9,7 @@ from trader.risk_engine import RiskEngine
 from trader.runtime import Runtime
 
 
-def _config(db_path: str) -> TradingConfig:
+def _config(db_path: str, *, allow_short: bool = False) -> TradingConfig:
     return TradingConfig(
         db_path=db_path,
         broker_type="alpaca_paper",
@@ -17,6 +17,7 @@ def _config(db_path: str) -> TradingConfig:
         risk=RiskConfig(
             max_position_pct=0.20,
             max_trade_risk_pct=0.005,
+            allow_short=allow_short,
         ),
     )
 
@@ -56,7 +57,10 @@ def test_trade_risk_at_configured_boundary_is_approved(tmp_path):
     ],
 )
 def test_trade_risk_above_limit_is_rejected(tmp_path, plan):
-    risk = RiskEngine(_config(str(tmp_path / "trade.duckdb")))
+    # A short-side plan must clear the separate allow_short gate before the
+    # trade-risk check this test targets even runs — enable it here so the
+    # SELL parametrization still isolates the risk-size check it's testing.
+    risk = RiskEngine(_config(str(tmp_path / "trade.duckdb"), allow_short=True))
 
     verdict = risk.evaluate_plan(plan, 100_000.0, {})
 

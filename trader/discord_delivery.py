@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +12,8 @@ from typing import Any
 import duckdb
 
 from .models import Notification
+
+logger = logging.getLogger(__name__)
 
 _SECRET_PATTERNS = (
     re.compile(r"(?i)(token|secret|api[_ -]?key)\s*[:=]\s*\S+"),
@@ -83,7 +86,19 @@ class DiscordDeliveryStore:
         dedupe_key: str,
         dry_run: bool,
         now: datetime,
+        allow_payload_drift: bool = False,
     ) -> dict[str, Any]:
+        """幂等投递。
+
+        allow_payload_drift 区分两种 dedupe_key 的语义：
+
+        - 内容哈希（默认 False）：key 由内容算出，内容变了 key 必然也变，所以
+          "同 key 不同内容"只可能是调用方传错或哈希碰撞，抛错是对的。
+        - 业务身份（True）：key 是"某天的某份报告"这种事实，同一份报告重算一
+          次，行情数字动几位、时间戳前进几秒都很正常。这里内容漂移是预期
+          的，命中即返回既有结果——幂等的定义本来就是"重复请求返回相同结
+          果"，而不是"重复请求报错"。
+        """
         if now.tzinfo is None or now.utcoffset() is None:
             raise ValueError("DISCORD_DELIVERY_TIME_TZ_REQUIRED")
         kind = message_kind.strip().upper()
@@ -106,7 +121,12 @@ class DiscordDeliveryStore:
         existing = self.get(delivery_id)
         if existing is not None:
             if existing["payload_hash"] != payload_hash:
-                raise ValueError("DISCORD_DELIVERY_DEDUPE_CONFLICT")
+                if not allow_payload_drift:
+                    raise ValueError("DISCORD_DELIVERY_DEDUPE_CONFLICT")
+                logger.info(
+                    "去重命中 %s（内容较上次有变化，按业务身份视为同一份，不重复推送）",
+                    delivery_id,
+                )
             return existing
         if dry_run:
             status, error = "DRY_RUN", ""

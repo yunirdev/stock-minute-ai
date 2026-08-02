@@ -184,7 +184,8 @@ def should_send_brief(now_utc: datetime, last_date: Optional[str]) -> bool:
 def send_morning_brief(
     symbols: List[str],
     db_path: str = _DB_PATH,
-) -> bool:
+) -> Any:
+    """发送晨报，返回汇总后的 DeliveryOutcome（真值语义 = 确实送达）。"""
     from .notify import DiscordNotifier
 
     # Both callers of send_morning_brief() — the "发送晨报" UI button and the
@@ -193,17 +194,20 @@ def send_morning_brief(
     # turned on). Not passing external_send_enabled=True here left every
     # brief silently BLOCKED behind the DISCORD_EXTERNAL_SEND_ENABLED gate,
     # unlike manual_push.py's send_intraday_levels_push() which does opt in.
+    from .notify import DeliveryOutcome, summarize
+
     notifier = DiscordNotifier(external_send_enabled=True)
     msgs = build_morning_brief(symbols=symbols, db_path=db_path)
-    ok = True
+    outcomes = []
     for msg in msgs:
         try:
-            ok = notifier.send(msg) and ok
+            outcomes.append(notifier.send(msg))
         except Exception as exc:
             logger.warning("晨报推送失败: %s", exc)
-            ok = False
-    logger.info("晨报推送完成，共 %d 条消息", len(msgs))
-    return ok
+            outcomes.append(DeliveryOutcome("FAILED", type(exc).__name__))
+    result = summarize(outcomes)
+    logger.info("晨报推送完成，共 %d 条消息，结果 %s", len(msgs), result.status)
+    return result
 
 
 def build_morning_brief(
@@ -220,6 +224,11 @@ def build_morning_brief(
     now = _now_pacific()
     date_str = now.strftime("%m/%d")
     wd_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now.weekday()]
+
+    # 去重身份用美东交易日：这是一份美股报告，"哪一天的晨报"该按交易日算。
+    # 四条消息各有各的身份，因为它们是四条独立的 Discord 消息，其中任何一条
+    # 重发都算重复。
+    brief_date = datetime.now(timezone.utc).astimezone(_EASTERN_TZ).strftime("%Y-%m-%d")
 
     # 批量拉行情（一次 HTTP 请求）
     company_symbols = _company_symbols(symbols)
@@ -260,6 +269,7 @@ def build_morning_brief(
         title=f"🎯 {date_str} {wd_cn} · 今日交易作战卡",
         body=action_text,
         kind="review",
+        dedupe_key=f"morning_brief:action:{brief_date}",
     )
 
     # ── 消息 2：市场依据 + 板块技术 ──────────────────────────────────────────
@@ -280,6 +290,7 @@ def build_morning_brief(
         title="📊 市场依据 · 指标计算",
         body=body2 or "市场依据暂不可用，请以开盘价格和账户风控为准。",
         kind="review",
+        dedupe_key=f"morning_brief:market:{brief_date}",
     )
 
     # ── 消息 3：事件 + 异常新闻/社交 ────────────────────────────────────────
@@ -306,6 +317,7 @@ def build_morning_brief(
         title="📅 事件风险 · 异常新闻",
         body=body3 or "暂无可确认的高优先级事件/新闻，请开盘前人工核对经济日历。",
         kind="news",
+        dedupe_key=f"morning_brief:events:{brief_date}",
     )
 
     # ── 消息 4：各股前瞻 + 盘前快照 + 账户 ────────────────────────────────
@@ -318,6 +330,7 @@ def build_morning_brief(
         title="📋 今日准备清单 · 各股前瞻",
         body=body4,
         kind="plan",
+        dedupe_key=f"morning_brief:checklist:{brief_date}",
     )
 
     return [msg1, msg2, msg3, msg4]

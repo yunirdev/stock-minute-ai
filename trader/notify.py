@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
@@ -27,6 +28,52 @@ from .models import Notification
 logger = logging.getLogger(__name__)
 
 _DISCORD_API = "https://discord.com/api/v10"
+
+
+@dataclass(frozen=True)
+class DeliveryOutcome:
+    """一次推送的结果。
+
+    真值语义是"内容真的送到 Discord 了"，所以 ``if notifier.send(x):`` 这类
+    既有写法继续可用，而且行为终于是对的：以前没配 token/webhook 时 send()
+    走 DRY_RUN 分支返回 console 打印的结果——也就是 True——于是监控台一路显
+    示"✓ 晨报已发送"，实际上一个字都没发出去。
+
+    需要区分"没发成功"和"根本没打算发"的调用方（比如要给用户显示不同颜色的
+    UI）读 status 即可。
+    """
+
+    status: str          # SENT | DRY_RUN | BLOCKED | FAILED
+    detail: str = ""
+
+    def __bool__(self) -> bool:
+        return self.status == "SENT"
+
+    @property
+    def delivered(self) -> bool:
+        return self.status == "SENT"
+
+
+#: 从"最该让用户知道"到"最不该"。汇总一批结果时按这个顺序取最严重的那个：
+#: 四条晨报里有一条失败，整体就不能报告成功。
+_SEVERITY = ("FAILED", "BLOCKED", "DRY_RUN", "SENT")
+
+
+def summarize(outcomes: Any) -> DeliveryOutcome:
+    """把一份多条消息的报告汇总成一个结果。
+
+    晨报是四条独立的 Discord 消息，manual_push 也可能一次发多条。调用方（尤
+    其是 UI）需要的是"这份报告到底送出去没有"，而 ``all(...)`` 只能给出真
+    假，说不清是没配置、被拦、还是真的发失败了。
+    """
+    items = [o for o in outcomes]
+    if not items:
+        return DeliveryOutcome("SENT", "NOTHING_TO_SEND")
+    worst = items[0]
+    for item in items:
+        if _SEVERITY.index(item.status) < _SEVERITY.index(worst.status):
+            worst = item
+    return worst
 
 
 class ConsoleNotifier:
@@ -77,12 +124,54 @@ class DiscordNotifier:
 
     # ── 公共入口 ─────────────────────────────────────────────────────────────
 
-    def send(self, note: Notification) -> bool:
+    def send(self, note: Notification) -> DeliveryOutcome:
         configured = bool((self._token and self._channel) or self._webhook)
         if not configured:
             logger.warning(
                 "Discord 未配置（无 BOT_TOKEN/CHANNEL_ID 也无 WEBHOOK_URL），降级 console"
             )
+        try:
+            result = DiscordDeliveryStore(
+                self._audit_db_path,
+                sender=_DiscordTransport(self),
+                external_send_enabled=self._external_send_enabled,
+            ).deliver(
+                note,
+                message_kind=note.kind or "system",
+                dedupe_key=self._dedupe_key(note),
+                dry_run=not configured,
+                now=datetime.now(timezone.utc),
+                # builder 声明了业务身份时，同一份报告重算带来的内容漂移是
+                # 预期的，命中即幂等返回，不该报冲突。
+                allow_payload_drift=bool(note.dedupe_key),
+            )
+        except Exception as exc:
+            logger.error(
+                "Discord 审计失败，禁止外发: %s",
+                type(exc).__name__,
+            )
+            if not configured:
+                self._console.send(note)
+            return DeliveryOutcome("FAILED", f"AUDIT_{type(exc).__name__}")
+
+        status = result["status"]
+        if status == "DRY_RUN":
+            # 打到日志里方便本地调试，但这不算送达——返回值必须如实说明，
+            # 否则监控台会把"没配 Discord"显示成"已发送"。
+            self._console.send(note)
+            return DeliveryOutcome("DRY_RUN", "DISCORD_NOT_CONFIGURED")
+        return DeliveryOutcome(status, str(result.get("error_code") or ""))
+
+    def _dedupe_key(self, note: Notification) -> str:
+        """优先用 builder 声明的业务身份，其次回退内容哈希。
+
+        内容哈希只能挡住逐字节相同的重复，对"同一天的同一份报告被算了两遍"
+        无能为力——两次计算之间行情动一下就是两个不同的哈希。业务身份（比如
+        ``morning_brief:1:2026-08-03``）才是真正想去重的东西，而且因为落在
+        审计库里，跨进程也有效。
+        """
+        if note.dedupe_key:
+            return f"{note.dedupe_key}|authorized={self._external_send_enabled}"
         payload_key = "|".join(
             (
                 note.kind,
@@ -93,28 +182,7 @@ class DiscordNotifier:
                 f"authorized={self._external_send_enabled}",
             )
         )
-        dedupe_key = hashlib.sha256(payload_key.encode()).hexdigest()
-        try:
-            result = DiscordDeliveryStore(
-                self._audit_db_path,
-                sender=_DiscordTransport(self),
-                external_send_enabled=self._external_send_enabled,
-            ).deliver(
-                note,
-                message_kind=note.kind or "system",
-                dedupe_key=dedupe_key,
-                dry_run=not configured,
-                now=datetime.now(timezone.utc),
-            )
-        except Exception as exc:
-            logger.error(
-                "Discord 审计失败，禁止外发: %s",
-                type(exc).__name__,
-            )
-            return self._console.send(note) if not configured else False
-        if result["status"] == "DRY_RUN":
-            return self._console.send(note)
-        return result["status"] == "SENT"
+        return hashlib.sha256(payload_key.encode()).hexdigest()
 
     def _send_configured(self, note: Notification) -> bool:
         """整形到 Discord 允许的尺寸后逐条发出。

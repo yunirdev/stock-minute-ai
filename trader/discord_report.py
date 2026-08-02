@@ -1,6 +1,9 @@
 ﻿"""
 trader/discord_report.py
-Discord 推送内容模板 — 面向新手用户，用大白话解释分析结果。
+Discord 推送内容模板 — 面向有经验的美股日内/波段交易者：直接给出 AI 的
+买入/卖出/观望结论和依据，不做模糊化处理；用户自行判断是否采纳。
+AI 结论不保证准确，仅供参考，但呈现方式必须诚实直接，不能为了"听起来
+不像投资建议"而把明确的看法说成模棱两可的话。
 
 ━━ 修改指南 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   改文案措辞  → 修改本文件中各 _TEXT / _LABEL 常量，或各 _build_* 函数里的字符串
@@ -13,12 +16,16 @@ Discord 推送内容模板 — 面向新手用户，用大白话解释分析结�
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
 from .models import Notification  # noqa: E402
+
+_ET = ZoneInfo("America/New_York")
 
 # ━━ 可调参数 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -28,10 +35,10 @@ MIN_SCORE_MENTION = 35  # 综合分低于此值的 AVOID 标的不单独推（�
 # ━━ 文案常量（改这里调整措辞）━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 _VERDICT_STYLE: Dict[str, tuple] = {
-    # verdict → (emoji, 一句话建议, Discord embed 颜色)
-    "BUY": ("🟢", "建议关注买入", 0x2ECC71),
-    "WATCHLIST": ("🟡", "可以持续观望", 0xF39C12),
-    "AVOID": ("🔴", "建议暂时回避", 0xE74C3C),
+    # verdict → (emoji, AI 结论原话, Discord embed 颜色)
+    "BUY": ("🟢", "买入", 0x2ECC71),
+    "WATCHLIST": ("🟡", "观望", 0xF39C12),
+    "AVOID": ("🔴", "卖出/回避", 0xE74C3C),
 }
 
 _SCORE_LABEL: List[tuple] = [
@@ -286,6 +293,7 @@ def build_daily_review_message(
     today: str,
     pnl: float,
     trade_count: int,
+    trades: Optional[List[dict]] = None,
     market_summary: str = "",
     symbols: Optional[List[str]] = None,
 ) -> Notification:
@@ -297,36 +305,38 @@ def build_daily_review_message(
         today          — 日期字符串 "2026-06-17"
         pnl            — 当日盈亏（USD）
         trade_count    — 当日成交笔数
+        trades         — 当日成交明细（[{symbol, side, qty, price, time}, ...]），
+                         用于按标的拆盈亏，不传则跳过这部分
         market_summary — 市场简评（可选）
         symbols        — 关注的股票列表，用于获取财报日期（可选）
     """
     # ── 盈亏 ─────────────────────────────────────────────────────────────────
     if pnl > 0:
-        pnl_line = f"📈 今天盈利 **+${pnl:,.2f}**，不错！"
+        pnl_line = f"📈 今天盈利 **+${pnl:,.2f}**"
     elif pnl < 0:
-        pnl_line = f"📉 今天亏损 **${pnl:,.2f}**，注意控制风险。"
+        pnl_line = f"📉 今天亏损 **${pnl:,.2f}**"
     else:
-        pnl_line = "➡️ 今天持平，继续观察。"
+        pnl_line = "➡️ 今天持平"
 
     lines = [pnl_line, ""]
 
     if trade_count:
         lines.append(f"今日共成交 **{trade_count}** 笔订单。")
     else:
-        lines.append("今日无成交，系统处于观察模式。")
+        lines.append("今日无成交。")
 
     if market_summary:
         lines += ["", "**今日市场简评：**", f"> {_trunc(market_summary, 200)}"]
+
+    # ── 按标的拆分净现金流（买卖净额，非考虑持仓成本的完整已实现盈亏）────────
+    attribution_block = _build_trade_attribution(trades or [])
+    if attribution_block:
+        lines += ["", attribution_block]
 
     # ── 近期高波动事件预警 ────────────────────────────────────────────────────
     event_block = _build_event_warning(symbols)
     if event_block:
         lines += ["", event_block]
-
-    lines += [
-        "",
-        "📌 有新信号时会第一时间推送到这里，请留意。",
-    ]
 
     pnl_str = f"+${pnl:,.2f}" if pnl >= 0 else f"-${abs(pnl):,.2f}"
     return Notification(
@@ -337,7 +347,57 @@ def build_daily_review_message(
             "今日盈亏": pnl_str,
             "成交笔数": str(trade_count),
         },
+        # 一天一份复盘。盘后重跑（比如手动补发）算出的盈亏可能因为晚到的成交
+        # 而略有变化，但那仍然是"同一天的复盘"，不该在频道里出现第二条。
+        dedupe_key=f"daily_review:{today}",
     )
+
+
+def _build_trade_attribution(trades: List[dict]) -> str:
+    """按标的汇总买卖净现金流，让复盘能看出今天是哪几只标的在赚/在亏，
+    而不只是一个总数。这是买卖净额（卖出金额 - 买入金额），不是扣除持仓
+    成本后的完整已实现盈亏——标的还有未平仓部分时，净现金流会是负的
+    （买入付出的钱还没算上未来卖出/当前市值），这里如实按方向展示，
+    不假装是精确的已实现盈亏。"""
+    if not trades:
+        return ""
+
+    per_symbol: Dict[str, Dict[str, float]] = {}
+    for t in trades:
+        sym = t.get("symbol")
+        if not sym:
+            continue
+        side = str(t.get("side", "")).upper()
+        try:
+            qty = float(t.get("qty") or 0.0)
+            price = float(t.get("price") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        notional = qty * price
+        bucket = per_symbol.setdefault(sym, {"buy": 0.0, "sell": 0.0, "fills": 0})
+        if side == "SELL":
+            bucket["sell"] += notional
+        else:
+            bucket["buy"] += notional
+        bucket["fills"] += 1
+
+    if not per_symbol:
+        return ""
+
+    rows = sorted(
+        per_symbol.items(),
+        key=lambda kv: kv[1]["sell"] - kv[1]["buy"],
+        reverse=True,
+    )
+    lines = ["**按标的净现金流（卖出 − 买入，非扣成本后已实现盈亏）：**"]
+    for sym, b in rows:
+        net = b["sell"] - b["buy"]
+        sign = "+" if net >= 0 else "-"
+        lines.append(
+            f"　{sym}：{sign}${abs(net):,.2f}"
+            f"（买入 ${b['buy']:,.2f} / 卖出 ${b['sell']:,.2f} / {int(b['fills'])} 笔）"
+        )
+    return "\n".join(lines)
 
 
 def _build_event_warning(symbols: Optional[List[str]] = None) -> str:
@@ -357,17 +417,22 @@ def _build_event_warning(symbols: Optional[List[str]] = None) -> str:
     _DAYS_BY_IMPACT = {"critical": 7, "high": 5, "medium": 3}
 
     try:
-        from .calendar_events import get_upcoming_events, IMPACT_EMOJI
+        from .calendar_events import get_upcoming_events_with_status, IMPACT_EMOJI
 
-        events = get_upcoming_events(symbols=symbols, days=7)
+        result = get_upcoming_events_with_status(symbols=symbols, days=7)
     except Exception as exc:
         logger.warning("获取事件日历失败: %s", exc)
-        return ""
+        return (
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚠️ **事件日历拉取失败**：本次复盘没有近期事件数据，不代表没有事件。\n"
+            f"错误：{type(exc).__name__}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
 
-    if not events:
-        return ""
-
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    events = result.events
+    now_utc = datetime.now(timezone.utc)
+    now_et = now_utc.astimezone(_ET)
+    today_str = now_et.strftime("%Y-%m-%d")
 
     # 按天分组
     by_date: dict[str, list] = {}
@@ -383,16 +448,32 @@ def _build_event_warning(symbols: Optional[List[str]] = None) -> str:
         ).days
         if days_away < 0 or days_away > max_days:
             continue
+        if days_away == 0 and _event_already_passed(e.time_str, now_et):
+            continue  # 今天已经发生过的事件，别当"即将到来"提醒
         by_date.setdefault(e.date, []).append(e)
         shown += 1
 
-    if not by_date:
-        return ""
+    source_warning = ""
+    if result.has_source_issue or result.has_partial_source_issue:
+        source_warning = (
+            "⚠️ 部分/全部经济事件数据源不可用（"
+            + (result.warning_text or "未知原因")
+            + "），下面的事件列表可能不完整。"
+        )
 
-    parts = [
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "🚨 **近期高波动事件预警（可能影响交易）**",
-    ]
+    if not by_date:
+        if not source_warning:
+            return ""
+        return (
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            + source_warning
+            + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+
+    parts = ["━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+    if source_warning:
+        parts.append(source_warning)
+    parts.append("🚨 **近期高波动事件预警（可能影响交易）**")
 
     for date_str in sorted(by_date.keys()):
         label = _date_label(date_str, today_str)
@@ -406,6 +487,17 @@ def _build_event_warning(symbols: Optional[List[str]] = None) -> str:
 
     parts.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     return "\n".join(parts)
+
+
+def _event_already_passed(time_str: str, now_et: datetime) -> bool:
+    """今天的事件，如果标注了具体 ET 时间且已经过去，就不再当'即将到来'提醒。
+    没有具体时间（盘前/盘后/待定/All Day）时保守起见仍然显示。"""
+    match = re.search(r"(\d{1,2}):(\d{2})", str(time_str or ""))
+    if not match:
+        return False
+    hour, minute = int(match.group(1)), int(match.group(2))
+    event_dt = now_et.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return now_et > event_dt
 
 
 def _date_label(date_str: str, today_str: str) -> str:
