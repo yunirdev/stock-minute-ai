@@ -24,6 +24,42 @@ logger = logging.getLogger(__name__)
 _DEFAULT_DB = str(Path(__file__).resolve().parents[2] / "trade.duckdb")
 
 
+def _default_period_label(period_hours: int) -> str:
+    """按周期粒度生成去重身份：周报按 ISO 周，日报按日期。"""
+    now = datetime.now(timezone.utc)
+    if period_hours >= 24 * 7:
+        year, week, _ = now.isocalendar()
+        return f"{year}-W{week:02d}"
+    return now.strftime("%Y-%m-%d")
+
+
+def should_send_weekly_report(
+    now_utc: datetime,
+    last_sent_label: str | None,
+    *,
+    weekday: int = 4,      # 0=周一 … 4=周五
+    hour_et: int = 16,
+    minute_et: int = 30,
+) -> bool:
+    """周五收盘后发一次策略体检。
+
+    和开盘确认一样用"到点之后 + 窗口"而不是精确匹配某一分钟——引擎重启或数
+    据源卡顿都可能刚好跳过那一分钟，那样这一周的体检就再也不会发了。
+    """
+    from zoneinfo import ZoneInfo
+
+    et = now_utc.astimezone(ZoneInfo("America/New_York"))
+    year, week, _ = et.isocalendar()
+    label = f"{year}-W{week:02d}"
+    if label == last_sent_label:
+        return False
+    if et.weekday() != weekday:
+        return False
+    minutes = et.hour * 60 + et.minute
+    start = hour_et * 60 + minute_et
+    return start <= minutes < start + 180
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 公共入口
 # ═══════════════════════════════════════════════════════════════════════════
@@ -32,10 +68,16 @@ def run_maintenance(
     db_path: str = _DEFAULT_DB,
     period_hours: int = 24,
     send_discord: bool = False,
+    period_label: str = "",
 ) -> TeamOutput:
-    """运行 T5 维护分析，返回 TeamOutput。"""
+    """运行 T5 维护分析，返回 TeamOutput。
+
+    period_label 用作推送的去重身份（例如 "2026-W31"），让周五自动触发的周
+    报和当天手动点一次"运行维护分析"落在同一条消息上，不会推两遍。
+    """
     out = TeamOutput(team="T5")
     t0 = time.time()
+    period_label = period_label or _default_period_label(period_hours)
     try:
         stats = _compute_stats(db_path, period_hours)
         anomalies = _detect_anomalies(db_path, period_hours)
@@ -47,7 +89,9 @@ def run_maintenance(
         out.data["period_hours"] = period_hours
 
         if send_discord:
-            _send_discord_report(stats, anomalies, suggestions)
+            _send_discord_report(
+                stats, anomalies, suggestions, period_label=period_label
+            )
 
         _persist_suggestions(db_path, suggestions)
 
@@ -82,15 +126,33 @@ def _compute_stats(db_path: str, period_hours: int) -> Dict[str, Any]:
         con = duckdb.connect(db_path, read_only=True)
 
         # 成交统计
+        # 之前这里查询用的列名 filled_at 在 fills 表里根本不存在（真实列名
+        # 是 fill_time），SQL 每次都直接报错，被下面的 bare except 吞掉——
+        # 每一份维护日报里的"成交次数"因此永远是 0，不管实际交易了多少笔。
         try:
             fills = con.execute(
-                "SELECT side, filled_qty, avg_price FROM fills WHERE filled_at >= ? ",
+                "SELECT symbol, side, filled_qty, avg_price FROM fills WHERE fill_time >= ? ",
                 [since],
             ).fetchdf()
             if not fills.empty:
                 stats["trade_count"] = len(fills)
-        except Exception:
-            pass
+                per_symbol: Dict[str, Dict[str, float]] = {}
+                for _, row in fills.iterrows():
+                    sym = row["symbol"]
+                    notional = float(row["filled_qty"]) * float(row["avg_price"])
+                    bucket = per_symbol.setdefault(sym, {"buy": 0.0, "sell": 0.0})
+                    if str(row["side"]).upper() == "SELL":
+                        bucket["sell"] += notional
+                    else:
+                        bucket["buy"] += notional
+                if per_symbol:
+                    # win_rate 是"卖出净现金流为正的标的数 / 有成交的标的数"，
+                    # 不是逐笔已实现盈亏（fills 表没有成本基础，算不出真正
+                    # 的逐笔盈亏）——比之前硬编码永远 0.0 诚实，但仍是近似值。
+                    wins = sum(1 for b in per_symbol.values() if b["sell"] - b["buy"] > 0)
+                    stats["win_rate"] = round(wins / len(per_symbol), 4)  # 0-1 分数，跟下面 *100 的展示逻辑保持一致
+        except Exception as exc:
+            logger.warning("T5 stats: fills 查询失败: %s", exc)
 
         # 权益快照（最大回撤）
         try:
@@ -155,26 +217,34 @@ def _detect_anomalies(db_path: str, period_hours: int) -> List[Dict[str, Any]]:
         except Exception:
             pass
 
-        # 异常2：风控熔断事件
+        # 异常2：风控拒单事件
+        # 原查询用的是 risk_events 表 + level='critical'，但 risk_events
+        # 从来没有任何代码写入过（log_risk_event() 是死代码），且这张表
+        # 根本没有 level 列——查询必报错，被 bare except 吞掉，这个异常
+        # 检测永远不会触发。Runtime 实际写风控裁决用的是 plan_risk_events
+        # 表（verdict='BLOCKED' 表示被拒），改用这张表。
         try:
-            risk_halts = con.execute(
-                "SELECT COUNT(*) FROM risk_events WHERE level='critical' AND ts >= ?",
+            risk_blocks = con.execute(
+                "SELECT COUNT(*) FROM plan_risk_events WHERE verdict='BLOCKED' AND ts >= ?",
                 [since],
             ).fetchone()
-            if risk_halts and risk_halts[0] > 0:
+            if risk_blocks and risk_blocks[0] > 0:
                 anomalies.append({
-                    "type": "risk_halt",
-                    "severity": "critical",
-                    "message": f"过去 {period_hours}h 发生 {risk_halts[0]} 次风控熔断",
-                    "value": risk_halts[0],
+                    "type": "risk_blocks",
+                    "severity": "high",
+                    "message": f"过去 {period_hours}h 有 {risk_blocks[0]} 个计划被风控拒绝",
+                    "value": risk_blocks[0],
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("T5 anomaly: 风控事件查询失败: %s", exc)
 
-        # 异常3：高频下单（同一标的在 5 分钟内多次下单）
+        # 异常3：高频下单（同一标的在窗口内多次下单）
+        # order_intents 没有 created_at 列（真实列名是 submitted_at），
+        # 同样一直静默失败——这个本该用来抓"失控疯狂下单"的检测从写出来
+        # 就没生效过。
         try:
             orders = con.execute(
-                "SELECT symbol, COUNT(*) as cnt FROM order_intents WHERE created_at >= ? "
+                "SELECT symbol, COUNT(*) as cnt FROM order_intents WHERE submitted_at >= ? "
                 "GROUP BY symbol HAVING COUNT(*) > 5",
                 [since],
             ).fetchdf()
@@ -185,8 +255,8 @@ def _detect_anomalies(db_path: str, period_hours: int) -> List[Dict[str, Any]]:
                     "message": f"{row['symbol']} 在窗口内提交了 {row['cnt']} 次订单",
                     "value": int(row["cnt"]),
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("T5 anomaly: 订单频率查询失败: %s", exc)
 
         con.close()
     except Exception as exc:
@@ -243,6 +313,7 @@ def _send_discord_report(
     stats: Dict[str, Any],
     anomalies: List[Dict[str, Any]],
     suggestions: List[Dict[str, Any]],
+    period_label: str = "",
 ) -> None:
     try:
         from trader.notify import DiscordNotifier
@@ -271,13 +342,33 @@ def _send_discord_report(
         else:
             sug_lines = "  无建议"
 
+        win_rate = stats.get("win_rate", 0) * 100
         body = (
-            f"盈亏: {pnl_str}  |  最大回撤: {dd:.2f}%  |  成交次数: {trades}\n"
+            f"盈亏: {pnl_str}  |  最大回撤: {dd:.2f}%  |  成交次数: {trades}"
+            f"  |  胜率: {win_rate:.1f}%\n"
             f"异常检测:\n{anom_lines}\n"
             f"整改建议:\n{sug_lines}"
         )
-        notifier = DiscordNotifier()
-        notifier.send(Notification(title="T5 维护日报", body=body, kind="system"))
+        # This is a user-triggered "运行维护分析" + "发送 Discord" action, same
+        # authorization tier as the other manual push buttons — without this
+        # flag the send is silently BLOCKED behind the
+        # DISCORD_EXTERNAL_SEND_ENABLED gate (see morning_brief.py / runtime.py).
+        notifier = DiscordNotifier(external_send_enabled=True)
+        notifier.send(
+            Notification(
+                title=f"🔧 周报 · 策略体检（近 {period_label}）",
+                body=body,
+                kind="system",
+                fields={
+                    "成交": str(trades),
+                    "胜率": f"{win_rate:.1f}%",
+                    "最大回撤": f"{dd:.2f}%",
+                },
+                # 一周一份。自动触发和手动点击落在同一个身份上，所以周五下午
+                # 手动跑一次维护不会和自动周报重复推送。
+                dedupe_key=f"maintenance:{period_label}",
+            )
+        )
     except Exception as exc:
         logger.warning("Discord 报告发送失败: %s", exc)
 

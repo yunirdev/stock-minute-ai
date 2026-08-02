@@ -184,6 +184,7 @@ def should_send_brief(now_utc: datetime, last_date: Optional[str]) -> bool:
 def send_morning_brief(
     symbols: List[str],
     db_path: str = _DB_PATH,
+    auto_trade: Optional[bool] = None,
 ) -> Any:
     """发送晨报，返回汇总后的 DeliveryOutcome（真值语义 = 确实送达）。"""
     from .notify import DiscordNotifier
@@ -197,7 +198,9 @@ def send_morning_brief(
     from .notify import DeliveryOutcome, summarize
 
     notifier = DiscordNotifier(external_send_enabled=True)
-    msgs = build_morning_brief(symbols=symbols, db_path=db_path)
+    msgs = build_morning_brief(
+        symbols=symbols, db_path=db_path, auto_trade=auto_trade
+    )
     outcomes = []
     for msg in msgs:
         try:
@@ -213,6 +216,7 @@ def send_morning_brief(
 def build_morning_brief(
     symbols: List[str],
     db_path: str = _DB_PATH,
+    auto_trade: Optional[bool] = None,
 ) -> List[Notification]:
     """组装 4 条 Notification，不实际推送，方便测试。
 
@@ -337,7 +341,12 @@ def build_morning_brief(
     premarket_text = _build_premarket_section(symbols, movers=premarket_movers)
     status_text = _build_status_section(db_path, movers=premarket_movers)
 
-    body4 = _join([catalysts_text, premarket_text, status_text])
+    carryover_text = _build_carryover_section(db_path)
+    automation_text = _build_automation_notice(auto_trade)
+
+    body4 = _join(
+        [carryover_text, automation_text, catalysts_text, premarket_text, status_text]
+    )
     msg4 = Notification(
         title="📋 今日准备清单 · 各股前瞻",
         body=body4,
@@ -2751,6 +2760,79 @@ def _safe_float(value: Any) -> Optional[float]:
         return float(value)
     except Exception:
         return None
+
+
+def _build_carryover_section(db_path: str) -> str:
+    """昨日承接 —— 读者醒来第一件事是"我手上还有什么"。
+
+    晨报此前只报当前权益和持仓市值，但没说这些仓位的止损止盈挂在哪里，也没说
+    昨天挂出去的计划还有几个活着。这两件事恰恰决定了开盘前要不要先处理点什
+    么，而不是从零开始看今天的机会。
+    """
+    lines: List[str] = []
+
+    try:
+        from .signal_reports import SignalState, SignalStore
+
+        store = SignalStore(db_path)
+        active = store.active()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("承接信息读取失败: %s", exc)
+        return ""
+
+    holding = [
+        r for r in active
+        if getattr(r, "state", None) in (SignalState.ENTERED, SignalState.HOLD)
+    ]
+    waiting = [r for r in active if getattr(r, "state", None) == SignalState.READY]
+
+    if holding:
+        lines.append("**持仓的止损/止盈位**")
+        for report in holding[:8]:
+            lines.append(
+                f"• {report.symbol}　止损 ${report.stop_loss:,.2f}"
+                f"　止盈 ${report.take_profit:,.2f}"
+            )
+    if waiting:
+        lines.append("**仍在等待的计划**")
+        for report in waiting[:8]:
+            valid = getattr(report, "valid_until", None)
+            expiry = f"（有效至 {valid:%m/%d %H:%M UTC}）" if valid else ""
+            lines.append(
+                f"• {report.symbol}　入场区间 ${report.entry_low:,.2f}"
+                f"–${report.entry_high:,.2f}{expiry}"
+            )
+    if not lines:
+        return ""
+    return "**🔄 昨日承接**\n" + "\n".join(lines)
+
+
+def _build_automation_notice(auto_trade: Optional[bool] = None) -> str:
+    """今天引擎会自动做什么。
+
+    这套系统在 auto_trade_paper 打开时会自行下单。读者有权在开盘前就知道它今
+    天打算怎么动，而不是等成交回报到了才发现——尤其当他自己也可能手动操作同
+    一个账户时。
+
+    auto_trade 由调用方传入（它在 TradingConfig 上，晨报模块本身拿不到）。传
+    None 时退而读环境变量；连环境变量都没有就整节不显示——宁可不说，也不能显
+    示一个可能与实际相反的自动化状态。
+    """
+    if auto_trade is None:
+        raw = os.getenv("AUTO_TRADE_PAPER", "").strip().lower()
+        if raw not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+            return ""
+        auto_trade = raw in {"1", "true", "yes", "on"}
+    if not auto_trade:
+        return (
+            "**🤖 今日自动化**\n"
+            "自动交易已关闭，引擎只做监控与播报，不会自行下单。"
+        )
+    return (
+        "**🤖 今日自动化**\n"
+        "自动交易已开启（模拟盘）：引擎会在常规时段按计划自行挂单，"
+        "并按各计划的止损/止盈自动离场。每一笔成交都会推送。"
+    )
 
 
 def _build_status_section(db_path: str, movers: Optional[List[dict]] = None) -> str:

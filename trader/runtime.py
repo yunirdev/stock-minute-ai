@@ -303,6 +303,7 @@ class Runtime:
         #: 已算好、等着和研究批次合并的复盘（见 close_report 的两阶段说明）
         self._pending_close_report = None
         self._last_open_confirm_date: Optional[str] = None
+        self._last_weekly_report_label: Optional[str] = None
         self._brief_calls = BriefCallStore(config.db_path)
         self._last_brief_date: Optional[str] = None
 
@@ -829,6 +830,9 @@ class Runtime:
 
         # 6e. 开盘确认（开盘满 15 分钟后一次）——晨报的回执
         self._maybe_open_confirmation(ts)
+
+        # 6f. 周报（周五收盘后一次）——策略体检
+        self._maybe_weekly_report(ts)
 
         # 7. 市场时段判断
         session = self._calendar.session_now()
@@ -1660,6 +1664,32 @@ class Runtime:
         except Exception as exc:  # noqa: BLE001 - 播报失败不能影响交易主流程
             logger.debug("信号播报失败: %s", exc)
 
+    def _maybe_weekly_report(self, ts: datetime) -> None:
+        """周五收盘后推一次策略体检（胜率/回撤/异常/调参建议）。
+
+        T5 维护分析一直只能从监控台手点。一份"我的策略到底行不行"的报告如果
+        要靠人记得去点，实际上就等于没有。
+        """
+        from .teams.maintenance import should_send_weekly_report
+
+        if not should_send_weekly_report(ts, self._last_weekly_report_label):
+            return
+        try:
+            from .teams.maintenance import run_maintenance
+
+            et = ts.astimezone(ZoneInfo("America/New_York"))
+            year, week, _ = et.isocalendar()
+            label = f"{year}-W{week:02d}"
+            run_maintenance(
+                db_path=self._cfg.db_path,
+                period_hours=24 * 7,
+                send_discord=True,
+                period_label=label,
+            )
+            self._last_weekly_report_label = label
+        except Exception as exc:  # noqa: BLE001 - 周报失败不能影响交易主流程
+            logger.warning("周报推送失败: %s", exc)
+
     def _maybe_open_confirmation(self, ts: datetime) -> None:
         """开盘 15 分钟后对账晨报给的关键触发位，判定今天走哪套剧本。"""
         from .open_confirmation import (
@@ -1747,6 +1777,9 @@ class Runtime:
             send_morning_brief(
                 symbols=list(self._cfg.symbols),
                 db_path=self._cfg.db_path,
+                # 引擎知道自己今天会不会自行下单，晨报模块不知道——显式传进
+                # 去，读者才能在开盘前看到准确的自动化状态。
+                auto_trade=bool(getattr(self._cfg, "auto_trade_paper", False)),
             )
             self._last_brief_date = ts.strftime("%Y-%m-%d")
         except Exception as exc:
