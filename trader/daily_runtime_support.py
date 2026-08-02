@@ -20,7 +20,18 @@ logger = logging.getLogger(__name__)
 class DailyRuntimeSupport:
     """Own the background daily batch without exposing broker access to agents."""
 
-    def __init__(self, config: Any, universe: Iterable[str]) -> None:
+    def __init__(
+        self,
+        config: Any,
+        universe: Iterable[str],
+        *,
+        on_error: Any = None,
+    ) -> None:
+        # on_error(error_code, summary) —— 由 runtime 注入，用来把研究批次的
+        # 故障送到读者眼前。这里刻意不直接依赖 notifier：这个类的职责是"在后
+        # 台跑研究批次且不把券商访问权暴露给 agent"，塞一个推送客户端进来会
+        # 让它多担一份不属于自己的责任。
+        self._on_error = on_error
         self.enabled = bool(getattr(config, "daily_research_enabled", True))
         self.max_age_hours = float(
             getattr(config, "daily_research_max_age_hours", 36.0)
@@ -67,11 +78,32 @@ class DailyRuntimeSupport:
                     completed.completed_symbols,
                     completed.failed_symbols,
                 )
+                # 批次跑完但一个标的都没成功 == 明天没有可用的研究结论，
+                # 这值得读者知道，而不是等到第二天发现收盘报告里空空如也。
+                if completed.completed_symbols == 0 and completed.failed_symbols:
+                    self._notify_error(
+                        "DAILY_RESEARCH_ALL_FAILED",
+                        f"研究批次 {completed.run_id} 的 "
+                        f"{completed.failed_symbols} 个标的全部失败，"
+                        "明日没有可用的深度研究结论。",
+                    )
             if self.worker.start_if_due(now):
                 logger.info("Daily TradingAgents research batch started")
         except Exception as exc:
             logger.error("Daily research scheduler failed: %s", exc)
+            self._notify_error(
+                "DAILY_RESEARCH_SCHEDULER_FAILED",
+                f"研究批次调度失败（{type(exc).__name__}）：{exc}",
+            )
         return self.latest_run
+
+    def _notify_error(self, code: str, summary: str) -> None:
+        if self._on_error is None:
+            return
+        try:
+            self._on_error(code, summary)
+        except Exception as exc:  # noqa: BLE001 - 告警失败不能反过来打断调度
+            logger.debug("研究故障告警失败: %s", exc)
 
     def snapshots(self, now: datetime):
         if not self.enabled:

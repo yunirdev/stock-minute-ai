@@ -182,9 +182,19 @@ def build_exception_message(
     evidence_refs: list[str],
     occurred_at: datetime,
 ) -> Notification:
-    """Build a bounded operational exception brief without credentials."""
+    """系统异常简报（不含任何凭据）。
+
+    单频道下 🚨 前缀是唯一的紧急度过滤手段：读者扫一眼频道就知道哪几条需要
+    立刻处理，哪些可以晚点看。
+
+    去重身份带上小时，等于免费得到"同一个错误码每小时最多一条"的节流：故障
+    往往每个 tick 都复现（引擎 30 秒一轮，一小时就是 120 次），没有节流会把
+    频道彻底淹掉。而且这个节流落在审计库里，多个进程同时报同一个故障也只会
+    发出去一条。
+    """
+    hour_bucket = occurred_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H")
     return Notification(
-        title=f"⚠️ 系统异常 · {_trunc(error_code, 80)}",
+        title=f"🚨 系统异常 · {_trunc(error_code, 80)}",
         body="\n".join(
             (
                 f"发生时间：{_fmt_time(occurred_at)}",
@@ -194,4 +204,5 @@ def build_exception_message(
         ),
         kind="alert",
         fields={"错误代码": _trunc(error_code, 100)},
+        dedupe_key=f"exception:{error_code}:{hour_bucket}",
     )

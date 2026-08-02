@@ -285,7 +285,11 @@ class Runtime:
         self._universe_provider = UniverseProvider(config.symbols, config.universe_max_symbols, config.universe_max_age_minutes)
         self._universe_snapshot = self._universe_provider.provide(cli_symbols=config.symbols, now=utc_now())
         self._daily_research = DailyRuntimeSupport(
-            config, self._universe_snapshot.symbols
+            config,
+            self._universe_snapshot.symbols,
+            on_error=lambda code, summary: self._report_exception(
+                error_code=code, summary=summary
+            ),
         )
         self._live_plans: Dict[str, TradePlan] = {}  # symbol → 当前活跃计划
         self._monitor_plans: Dict[str, TradePlan] = {}
@@ -742,6 +746,15 @@ class Runtime:
         # 2. Watchdog 告警
         for alert in self._watchdog.check():
             logger.warning("[WATCHDOG] %s: %s", alert.level.upper(), alert.message)
+            # 只有 critical 值得打扰人；warn 级别留在日志里，否则每次数据源
+            # 抖动都会响一次。
+            if str(alert.level).lower() == "critical":
+                self._report_exception(
+                    error_code=f"WATCHDOG_{alert.source}".upper(),
+                    summary=alert.message,
+                    evidence=[f"tick={self._tick_count}"],
+                    at=ts,
+                )
 
         # 3. 权益 + 持仓（broker 是权威来源）
         try:
@@ -754,6 +767,15 @@ class Runtime:
                 exc, operation="broker.snapshot"
             )
             logger.error("broker 数据获取失败，跳过本轮: %s", exc)
+            self._report_exception(
+                error_code="BROKER_SNAPSHOT_FAILED",
+                summary=(
+                    f"无法从券商读取权益/持仓（{type(exc).__name__}）。"
+                    "引擎已跳过本轮，不会基于陈旧数据做任何决策。"
+                ),
+                evidence=[f"tick={self._tick_count}"],
+                at=ts,
+            )
             return
         logger.info("equity=%.2f  positions=%d", equity, len(positions))
         # 配置的杠杆倍数用于放大仓位规模（等权分配 + 风控上限的资金基数），
@@ -769,6 +791,15 @@ class Runtime:
         self._risk.check_equity(equity)
         if self._risk.is_halted:
             logger.warning("风控熔断: %s", self._risk.halt_reason)
+            self._report_exception(
+                error_code="RISK_HALTED",
+                summary=(
+                    f"风控已熔断，本轮不再开新仓：{self._risk.halt_reason}。"
+                    f"当前权益 ${equity:,.2f}。"
+                ),
+                evidence=[f"tick={self._tick_count}"],
+                at=ts,
+            )
             self._audit.log_heartbeat(self._tick_count, equity)
             return
 
@@ -802,6 +833,19 @@ class Runtime:
 
         if not raw_bars_map:
             logger.warning("无可用 K 线数据")
+            # 只有常规交易时段拿不到任何 K 线才算故障。盘前/盘后流动性稀疏，
+            # 所有标的的最新 bar 都过期是常态，在那两个时段告警等于每天早晚
+            # 各刷一次屏。
+            if session == "open":
+                self._report_exception(
+                    error_code="MARKET_DATA_UNAVAILABLE",
+                    summary=(
+                        f"常规交易时段内 {len(self._cfg.symbols)} 个标的全部拿不到"
+                        "新鲜 K 线，本轮不做任何交易决策。"
+                    ),
+                    evidence=[f"tick={self._tick_count}", f"session={session}"],
+                    at=ts,
+                )
             self._portfolio.snapshot_external_equity(equity)
             self._audit.log_heartbeat(self._tick_count, equity)
             self._publish_runtime_status(
@@ -1569,6 +1613,37 @@ class Runtime:
             ),
             require_llm=not self._cfg.allow_quant_without_ai,
         )
+
+    def _report_exception(
+        self,
+        *,
+        error_code: str,
+        summary: str,
+        evidence: Optional[List[str]] = None,
+        at: Optional[datetime] = None,
+    ) -> None:
+        """把运行期故障推给读者。
+
+        在这之前，引擎的故障只写日志：watchdog 已经在喊"心跳超时 194222s"，
+        风控熔断、broker 断连也都记录得很完整——但没有任何一条会送到人眼前，
+        而这些恰恰是最需要立刻知道的事。
+
+        告警链路本身绝不能拖垮主循环：这里吞掉所有异常，最多留一行 debug。
+        推送失败不该让一个本来只是"数据源抖了一下"的 tick 变成崩溃。
+        """
+        try:
+            from .daily_discord import build_exception_message
+
+            self._notifier.send(
+                build_exception_message(
+                    error_code=error_code,
+                    summary=summary,
+                    evidence_refs=list(evidence or []),
+                    occurred_at=at or datetime.now(timezone.utc),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - 告警失败不能影响交易主流程
+            logger.debug("异常告警推送失败 %s: %s", error_code, exc)
 
     def _maybe_morning_brief(self, ts: datetime) -> None:
         """美东 9AM（UTC 13h/14h）自动发送晨报，每天只发一次。"""
