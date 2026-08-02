@@ -75,7 +75,7 @@ from .execution_pipeline import (
     ExecutionPipelineStore,
     candidate_from_trade_plan,
 )
-from .signal_reports import SignalStore, build_ready_signal_report
+from .signal_reports import SignalPublisher, SignalStore, build_ready_signal_report
 from .selection import AICandidateSelector
 from .trade_episodes import TradeEpisodeStore
 from .watchdog import FileKillSwitch, HeartbeatWatchdog
@@ -264,6 +264,10 @@ class Runtime:
             config.db_path
         )
         self._signal_store = SignalStore(config.db_path)
+        # 信号播报：填掉开盘到收盘之间那 6.5 小时的空白。在这之前
+        # SignalPublisher 全仓库没有一处实例化，READY/ENTERED/EXIT/CLOSED
+        # 这些"现在要不要动手"的判断全部只落库，不到人眼前。
+        self._signal_publisher = SignalPublisher(self._signal_store, self._notifier)
         self._bug_reporter = BugReporter(config.db_path, "runtime")
         self._reconciliation_blocked = False
         daily_research = bool(config.daily_research_enabled)
@@ -813,6 +817,10 @@ class Runtime:
         # 时段限制 —— SEC 8-K、WSCN 快讯盘前盘后都可能发布，PriceMoveSource 读的是
         # 本地 bars 缓存，都不需要等本轮实时 K 线拉取成功。
         self._poll_news(ts)
+
+        # 6d. 信号播报。放在市场时段判断之前：成交回报、离场、过期结算在盘前
+        # 盘后同样会发生，读者需要知道。
+        self._publish_signal_events(ts)
 
         # 7. 市场时段判断
         session = self._calendar.session_now()
@@ -1522,7 +1530,7 @@ class Runtime:
                             projected_plan.position_plan_id
                         )
                         self._post_trade_learning.process(episode)
-                    self._signal_store.apply_fill(intent.plan_id, fill)
+                    filled_signal = self._signal_store.apply_fill(intent.plan_id, fill)
                     if intent.idempotency_key:
                         self._order_store.update(intent.idempotency_key, filled_qty=cumulative_filled_qty, remaining_qty=max(0.0, intent.qty - cumulative_filled_qty), state=(OrderLifecycle.FILLED.value if status == OrderStatus.FILLED else OrderLifecycle.PARTIALLY_FILLED.value))
                     self._risk.record_success()
@@ -1530,14 +1538,20 @@ class Runtime:
                         "FILLED %s %s qty=%.0f @ %.4f",
                         fill.symbol, fill.side.value, fill.filled_qty, fill.avg_price,
                     )
-                    self._notifier.send(Notification(
-                        title=f"成交: {fill.symbol}",
-                        body=(
-                            f"{fill.side.value} qty={fill.filled_qty:.0f} "
-                            f"@ {fill.avg_price:.2f}"
-                        ),
-                        kind="plan",
-                    ))
+                    if filled_signal is None:
+                        # 有对应信号时，这笔成交会由 ENTERED/CLOSED 播报，那条
+                        # 消息还带着入场区间、止损止盈和已实现盈亏，信息量远大
+                        # 于这里的一行流水——两条一起发就是同一件事说两遍。
+                        # 只有找不到信号的成交（例如手工计划）才需要这条兜底。
+                        self._notifier.send(Notification(
+                            title=f"成交: {fill.symbol}",
+                            body=(
+                                f"{fill.side.value} qty={fill.filled_qty:.0f} "
+                                f"@ {fill.avg_price:.2f}"
+                            ),
+                            kind="plan",
+                            dedupe_key=f"fill:{intent.idempotency_key or broker_id}",
+                        ))
                 # BUY 成交后从 _live_plans 清理（允许后续重新开仓）
                 if fill is not None and fill.side == Side.SELL:
                     self._live_plans.pop(fill.symbol, None)
@@ -1613,6 +1627,24 @@ class Runtime:
             ),
             require_llm=not self._cfg.allow_quant_without_ai,
         )
+
+    #: 补发窗口。引擎重启或推送中断后，只补这段时间内的信号事件——更早的行情
+    #: 已经过去了，把它们倾泻到频道里除了制造困惑没有别的作用。
+    _SIGNAL_BACKFILL_MINUTES = 30
+
+    def _publish_signal_events(self, ts: datetime) -> None:
+        """把待播报的信号状态变更推给读者。
+
+        统一在这里轮询，而不是散在 register_ready / apply_fill / mark_exit /
+        invalidate_expired 各处：那样每新增一个状态变更点都得记得补一次推送
+        调用，漏一个就是一类事件永远不播报。
+        """
+        try:
+            self._signal_publisher.publish_pending(
+                since=ts - timedelta(minutes=self._SIGNAL_BACKFILL_MINUTES)
+            )
+        except Exception as exc:  # noqa: BLE001 - 播报失败不能影响交易主流程
+            logger.debug("信号播报失败: %s", exc)
 
     def _report_exception(
         self,

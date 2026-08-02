@@ -356,6 +356,41 @@ class SignalStore:
             con.close()
         return [SignalReport.from_dict(json.loads(row[0])) for row in rows]
 
+    def pending_publications(
+        self,
+        *,
+        since: datetime,
+        limit: int = 50,
+    ) -> list["SignalReport"]:
+        """还没成功播报出去的信号事件（按发生顺序）。
+
+        为什么不能用 recent()：那个查询每个 signal 只取最新版本。一个信号在
+        两次 tick 之间走完 READY → ENTERED，recent() 只会给出 ENTERED，
+        READY 那条"可以进场了"就永远没人看见了——而它恰恰是最有行动价值的
+        一条。这里按 (signal_id, version) 逐条比对播报记录，中间态不会丢。
+
+        since 是防补发闸门：推送中断几天后重新接上，不该把积压的历史事件一
+        次性倾泻到频道里，那些行情早就过时了。
+        """
+        con = self._connect()
+        try:
+            rows = con.execute(
+                """
+                SELECT e.payload_json
+                FROM signal_events e
+                LEFT JOIN signal_publications p
+                  ON p.signal_id = e.signal_id AND p.version = e.version
+                WHERE e.created_at >= ?
+                  AND (p.status IS NULL OR p.status <> 'SENT')
+                ORDER BY e.created_at
+                LIMIT ?
+                """,
+                [_utc(since), limit],
+            ).fetchall()
+        finally:
+            con.close()
+        return [SignalReport.from_dict(json.loads(row[0])) for row in rows]
+
     def begin_publication(self, report: SignalReport) -> bool:
         publication_id = f"pub-{report.signal_id}-{report.version}"
         con = self._connect()
@@ -485,12 +520,33 @@ class SignalStore:
         return SignalReport.from_dict(json.loads(row[0])) if row else None
 
 
+#: 值得打断读者的状态——每一条都对应一个"现在要不要动手"的判断。
+#:
+#: 刻意排除两个：
+#: - HOLD 是持仓心跳，每轮都可能重复，7 个标的会把频道变成噪音流。
+#: - INVALIDATED 是"计划没等到就过期了"，属于事后信息而非行动信号，
+#:   并入收盘报告的"未成交计划结局"一节更合适。
+PUBLISHABLE_STATES = frozenset(
+    {
+        SignalState.READY,      # 可以进场了
+        SignalState.ENTERED,    # 已成交
+        SignalState.EXIT,       # 该退了
+        SignalState.CLOSED,     # 结算，带已实现盈亏
+    }
+)
+
+
 class SignalPublisher:
     def __init__(self, store: SignalStore, notifier: Any) -> None:
         self.store = store
         self.notifier = notifier
 
+    def should_publish(self, report: SignalReport) -> bool:
+        return report.state in PUBLISHABLE_STATES
+
     def publish(self, report: SignalReport) -> bool:
+        if not self.should_publish(report):
+            return True
         if not self.store.begin_publication(report):
             return True
         from .daily_discord import build_signal_report_message
@@ -501,3 +557,18 @@ class SignalPublisher:
         except Exception as exc:
             self.store.finish_publication(report, False, type(exc).__name__)
             return False
+
+    def publish_pending(self, *, since: datetime, limit: int = 50) -> int:
+        """播报所有待发的信号事件，返回实际发出的条数。
+
+        集中在一处轮询，而不是在 register_ready / apply_fill / mark_exit 等
+        五个跃迁点各插一次调用——那样每加一个新的状态变更点就得记得补一次推
+        送，迟早会漏。
+        """
+        sent = 0
+        for report in self.store.pending_publications(since=since, limit=limit):
+            if not self.should_publish(report):
+                continue
+            if self.publish(report):
+                sent += 1
+        return sent
