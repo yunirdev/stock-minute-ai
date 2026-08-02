@@ -302,6 +302,7 @@ class Runtime:
         self._last_review_date: Optional[str] = None
         #: 已算好、等着和研究批次合并的复盘（见 close_report 的两阶段说明）
         self._pending_close_report = None
+        self._last_open_confirm_date: Optional[str] = None
         self._brief_calls = BriefCallStore(config.db_path)
         self._last_brief_date: Optional[str] = None
 
@@ -825,6 +826,9 @@ class Runtime:
         # 6d. 信号播报。放在市场时段判断之前：成交回报、离场、过期结算在盘前
         # 盘后同样会发生，读者需要知道。
         self._publish_signal_events(ts)
+
+        # 6e. 开盘确认（开盘满 15 分钟后一次）——晨报的回执
+        self._maybe_open_confirmation(ts)
 
         # 7. 市场时段判断
         session = self._calendar.session_now()
@@ -1655,6 +1659,52 @@ class Runtime:
             )
         except Exception as exc:  # noqa: BLE001 - 播报失败不能影响交易主流程
             logger.debug("信号播报失败: %s", exc)
+
+    def _maybe_open_confirmation(self, ts: datetime) -> None:
+        """开盘 15 分钟后对账晨报给的关键触发位，判定今天走哪套剧本。"""
+        from .open_confirmation import (
+            OPEN_RANGE_MINUTES,
+            build_open_confirmation_message,
+            should_send_open_confirmation,
+        )
+
+        if not should_send_open_confirmation(ts, self._last_open_confirm_date):
+            return
+        try:
+            from .data_cache import get_bars
+            from .intraday_levels import compute_intraday_levels
+            from .morning_brief import _fetch_index_technicals
+
+            technicals = _fetch_index_technicals()
+            levels = {}
+            for name in ("SPY", "QQQ"):
+                bars = get_bars(name, self._cfg.timeframe)
+                if bars is None or getattr(bars, "empty", True):
+                    continue
+                computed = compute_intraday_levels(
+                    name, bars, open_range_minutes=OPEN_RANGE_MINUTES
+                )
+                if computed is not None:
+                    levels[name] = computed
+            if not levels:
+                logger.debug("开盘确认：暂无指数分钟数据，下轮再试")
+                return
+
+            trading_date = ts.astimezone(ZoneInfo("America/New_York")).strftime(
+                "%Y-%m-%d"
+            )
+            call = self._brief_calls.get(trading_date) or {}
+            self._notifier.send(
+                build_open_confirmation_message(
+                    trading_date=trading_date,
+                    index_levels=levels,
+                    technicals=technicals,
+                    morning_bias=call.get("bias", ""),
+                )
+            )
+            self._last_open_confirm_date = trading_date
+        except Exception as exc:  # noqa: BLE001 - 报告失败不能影响交易主流程
+            logger.warning("开盘确认推送失败: %s", exc)
 
     def _report_exception(
         self,
