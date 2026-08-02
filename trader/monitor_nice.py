@@ -206,7 +206,7 @@ ui.add_body_html(f"<script>{UI_HEALTH_SCRIPT}</script>")
 # 当前代码里仍会被 _pref/_set_pref 读写的 key；不在这里的 key（旧引擎配置页、
 # 旧图表探索页、旧决策台遗留）不会被保存回 conf/ui_settings.json。
 _KNOWN_PREF_KEYS = {
-    "sys_sym", "sys_strat", "sys_tf", "sys_int", "sys_min_score", "sys_review_bias",
+    "sys_sym", "sys_strat", "sys_tf", "sys_int", "sys_min_score",
     "fa_sym", "fa_tf", "fa_fac", "fa_fwd", "fa_nq",
     "r_sym", "r_tf", "r_strat", "r_cap", "r_lev", "r_slip", "r_fill", "r_risk",
     "sel_source", "sel_long_n", "sel_daily_n", "sel_decision_style",
@@ -1681,16 +1681,9 @@ def _render_system():
             _push_status = ui.html(
                 '<span style="font-size:12px;color:var(--qa-text-muted)">就绪</span>'
             )
-            review_bias_sel = _persist(
-                ui.select(
-                    ["中性", "偏多", "偏空"],
-                    value=_pref("sys_review_bias", "中性"),
-                    label="复盘方向",
-                )
-                .props("dense outlined dark")
-                .style("width:120px"),
-                "sys_review_bias",
-            )
+            # 「复盘方向」下拉已移除：让使用者在收盘后凭印象挑一个方向再打分，
+            # 等于给一个事后编造的判断评分，甚至可以挑一个事后看对的方向让复盘
+            # 好看。方向现在只从 BriefCallStore 读当天晨报的真实判断。
 
             def _system_symbols():
                 syms_raw = sym_in.value or "QQQ,SPY,NVDA,AAPL,MSFT"
@@ -1769,10 +1762,7 @@ def _render_system():
                 try:
                     from trader.manual_push import send_direction_review_push
 
-                    ok = send_direction_review_push(
-                        _system_symbols(),
-                        bias=str(review_bias_sel.value or "中性"),
-                    )
+                    ok = send_direction_review_push(_system_symbols())
                     _push_status.set_content(_push_result_html("方向复盘", ok))
                     return ok
                 except Exception as exc:
@@ -1781,17 +1771,58 @@ def _render_system():
                     )
                     raise
 
+            def _manual_push(label: str, fn):
+                """统一的手动补发外壳：所有报告类型共用同一套状态显示。"""
+
+                def _run():
+                    _push_status.set_content(
+                        f'<span style="color:#d29922">{label}发送中…</span>'
+                    )
+                    try:
+                        ok = fn()
+                        _push_status.set_content(_push_result_html(label, ok))
+                        return ok
+                    except Exception as exc:
+                        _push_status.set_content(
+                            f'<span style="color:#f85149">{label}错误: {exc}</span>'
+                        )
+                        raise
+
+                return _run
+
+            def _do_send_open_confirmation():
+                from trader.manual_push import send_open_confirmation_push
+
+                return send_open_confirmation_push()
+
+            def _do_send_close_report():
+                from trader.manual_push import send_close_report_push
+
+                return send_close_report_push()
+
+            def _do_send_weekly():
+                from trader.manual_push import send_weekly_report_push
+
+                return send_weekly_report_push()
+
+            # 每一种自动推送的报告都要能手动补发。补发的周期语义由
+            # report_period 统一决定：当前周期已开始就发本周期至今（正文会标注
+            # 尚未结束），否则发上一个完整周期——而不是拿"此刻"硬算，那样周日
+            # 点一次复盘会得到一份标着当天日期的空报告。
             _DISCORD_REPORTS = {
                 "晨报": _do_send_brief,
+                "开盘确认": _manual_push("开盘确认", _do_send_open_confirmation),
                 "盘中 OR/VWAP": _do_send_intraday,
-                "每日复盘": _do_send_review,
+                "收盘报告（复盘+研究）": _manual_push("收盘报告", _do_send_close_report),
+                "每日复盘（仅复盘）": _do_send_review,
                 "方向复盘": _do_send_direction_review,
+                "周报（策略体检）": _manual_push("周报", _do_send_weekly),
             }
             report_type_sel = ui.select(
                 list(_DISCORD_REPORTS),
                 value="晨报",
                 label="报告类型",
-            ).props("dense outlined dark").style("width:150px")
+            ).props("dense outlined dark").style("width:210px")
 
             def _do_send_selected():
                 return _DISCORD_REPORTS[str(report_type_sel.value)]()

@@ -24,12 +24,198 @@ def send_intraday_levels_push(symbols: Iterable[str]) -> bool:
     return _send_all(build_intraday_levels_messages(symbols))
 
 
-def send_direction_review_push(symbols: Iterable[str], bias: str = "中性") -> bool:
-    return _send_all([build_direction_review_message(symbols, bias=bias)])
+def send_direction_review_push(symbols: Iterable[str]):
+    return _send_all([build_direction_review_message(symbols)])
 
 
-def send_stock_analysis_push(symbol: str, ai_db_path: str | None = None) -> bool:
+def send_stock_analysis_push(symbol: str, ai_db_path: str | None = None):
     return _send_all([build_stock_analysis_message(symbol, ai_db_path=ai_db_path)])
+
+
+def send_open_confirmation_push(db_path: str | None = None):
+    """手动补发开盘确认。
+
+    周期语义见 report_period：交易日已开始就对账当天，否则对账上一个交易日。
+    """
+    return _send_all([build_open_confirmation_push_message(db_path=db_path)])
+
+
+def send_close_report_push(db_path: str | None = None):
+    """手动补发收盘报告（复盘 + 研究）。"""
+    return _send_all([build_close_report_push_message(db_path=db_path)])
+
+
+def send_weekly_report_push(db_path: str | None = None):
+    """手动补发周报。本周未结束时只统计到此刻，并在正文标注。"""
+    from .report_period import period_hours, resolve_weekly_period
+    from .teams.maintenance import run_maintenance
+
+    period = resolve_weekly_period(datetime.now(timezone.utc))
+    run_maintenance(
+        db_path=db_path or str(_ROOT / "trade.duckdb"),
+        period_hours=period_hours(period),
+        send_discord=True,
+        period_label=period.label + ("-partial" if period.is_partial else ""),
+    )
+    from .notify import DeliveryOutcome
+
+    # run_maintenance 内部自己发送，这里只把结果语义传回给 UI
+    return DeliveryOutcome("SENT")
+
+
+def build_open_confirmation_push_message(db_path: str | None = None) -> Notification:
+    """按当前周期组装一份开盘确认。"""
+    from .brief_review import BriefCallStore
+    from .data_cache import get_bars
+    from .intraday_levels import compute_intraday_levels
+    from .morning_brief import _fetch_index_technicals
+    from .open_confirmation import (
+        OPEN_RANGE_MINUTES,
+        build_open_confirmation_message,
+    )
+    from .report_period import resolve_daily_period
+
+    period = resolve_daily_period(datetime.now(timezone.utc))
+    resolved_db = db_path or str(_ROOT / "trade.duckdb")
+
+    levels = {}
+    for name in ("SPY", "QQQ"):
+        try:
+            bars = get_bars(name, "5m")
+            if bars is None or getattr(bars, "empty", True):
+                continue
+            computed = compute_intraday_levels(
+                name, bars, open_range_minutes=OPEN_RANGE_MINUTES
+            )
+            if computed is not None:
+                levels[name] = computed
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("开盘确认取 %s 分钟数据失败: %s", name, exc)
+
+    if not levels:
+        return Notification(
+            title=f"🎯 开盘确认 · {period.label}",
+            body="缺少 SPY/QQQ 的分钟级数据，无法计算开盘区间与触发位对账。",
+            kind="review",
+            fields={"交易日": period.label},
+            dedupe_key=f"open_confirmation:{period.label}:nodata",
+        )
+
+    call = {}
+    try:
+        call = BriefCallStore(resolved_db).get(period.label) or {}
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("读取晨报方向失败: %s", exc)
+
+    note = build_open_confirmation_message(
+        trading_date=period.label,
+        index_levels=levels,
+        technicals=_fetch_index_technicals(),
+        morning_bias=call.get("bias", ""),
+    )
+    if period.note:
+        note.body = period.note + "\n\n" + note.body
+    return note
+
+
+def build_close_report_push_message(db_path: str | None = None) -> Notification:
+    """按当前周期组装一份收盘报告。
+
+    自动路径会等研究批次；手动补发不等——按下按钮的人要的是现在就看到，所以
+    研究没跑完就如实写明缺席原因。
+    """
+    from .brief_review import BriefCallStore
+    from .close_report import (
+        build_close_report,
+        build_direction_review_line,
+        build_unfilled_plans_line,
+    )
+    from .discord_report import build_review_body
+    from .report_period import resolve_daily_period
+    from .review import SimpleReviewer
+
+    period = resolve_daily_period(datetime.now(timezone.utc))
+    resolved_db = db_path or str(_ROOT / "trade.duckdb")
+
+    try:
+        report = SimpleReviewer(db_path=resolved_db).review(
+            period="daily", as_of=period.end
+        )
+        trade_count = report.attribution.get("trade_count", len(report.trades))
+        body, fields = build_review_body(
+            today=period.label,
+            pnl=report.portfolio_pnl,
+            trade_count=trade_count,
+            trades=report.trades,
+            market_summary=getattr(report, "market_summary", ""),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return Notification(
+            title=f"📋 收盘报告 · {period.label}",
+            body=f"复盘数据读取失败（{type(exc).__name__}），本次没有可用内容。",
+            kind="review",
+            fields={"交易日": period.label},
+            dedupe_key=f"close_report:{period.label}:failed",
+        )
+
+    extras = []
+    try:
+        call = BriefCallStore(resolved_db).get(period.label)
+        ohlc = _session_ohlc(_load_bars("SPY"))
+        extras.append(build_direction_review_line(call, ohlc))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("方向复盘失败: %s", exc)
+
+    try:
+        from .signal_reports import SignalStore
+
+        invalid = [
+            r
+            for r in SignalStore(resolved_db).recent(limit=50)
+            if getattr(getattr(r, "state", ""), "value", "") == "INVALIDATED"
+        ]
+        line = build_unfilled_plans_line(invalid)
+        if line:
+            extras.append(line)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("未成交计划读取失败: %s", exc)
+
+    research_body, missing = "", ""
+    try:
+        from .daily_discord import build_daily_research_message
+        from .daily_research import DailyResearchStore
+
+        store = DailyResearchStore(str(_ROOT / "ai_states.duckdb"))
+        run = store.latest_run(period.label)
+        if run is not None and str(getattr(run, "status", "")).upper() not in (
+            "RUNNING",
+            "PENDING",
+            "",
+        ):
+            research_body = build_daily_research_message(run, store.items(run.run_id)).body
+        elif run is not None:
+            missing = "研究批次仍在进行中"
+        else:
+            missing = f"{period.label} 没有研究批次记录"
+    except Exception as exc:  # noqa: BLE001
+        missing = f"研究结果读取失败（{type(exc).__name__}）"
+
+    full_body = "\n\n".join([body] + [e for e in extras if e])
+    if period.note:
+        full_body = period.note + "\n\n" + full_body
+
+    note = build_close_report(
+        trading_date=period.label,
+        review_body=full_body,
+        review_fields=fields,
+        research_body=research_body,
+        research_missing_reason=missing,
+    )
+    if period.is_partial:
+        # 未收盘的补发和收盘后的正式报告是两份不同的东西，不能共用身份，
+        # 否则盘中补发一次就会把当天正式的收盘报告顶掉。
+        note.dedupe_key = f"close_report:{period.label}:partial"
+    return note
 
 
 _MAX_INTRADAY_SYMBOLS = 8
@@ -61,11 +247,44 @@ def build_intraday_levels_messages(symbols: Iterable[str]) -> List[Notification]
 
 def build_direction_review_message(
     symbols: Iterable[str],
-    bias: str = "中性",
+    db_path: str | None = None,
 ) -> Notification:
+    """对账晨报当天真实给出的方向判断。
+
+    方向不再由人从下拉框里选。让使用者在收盘后凭印象挑一个方向再打分，本质上
+    是在给一个事后编造的判断评分——最坏的情况是挑一个事后看对的方向，让复盘显
+    得很漂亮。真正要回答的问题是"今天早上那句话说对了没有"，所以方向只能来自
+    BriefCallStore 里当天记录下来的原话；没有记录就如实说没有，而不是默认一个
+    "中性"糊弄过去。
+    """
+    from .brief_review import BriefCallStore
+    from .report_period import resolve_daily_period
+
     parsed = _parse_symbols(symbols)
+    now = datetime.now(timezone.utc)
+    period = resolve_daily_period(now)
+
+    call = None
+    try:
+        call = BriefCallStore(db_path or str(_ROOT / "trade.duckdb")).get(period.label)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("读取晨报方向失败: %s", exc)
+
+    if not call or not call.get("bias"):
+        return Notification(
+            title=f"晨报方向复盘 · {period.label}",
+            body=(
+                f"{period.label} 没有记录到晨报方向判断，无法复盘。\n"
+                "方向来自当天晨报生成时的真实判断；那天如果没有发过晨报，就没有"
+                "可对账的对象。"
+            ),
+            kind="review",
+            fields={"交易日": period.label},
+            dedupe_key=f"direction_review:{period.label}:none",
+        )
+
+    bias = call["bias"]
     reviews = []
-    today_et = datetime.now(timezone.utc).astimezone(_ET_TZ).date()
     for symbol in parsed[:_MAX_REVIEW_SYMBOLS]:
         bars = _load_bars(symbol)
         ohlc = _session_ohlc(bars)
@@ -73,8 +292,8 @@ def build_direction_review_message(
             reviews.append(f"{symbol}: 缺少当日常规时段 bars，暂无法评分。")
             continue
         stale_prefix = ""
-        if ohlc["session_date"] != today_et:
-            stale_prefix = f"⚠️ 数据非当日（最新只有 {ohlc['session_date']} 的数据）— "
+        if ohlc["session_date"].isoformat() != period.label:
+            stale_prefix = f"⚠️ 数据非本期（最新只有 {ohlc['session_date']} 的数据）— "
         review = evaluate_direction_call(
             bias=bias,
             session_open=ohlc["open"],
@@ -92,11 +311,18 @@ def build_direction_review_message(
     if not reviews:
         reviews = ["没有可用标的。请先在系统页标的输入框填写股票代码。"]
 
+    lines = [f"早上的判断：{bias}"]
+    if period.note:
+        lines.append(period.note)
+    lines.append("")
+    lines.extend(f"• {line}" for line in reviews)
+
     return Notification(
-        title=f"晨报方向复盘 · {datetime.now():%m/%d %H:%M}",
-        body="\n".join(f"• {line}" for line in reviews),
+        title=f"晨报方向复盘 · {period.label}",
+        body="\n".join(lines),
         kind="review",
-        fields={"复盘方向": bias, "数据": "实时拉取（失败时回退本地缓存）"},
+        fields={"交易日": period.label, "数据": "实时拉取（失败时回退本地缓存）"},
+        dedupe_key=f"direction_review:{period.label}",
     )
 
 
