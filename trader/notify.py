@@ -15,6 +15,8 @@ import hashlib
 import json
 import logging
 import os
+import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -52,6 +54,51 @@ class DeliveryOutcome:
     @property
     def delivered(self) -> bool:
         return self.status == "SENT"
+
+
+_FALSEY = {"0", "false", "no", "off"}
+
+#: 限流/服务端故障时的最大尝试次数（含首次）。
+_MAX_SEND_ATTEMPTS = int(os.getenv("DISCORD_MAX_SEND_ATTEMPTS", "3"))
+#: 两条消息之间的最小间隔（秒）。设 0 关闭，测试里就是这么做的。
+_MIN_SEND_INTERVAL = float(os.getenv("DISCORD_MIN_SEND_INTERVAL", "0.3"))
+#: 非限流类异常的退避基数，按尝试次数线性放大。
+_BACKOFF_BASE = 1.0
+#: Retry-After 的上限。Discord 偶尔会给出很长的冷却，但把交易引擎的 tick 卡
+#: 在那里毫无意义——超过这个值就放弃本轮，交给下一轮重试。
+_MAX_RETRY_AFTER = 10.0
+
+
+def _retry_after_seconds(exc: "urllib.error.HTTPError") -> float:
+    """从 429 响应里读 Discord 要求的冷却时间。"""
+    raw = ""
+    try:
+        raw = exc.headers.get("Retry-After", "") or ""
+    except Exception:  # noqa: BLE001 - 头缺失/畸形都走默认值
+        raw = ""
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        seconds = 1.0
+    return max(0.0, min(seconds, _MAX_RETRY_AFTER))
+
+
+def _external_send_allowed() -> bool:
+    """DISCORD_EXTERNAL_SEND_ENABLED —— 外发总闸。
+
+    这个开关之前形同虚设：五个生产调用点全都硬编码 external_send_enabled=
+    True 把它绕过去了，而构造函数里还有一条"传了凭据参数就视为已授权"的隐式
+    规则，连测试传三个空字符串都会被当成授权。与此同时 .env.example 里白纸黑
+    字写着 false ——配置文件在说一件和实际行为相反的事。
+
+    现在它真的管用了，语义是"显式关掉才拦"：只有把它设成 false/0/no/off 才
+    阻止外发，没配置就照发。默认放行是刻意的——实际部署的 .env 里根本没有这
+    个变量，如果默认拦截，升级后所有推送会毫无征兆地全部停掉。
+
+    手动点击也不能绕过总闸。闸门关着时点发送会得到 BLOCKED，监控台显示
+    "⚠ 外发未授权"，而不是一个看起来成功了的绿勾。
+    """
+    return os.getenv("DISCORD_EXTERNAL_SEND_ENABLED", "").strip().lower() not in _FALSEY
 
 
 #: 从"最该让用户知道"到"最不该"。汇总一批结果时按这个顺序取最严重的那个：
@@ -106,13 +153,10 @@ class DiscordNotifier:
         self._channel = (channel_id  if channel_id  is not None else os.getenv("DISCORD_CHANNEL_ID",  "")).strip()
         self._webhook = (webhook_url if webhook_url  is not None else os.getenv("DISCORD_WEBHOOK_URL", "")).strip()
         self._console = ConsoleNotifier()
-        explicitly_configured = any(
-            value is not None for value in (bot_token, channel_id, webhook_url)
-        )
+        #: 上次实际发出的时刻（单调时钟），用于消息间节流
+        self._last_send_at = 0.0
         if external_send_enabled is None:
-            external_send_enabled = explicitly_configured or os.getenv(
-                "DISCORD_EXTERNAL_SEND_ENABLED", ""
-            ).strip().lower() in {"1", "true", "yes", "on"}
+            external_send_enabled = _external_send_allowed()
         self._external_send_enabled = bool(external_send_enabled)
         root = Path(__file__).resolve().parents[1]
         raw_db = Path(
@@ -250,19 +294,64 @@ class DiscordNotifier:
             ]
         return embed
 
+    def _throttle(self) -> None:
+        """两次发送之间至少隔 _MIN_SEND_INTERVAL 秒。
+
+        晨报是四条消息背靠背发出去的，实测一秒内全部打完。Discord 的频道级限
+        流窗口很窄，这种突发很容易撞上 429；主动错开比事后退避便宜得多。
+        """
+        if _MIN_SEND_INTERVAL <= 0:
+            return
+        wait = _MIN_SEND_INTERVAL - (time.monotonic() - self._last_send_at)
+        if wait > 0:
+            time.sleep(wait)
+
     def _post(self, req: urllib.request.Request, note: Notification) -> bool:
-        try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                ok = resp.status in (200, 204)
-            if ok:
-                logger.info("Discord 推送成功: %s", note.title)
-            else:
-                logger.warning("Discord 推送返回 %s", resp.status)
-            return ok
-        except Exception as exc:
-            logger.error("Discord 推送失败: %s，降级 console", exc)
-            self._console.send(note)
-            return False
+        """发送并在限流/服务端故障时退避重试。
+
+        之前这里把所有异常一视同仁：429 限流和 DNS 解析失败走同一条日志、同
+        样返回 False，而 FAILED 在投递层是终态，没有任何东西会再试一次——一次
+        限流就等于永久丢一条消息。429 恰恰是最该重试的情况，Discord 还在
+        Retry-After 头里明确告诉了要等多久。
+        """
+        for attempt in range(1, _MAX_SEND_ATTEMPTS + 1):
+            self._throttle()
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    self._last_send_at = time.monotonic()
+                    if resp.status in (200, 204):
+                        logger.info("Discord 推送成功: %s", note.title)
+                        return True
+                    logger.warning("Discord 推送返回 %s", resp.status)
+                    return False
+            except urllib.error.HTTPError as exc:
+                self._last_send_at = time.monotonic()
+                retry_after = _retry_after_seconds(exc)
+                retriable = exc.code == 429 or 500 <= exc.code < 600
+                if not retriable or attempt >= _MAX_SEND_ATTEMPTS:
+                    # 4xx（除 429）是我们自己把请求构造错了，重试多少次都一样
+                    logger.error(
+                        "Discord 推送失败 HTTP %s: %s，降级 console", exc.code, note.title
+                    )
+                    self._console.send(note)
+                    return False
+                logger.warning(
+                    "Discord %s，%.1fs 后重试（第 %d/%d 次）: %s",
+                    "限流 429" if exc.code == 429 else f"服务端 {exc.code}",
+                    retry_after, attempt, _MAX_SEND_ATTEMPTS, note.title,
+                )
+                time.sleep(retry_after)
+            except Exception as exc:
+                self._last_send_at = time.monotonic()
+                if attempt >= _MAX_SEND_ATTEMPTS:
+                    logger.error("Discord 推送失败: %s，降级 console", exc)
+                    self._console.send(note)
+                    return False
+                logger.warning(
+                    "Discord 推送异常（第 %d/%d 次）: %s", attempt, _MAX_SEND_ATTEMPTS, exc
+                )
+                time.sleep(_BACKOFF_BASE * attempt)
+        return False
 
 
 class _DiscordTransport:

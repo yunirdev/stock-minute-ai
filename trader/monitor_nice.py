@@ -1746,7 +1746,7 @@ def _render_system():
                         trade_count=cnt,
                         symbols=_system_symbols(),
                     )
-                    ok = make_notifier(external_send_enabled=True).send(msg)
+                    ok = make_notifier().send(msg)
                     _push_status.set_content(_push_result_html("复盘", ok))
                     return ok
                 except Exception as exc:

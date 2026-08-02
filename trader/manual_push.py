@@ -399,7 +399,7 @@ def _send_all(messages: List[Notification]):
     """返回汇总后的 DeliveryOutcome —— 真值语义是"确实送到 Discord 了"。"""
     from .notify import summarize
 
-    notifier = make_notifier(external_send_enabled=True)
+    notifier = make_notifier()
     return summarize([notifier.send(message) for message in messages])
 
 

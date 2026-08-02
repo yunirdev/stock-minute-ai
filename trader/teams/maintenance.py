@@ -349,11 +349,9 @@ def _send_discord_report(
             f"异常检测:\n{anom_lines}\n"
             f"整改建议:\n{sug_lines}"
         )
-        # This is a user-triggered "运行维护分析" + "发送 Discord" action, same
-        # authorization tier as the other manual push buttons — without this
-        # flag the send is silently BLOCKED behind the
-        # DISCORD_EXTERNAL_SEND_ENABLED gate (see morning_brief.py / runtime.py).
-        notifier = DiscordNotifier(external_send_enabled=True)
+        # 授权交给 DISCORD_EXTERNAL_SEND_ENABLED 总闸决定，这里不再硬编码
+        # 绕过它：总闸关着时手动点击同样应该被拦下并如实告知，而不是悄悄放行。
+        notifier = DiscordNotifier()
         notifier.send(
             Notification(
                 title=f"🔧 周报 · 策略体检（近 {period_label}）",

@@ -189,15 +189,13 @@ def send_morning_brief(
     """发送晨报，返回汇总后的 DeliveryOutcome（真值语义 = 确实送达）。"""
     from .notify import DiscordNotifier
 
-    # Both callers of send_morning_brief() — the "发送晨报" UI button and the
-    # 9AM ET auto-brief in runtime._maybe_morning_brief — are already a
-    # deliberate, authorized send (explicit click, or a schedule the user
-    # turned on). Not passing external_send_enabled=True here left every
-    # brief silently BLOCKED behind the DISCORD_EXTERNAL_SEND_ENABLED gate,
-    # unlike manual_push.py's send_intraday_levels_push() which does opt in.
     from .notify import DeliveryOutcome, summarize
 
-    notifier = DiscordNotifier(external_send_enabled=True)
+    # 授权由 DISCORD_EXTERNAL_SEND_ENABLED 总闸统一决定（默认放行，显式设成
+    # false 才拦）。这里曾经硬编码 external_send_enabled=True，理由是"手动点
+    # 击和定时任务都属于已授权"——但五个调用点各自这么写一遍，总闸就再也拦不
+    # 住任何东西，而 .env.example 里还写着 false。
+    notifier = DiscordNotifier()
     msgs = build_morning_brief(
         symbols=symbols, db_path=db_path, auto_trade=auto_trade
     )

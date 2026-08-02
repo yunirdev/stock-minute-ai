@@ -210,13 +210,10 @@ class Runtime:
         if config.auto_trade_paper and config.broker_type != "alpaca_paper":
             raise ValueError("AUTO_TRADE_REQUIRES_ALPACA_PAPER")
         self._pos_monitor = StopTakeProfitMonitor()
-        # Fill notifications and the daily review push (below) are triggered
-        # by the running engine itself, not a stray background job — same
-        # authorization tier as the manual "发送" buttons, which already opt
-        # in via external_send_enabled=True. Without it here, every fill/
-        # review message was silently BLOCKED behind the
-        # DISCORD_EXTERNAL_SEND_ENABLED gate (see morning_brief.py fix).
-        self._notifier = DiscordNotifier(external_send_enabled=True)
+        # 授权由 DISCORD_EXTERNAL_SEND_ENABLED 总闸统一决定（默认放行，显式
+        # 设成 false 才拦）。引擎的所有推送——成交、信号、异常、各类报告——都
+        # 走这一个 notifier，所以总闸对它们一视同仁。
+        self._notifier = DiscordNotifier()
         self._price_news = PriceMoveSource(
             universe=config.symbols, timeframe=config.timeframe
         )
