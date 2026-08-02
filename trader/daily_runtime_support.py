@@ -44,6 +44,10 @@ class DailyRuntimeSupport:
         service = DailyResearchService(
             self.store,
             TradingAgentsAdapter(),
+            # notifier=None 是刻意的，不是漏接：研究结果由收盘报告统一播报
+            # （runtime._maybe_flush_close_report 会主动读取本批次结果并合进
+            # "明天做什么"一节）。这里再接一个 notifier 会让同一批研究结论在
+            # 频道里出现两次。
             notifier=None,
         )
         self.worker = DailyResearchWorker(

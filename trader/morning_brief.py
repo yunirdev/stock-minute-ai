@@ -239,7 +239,7 @@ def build_morning_brief(
     premarket_movers = _fetch_premarket_movers(company_symbols)
 
     # ── 消息 1：今日作战卡 ──────────────────────────────────────────────────
-    action_text = _build_action_card(
+    action_text, direction_bias, direction_reasons = _build_action_card(
         mkt=mkt,
         symbols=symbols,
         event_result=event_result,
@@ -247,6 +247,18 @@ def build_morning_brief(
         macro_news=priority_news,
         premarket_movers=premarket_movers,
     )
+    # 把今天的方向判断记下来，收盘报告才能对账。只记第一次：手动重发晨报会
+    # 用当时的行情重算出不同的方向，覆盖掉早上那次就等于让判断跟着结果走。
+    try:
+        from .brief_review import BriefCallStore
+
+        BriefCallStore(db_path).record(
+            trading_date=brief_date,
+            bias=direction_bias,
+            reasons=direction_reasons,
+        )
+    except Exception as exc:  # noqa: BLE001 - 记录失败不该让晨报发不出去
+        logger.warning("晨报方向记录失败: %s", exc)
     # 整份晨报的措辞（"开盘策略"、"盘前快照"等）默认假设是盘前发的。手动
     # "发送晨报"按钮没有时段限制，收盘后重发会呈现已经过期的盘前框架，
     # 之前完全没有提示——这里显式标注一下，而不是让读者误以为是最新判断。
@@ -429,7 +441,9 @@ def _build_action_card(
     if main_reasons:
         lines.insert(4, f"**主要原因：** {'；'.join(main_reasons[:4])}")
 
-    return "\n".join(lines)
+    # 连同方向判断一起返回：收盘复盘要拿它来对账"今天早上说对了没有"，在外面
+    # 重算一遍会因为行情已经变化而得出不同的方向，那样对账就失去意义了。
+    return "\n".join(lines), bias_line, main_reasons
 
 
 def _build_uncertainty_line(

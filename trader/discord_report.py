@@ -353,6 +353,30 @@ def build_daily_review_message(
     )
 
 
+def build_review_body(
+    today: str,
+    pnl: float,
+    trade_count: int,
+    trades: Optional[List[dict]] = None,
+    market_summary: str = "",
+    symbols: Optional[List[str]] = None,
+) -> tuple[str, dict]:
+    """复盘正文 + 摘要字段，供收盘报告拼装。
+
+    与 build_daily_review_message 共用同一套内容，只是不自带标题和去重身份
+    ——合并进收盘报告后，那两样由收盘报告统一负责。
+    """
+    note = build_daily_review_message(
+        today=today,
+        pnl=pnl,
+        trade_count=trade_count,
+        trades=trades,
+        market_summary=market_summary,
+        symbols=symbols,
+    )
+    return note.body, dict(note.fields)
+
+
 def _build_trade_attribution(trades: List[dict]) -> str:
     """按标的汇总买卖净现金流，让复盘能看出今天是哪几只标的在赚/在亏，
     而不只是一个总数。这是买卖净额（卖出金额 - 买入金额），不是扣除持仓

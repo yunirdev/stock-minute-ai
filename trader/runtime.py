@@ -75,6 +75,7 @@ from .execution_pipeline import (
     ExecutionPipelineStore,
     candidate_from_trade_plan,
 )
+from .brief_review import BriefCallStore
 from .signal_reports import SignalPublisher, SignalStore, build_ready_signal_report
 from .selection import AICandidateSelector
 from .trade_episodes import TradeEpisodeStore
@@ -299,6 +300,9 @@ class Runtime:
         self._monitor_plans: Dict[str, TradePlan] = {}
         self._daily_start_set = False
         self._last_review_date: Optional[str] = None
+        #: 已算好、等着和研究批次合并的复盘（见 close_report 的两阶段说明）
+        self._pending_close_report = None
+        self._brief_calls = BriefCallStore(config.db_path)
         self._last_brief_date: Optional[str] = None
 
         logger.info(
@@ -866,6 +870,12 @@ class Runtime:
             self._portfolio.snapshot_external_equity(equity)
             self._audit.log_heartbeat(self._tick_count, equity)
             self._publish_runtime_status(ts, session, equity, positions)
+            # 收盘报告必须在这里也检查一次。16:00–20:00 ET 属于 "post" 时段，
+            # 会在本分支提前 return，而另外两个调用点分别只在 session=="open"
+            # 和 session=="closed" 时才走到——于是配置里写着 16 点的复盘，实际
+            # 要拖到 20:00 收盘后才发得出去。两阶段的收盘报告更依赖这一点：
+            # 它需要从 16:05 起就开始轮询研究批次的进度。
+            self._maybe_daily_review(ts)
             return
 
         # 10. 持仓监控：止损/止盈触发 → 生成 CLOSE 计划并立即执行
@@ -1742,15 +1752,41 @@ class Runtime:
         poll_all_sources(news_sources, self._news_store, now=ts)
 
     def _maybe_daily_review(self, ts: datetime) -> None:
-        """每日美东 daily_review_hour_et 点（.env 可配置，默认 16）后触发一次复盘，当天只运行一次。"""
+        """收盘报告，两阶段。
+
+        第一阶段（daily_review_hour_et 点后）算好复盘并挂起；第二阶段每个
+        tick 检查今天的研究批次好了没有，好了就合并发出，超时就只发复盘并写
+        明研究为什么缺席。复盘只依赖本地账本、必定算得出来，绝不能被研究批
+        次的不确定耗时拖累。
+        """
         today = ts.strftime("%Y-%m-%d")
         if today == self._last_review_date:
             return
-        review_hour_et = ts.astimezone(ZoneInfo("America/New_York")).replace(
-            hour=self._cfg.daily_review_hour_et, minute=0, second=0, microsecond=0
+
+        if self._pending_close_report is None:
+            review_hour_et = ts.astimezone(ZoneInfo("America/New_York")).replace(
+                hour=self._cfg.daily_review_hour_et, minute=0, second=0, microsecond=0
+            )
+            if ts < review_hour_et.astimezone(timezone.utc):
+                return
+            self._pending_close_report = self._build_pending_close_report(ts, today)
+            if self._pending_close_report is None:
+                return  # 复盘算失败了，下个 tick 重试
+
+        self._maybe_flush_close_report(ts, today)
+
+    def _build_pending_close_report(self, ts: datetime, today: str):
+        """算复盘部分，先不发。"""
+        from .close_report import (
+            PendingCloseReport,
+            build_direction_review_line,
+            build_health_line,
+            build_overnight_risk_line,
+            build_unfilled_plans_line,
+            research_wait_deadline,
         )
-        if ts < review_hour_et.astimezone(timezone.utc):
-            return
+        from .discord_report import build_review_body
+
         try:
             report = self._reviewer.review(period="daily", as_of=ts)
             trade_count = report.attribution.get("trade_count", len(report.trades))
@@ -1758,20 +1794,116 @@ class Runtime:
                 "Daily review %s: pnl=%.2f trades=%d",
                 today, report.portfolio_pnl, trade_count,
             )
-            from .discord_report import build_daily_review_message
-            self._notifier.send(build_daily_review_message(
+            body, fields = build_review_body(
                 today=today,
                 pnl=report.portfolio_pnl,
                 trade_count=trade_count,
                 trades=report.trades,
                 market_summary=getattr(report, "market_summary", ""),
                 symbols=list(self._cfg.symbols) if getattr(self._cfg, "symbols", None) else None,
-            ))
-            # Only mark today "done" once the review actually succeeded —
-            # marking it before the try meant a transient DB-lock failure
-            # (the live engine holds trade.duckdb open concurrently) would
-            # permanently skip the day's review instead of being retried on
-            # the next tick.
-            self._last_review_date = today
+            )
+
+            extras = [
+                build_direction_review_line(
+                    self._brief_calls.get(
+                        ts.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+                    ),
+                    self._session_ohlc_for_review(),
+                ),
+                build_overnight_risk_line(self._broker.get_positions()),
+                build_health_line(
+                    tick_count=self._tick_count,
+                    halted=self._risk.is_halted,
+                    halt_reason=self._risk.halt_reason or "",
+                ),
+            ]
+            unfilled = build_unfilled_plans_line(
+                [
+                    r
+                    for r in self._signal_store.recent(limit=50)
+                    if getattr(getattr(r, "state", ""), "value", "") == "INVALIDATED"
+                ]
+            )
+            if unfilled:
+                extras.insert(1, unfilled)
+
+            return PendingCloseReport(
+                trading_date=today,
+                review_body="\n\n".join([body] + [e for e in extras if e]),
+                fields=fields,
+                deadline=research_wait_deadline(ts),
+            )
         except Exception as exc:
             logger.warning("每日复盘失败: %s", exc)
+            return None
+
+    def _session_ohlc_for_review(self):
+        """取一个大盘代表标的的当日 OHLC，用来给晨报方向打分。"""
+        try:
+            from .data_cache import get_bars
+            from .manual_push import _session_ohlc
+
+            for symbol in ("SPY", "QQQ", *self._cfg.symbols):
+                bars = get_bars(symbol, self._cfg.timeframe)
+                ohlc = _session_ohlc(bars) if bars is not None else None
+                if ohlc:
+                    return ohlc
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("方向复盘取 OHLC 失败: %s", exc)
+        return None
+
+    def _maybe_flush_close_report(self, ts: datetime, today: str) -> None:
+        """研究批次好了（或等超时了）就把收盘报告发出去。"""
+        from .close_report import build_close_report
+
+        pending = self._pending_close_report
+        if pending is None:
+            return
+
+        research_body, missing = "", ""
+        run = None
+        try:
+            run = self._daily_research.store.latest_run(
+                ts.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("读取研究批次失败: %s", exc)
+
+        finished = run is not None and str(getattr(run, "status", "")).upper() not in (
+            "RUNNING",
+            "PENDING",
+            "",
+        )
+        if finished:
+            try:
+                from .daily_discord import build_daily_research_message
+
+                items = self._daily_research.store.items(run.run_id)
+                research_body = build_daily_research_message(run, items).body
+            except Exception as exc:  # noqa: BLE001
+                missing = f"研究结果读取失败（{type(exc).__name__}）"
+        elif pending.expired(ts):
+            missing = (
+                f"研究批次到 {ts.astimezone(ZoneInfo('America/New_York')):%H:%M} ET 仍未完成"
+                if run is not None
+                else "今天没有研究批次记录（可能未启用或未到触发时间）"
+            )
+        else:
+            return  # 还在等，下个 tick 再看
+
+        try:
+            self._notifier.send(
+                build_close_report(
+                    trading_date=pending.trading_date,
+                    review_body=pending.review_body,
+                    review_fields=pending.fields,
+                    research_body=research_body,
+                    research_missing_reason=missing,
+                )
+            )
+            # 发成功了才标记当天完成：否则一次瞬时的 DB 锁冲突（实盘引擎同时
+            # 占着 trade.duckdb）会让这一天的报告被永久跳过而不是下轮重试。
+            self._last_review_date = today
+            self._pending_close_report = None
+        except Exception as exc:
+            logger.warning("收盘报告推送失败: %s", exc)

@@ -1,7 +1,116 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+
+class BriefCallStore:
+    """记下晨报当天给的方向判断，供收盘时对账。
+
+    闭环的前提。晨报每天都在给可证伪的判断——"中性震荡，先等开盘区间给方
+    向"、"偏多，但只做回踩确认后的多头"——但判断一旦推送出去就没有任何东西
+    记得它，收盘时也就无从谈起"今天早上说对了没有"。evaluate_direction_call
+    早就写好了打分逻辑，却只能挂在一个要人手动选方向的按钮上，因为程序自己
+    不知道早上说过什么。
+    """
+
+    def __init__(self, db_path: str) -> None:
+        self.db_path = str(db_path)
+        self._init_db()
+
+    def _connect(self):
+        import duckdb
+
+        return duckdb.connect(self.db_path)
+
+    def _init_db(self) -> None:
+        try:
+            con = self._connect()
+        except Exception as exc:  # noqa: BLE001 - 建表失败不该拖垮晨报
+            logger.warning("晨报方向存储不可用: %s", exc)
+            return
+        try:
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS morning_brief_calls (
+                    trading_date TEXT PRIMARY KEY,
+                    bias TEXT,
+                    reasons TEXT,
+                    created_at TIMESTAMPTZ
+                )
+                """
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def record(
+        self,
+        *,
+        trading_date: str,
+        bias: str,
+        reasons: Optional[list[str]] = None,
+        at: Optional[datetime] = None,
+    ) -> None:
+        """记录当天的方向判断。同一天重复调用保留第一次的判断。
+
+        保留第一次是刻意的：收盘要对账的是"开盘前说了什么"。手动重发晨报会
+        用当时的行情重算出一个不同的方向，如果覆盖掉早上那次，等于让判断跟
+        着结果走，复盘就没有意义了。
+        """
+        try:
+            con = self._connect()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("晨报方向记录失败: %s", exc)
+            return
+        try:
+            con.execute(
+                """
+                INSERT INTO morning_brief_calls VALUES (?,?,?,?)
+                ON CONFLICT (trading_date) DO NOTHING
+                """,
+                [
+                    trading_date,
+                    str(bias or ""),
+                    "；".join(reasons or []),
+                    at or datetime.now(timezone.utc),
+                ],
+            )
+            con.commit()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("晨报方向记录失败: %s", exc)
+        finally:
+            con.close()
+
+    def get(self, trading_date: str) -> Optional[dict[str, Any]]:
+        try:
+            con = self._connect()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("晨报方向读取失败: %s", exc)
+            return None
+        try:
+            row = con.execute(
+                "SELECT trading_date, bias, reasons, created_at "
+                "FROM morning_brief_calls WHERE trading_date=?",
+                [trading_date],
+            ).fetchone()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("晨报方向读取失败: %s", exc)
+            return None
+        finally:
+            con.close()
+        if row is None:
+            return None
+        return {
+            "trading_date": str(row[0]),
+            "bias": str(row[1] or ""),
+            "reasons": [r for r in str(row[2] or "").split("；") if r],
+            "created_at": row[3],
+        }
 
 
 @dataclass(frozen=True)
@@ -59,6 +168,12 @@ def format_brief_call_review(review: BriefCallReview) -> str:
 
 def _normalize_bias(bias: str) -> str:
     text = str(bias or "").lower()
+    # 观望类措辞必须先判：晨报在重大事件日给出的是"事件前观望，不抢多空；
+    # 事件后只跟随确认方向"，这句里"多"和"空"同时出现，按下面的子串顺序会
+    # 先撞上"多"从而判成看多——把一个明确的观望建议记成了看涨，收盘对账时
+    # 就会拿错误的方向去打分。
+    if any(token in text for token in ("观望", "不抢", "中性", "震荡", "flat")):
+        return "neutral"
     if any(token in text for token in ("bull", "long", "多", "看多", "偏多")):
         return "bullish"
     if any(token in text for token in ("bear", "short", "空", "看空", "防守", "偏空")):
