@@ -69,7 +69,7 @@ def test_morning_brief_keeps_four_messages_with_action_card(monkeypatch):
         "_fetch_premarket_movers",
         lambda symbols: [{"symbol": "NVDA", "pct": 1.2, "pre_price": 101.2, "prev": 100.0}],
     )
-    monkeypatch.setattr(mb, "_build_regime_section", lambda: ("**市场环境**\n中性", 0))
+    monkeypatch.setattr(mb, "_build_regime_section", lambda live_vix=None: ("**市场环境**\n中性", 0))
     monkeypatch.setattr(mb, "_build_fear_greed", lambda: "")
     monkeypatch.setattr(mb, "_build_market_overview", lambda mkt: "大盘")
     monkeypatch.setattr(mb, "_build_macro_section", lambda mkt: "")
@@ -77,7 +77,6 @@ def test_morning_brief_keeps_four_messages_with_action_card(monkeypatch):
     monkeypatch.setattr(mb, "_build_technical_indicator_section", lambda technicals: "技术")
     monkeypatch.setattr(mb, "_build_event_section", lambda symbols, result=None: "事件")
     monkeypatch.setattr(mb, "_build_opex_section", lambda: "OpEx")
-    monkeypatch.setattr(mb, "_build_wsb_section", lambda symbols=None: "")
     monkeypatch.setattr(mb, "_build_trending_section", lambda symbols=None: "")
     monkeypatch.setattr(mb, "_build_analyst_changes", lambda symbols: "")
     monkeypatch.setattr(mb, "_build_news_section", lambda symbols=None, events=None: "")
@@ -621,24 +620,16 @@ def test_account_risk_lines_surface_largest_and_moving_positions():
     assert "新计划优先减半" in text
 
 
-def test_wsb_section_only_shows_notable_activity(monkeypatch):
-    import urllib.request
+def test_removed_dead_sources_stay_removed():
+    """WSB 与 CBOE Put/Call 已随上游封禁/下线一起删除，别再被顺手加回来。
 
+    Reddit 的 .json 接口对未授权请求恒 403（RSS 虽可访问但不带 upvote 分数，
+    支撑不了原来的热度阈值逻辑）；CBOE 两个公开 CSV 端点分别 403/404。
+    """
     import trader.morning_brief as mb
 
-    quiet_payload = {
-        "data": {"children": [{"data": {"title": "Daily discussion thread", "score": 120}}]}
-    }
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *_, **__: _FakeResponse(quiet_payload))
-    assert mb._build_wsb_section(["NVDA"]) == ""
-
-    hot_payload = {
-        "data": {"children": [{"data": {"title": "NVDA breakout setup", "score": 800}}]}
-    }
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *_, **__: _FakeResponse(hot_payload))
-    text = mb._build_wsb_section(["NVDA"])
-    assert "NVDA" in text
-    assert "异常热度" in text
+    assert not hasattr(mb, "_build_wsb_section")
+    assert not hasattr(mb, "_fetch_cboe_put_call")
 
 
 def test_yahoo_trending_only_shows_watchlist_or_large_moves(monkeypatch):

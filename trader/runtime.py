@@ -76,7 +76,7 @@ from .execution_pipeline import (
     candidate_from_trade_plan,
 )
 from .signal_reports import SignalStore, build_ready_signal_report
-from .selection import ConsensusSelector
+from .selection import AICandidateSelector
 from .trade_episodes import TradeEpisodeStore
 from .watchdog import FileKillSwitch, HeartbeatWatchdog
 
@@ -188,11 +188,20 @@ class Runtime:
         self._broker = AlpacaBroker(
             config.alpaca_api_key, config.alpaca_secret_key, paper=is_paper
         )
+        # data_feed_type 之前是"设了但没人读"：main.py 有 --data-feed 参数、
+        # .env 有 DATA_FEED_TYPE，帮助文本也写着能选数据源，但这里无论如何
+        # 都硬编码 AlpacaDataFeed —— 设成别的值会被静默忽略。目前确实只实现
+        # 了 Alpaca 一种，那就明确拒绝不支持的取值，而不是假装接受。
+        feed_type = (config.data_feed_type or "alpaca").strip().lower()
+        if feed_type != "alpaca":
+            raise ValueError(
+                f"UNSUPPORTED_DATA_FEED: {config.data_feed_type!r}（当前只实现了 alpaca）"
+            )
         self._feed = AlpacaDataFeed(config)
         self._portfolio = Portfolio(config)
         self._audit = AuditLog(config)
         self._risk = RiskEngine(config)
-        self._selector = ConsensusSelector(strategies=config.strategies)
+        self._selector = AICandidateSelector()
         self._planner = ATRPlanner()
         self._allocator = EqualWeightAllocator(
             max_position_pct=config.risk.max_position_pct,
@@ -200,12 +209,21 @@ class Runtime:
         if config.auto_trade_paper and config.broker_type != "alpaca_paper":
             raise ValueError("AUTO_TRADE_REQUIRES_ALPACA_PAPER")
         self._pos_monitor = StopTakeProfitMonitor()
-        self._notifier = DiscordNotifier()
+        # Fill notifications and the daily review push (below) are triggered
+        # by the running engine itself, not a stray background job — same
+        # authorization tier as the manual "发送" buttons, which already opt
+        # in via external_send_enabled=True. Without it here, every fill/
+        # review message was silently BLOCKED behind the
+        # DISCORD_EXTERNAL_SEND_ENABLED gate (see morning_brief.py fix).
+        self._notifier = DiscordNotifier(external_send_enabled=True)
         self._price_news = PriceMoveSource(
             universe=config.symbols, timeframe=config.timeframe
         )
+        # "us" 频道已从 channels 移除：华尔街见闻的 us-channel 现在稳定返回
+        # code=20000 + items=[]（频道已废弃），不报错、只是永远空手而归。
+        # 保留它只会每轮多打一次无用请求。global 频道本身已覆盖美股要闻。
         self._wscn = WallStreetCNSource(
-            universe=config.symbols, channels=["global", "us"],
+            universe=config.symbols, channels=["global"],
         )
         self._sec = SECEdgarSource(universe=config.symbols)
         self._finnhub = FinnhubSource(universe=config.symbols)
@@ -261,6 +279,7 @@ class Runtime:
             ai_min_weight_coverage=(
                 1.0 if daily_research else config.ai_min_weight_coverage
             ),
+            allow_short=config.risk.allow_short,
         )
         self._strategy_stats = StrategyStatisticsRepository.from_json(config.strategy_statistics_path)
         self._universe_provider = UniverseProvider(config.symbols, config.universe_max_symbols, config.universe_max_age_minutes)
@@ -737,6 +756,9 @@ class Runtime:
             logger.error("broker 数据获取失败，跳过本轮: %s", exc)
             return
         logger.info("equity=%.2f  positions=%d", equity, len(positions))
+        # 配置的杠杆倍数用于放大仓位规模（等权分配 + 风控上限的资金基数），
+        # 单笔止损风险仍按真实 equity 计算，不随杠杆放大。
+        buying_power = equity * max(float(self._cfg.leverage or 1.0), 1.0)
 
         # 4. 日内起点（只设一次）
         if not self._daily_start_set and equity > 0:
@@ -808,7 +830,8 @@ class Runtime:
                     positions,
                 )
 
-        # 11. 选股（ConsensusSelector → T0 regime 动态 score 阈值过滤）
+        # 11. 选股（AI 直选：每日深度研究名单 + 轻量技术确认，T0 regime 动态阈值）
+        ai_scores = self._read_ai_scores(ts)
         score_threshold = _get_score_threshold()
         if score_threshold is None:
             logger.info("T0 高波动(HIGH_VOL) → 暂停选股本轮")
@@ -817,13 +840,12 @@ class Runtime:
             return
         try:
             candidates = self._selector.select(
-                universe=list(self._universe_snapshot.symbols),
-                timeframe=self._cfg.timeframe,
-                as_of=ts,
+                ai_scores=ai_scores,
+                bars=raw_bars_map,
+                score_threshold=score_threshold,
             )
-            candidates = [c for c in candidates if c.score >= score_threshold]
             logger.info(
-                "selection: %d candidates (score≥%.0f, regime=%s)",
+                "selection: %d candidates (AI shortlist, score≥%.0f, regime=%s)",
                 len(candidates), score_threshold,
                 _get_current_regime_label(),
             )
@@ -833,19 +855,6 @@ class Runtime:
             )
             logger.error("selection.select 失败: %s", exc, exc_info=True)
             candidates = []
-
-        ai_scores = self._read_ai_scores(ts)
-        if self._cfg.daily_research_enabled:
-            research_symbols = set(ai_scores)
-            candidates = [
-                candidate
-                for candidate in candidates
-                if candidate.symbol in research_symbols
-            ]
-            logger.info(
-                'daily research gate: %d candidates from run shortlist',
-                len(candidates),
-            )
 
         decisions_by_symbol = {}
         decisions = self._decision_service.decide(
@@ -945,6 +954,7 @@ class Runtime:
                 equity,
                 positions,
                 pending_buy_notional=pending_buy_notional,
+                buying_power=buying_power,
             )
         except Exception as exc:
             self._bug_reporter.capture_exception(
@@ -991,6 +1001,7 @@ class Runtime:
                 equity,
                 positions,
                 pending_buy_notional=pending_buy_notional,
+                buying_power=buying_power,
             )
             self._audit.log_plan_risk_event(
                 plan,
@@ -1182,6 +1193,7 @@ class Runtime:
                         self._order_store
                         .pending_buy_notional_by_symbol()
                     ),
+                    buying_power=equity * max(float(self._cfg.leverage or 1.0), 1.0),
                 )
         if not verdict.approved:
             store.reject_candidate(
@@ -1338,6 +1350,12 @@ class Runtime:
                     equity,
                     positions,
                     pending_buy_notional=pending_buy_notional,
+                    # Must match the buying_power used when this plan was
+                    # first approved in _tick() — omitting it here would
+                    # silently re-check against bare equity and could reject
+                    # an already-approved leveraged plan right before
+                    # submission.
+                    buying_power=equity * max(float(self._cfg.leverage or 1.0), 1.0),
                 )
                 audit = getattr(self, "_audit", None)
                 if audit is not None:
@@ -1626,9 +1644,8 @@ class Runtime:
         )
         if ts < review_hour_et.astimezone(timezone.utc):
             return
-        self._last_review_date = today
         try:
-            report = self._reviewer.review(period="1d", as_of=ts)
+            report = self._reviewer.review(period="daily", as_of=ts)
             trade_count = report.attribution.get("trade_count", len(report.trades))
             logger.info(
                 "Daily review %s: pnl=%.2f trades=%d",
@@ -1639,8 +1656,15 @@ class Runtime:
                 today=today,
                 pnl=report.portfolio_pnl,
                 trade_count=trade_count,
+                trades=report.trades,
                 market_summary=getattr(report, "market_summary", ""),
                 symbols=list(self._cfg.symbols) if getattr(self._cfg, "symbols", None) else None,
             ))
+            # Only mark today "done" once the review actually succeeded —
+            # marking it before the try meant a transient DB-lock failure
+            # (the live engine holds trade.duckdb open concurrently) would
+            # permanently skip the day's review instead of being retried on
+            # the next tick.
+            self._last_review_date = today
         except Exception as exc:
             logger.warning("每日复盘失败: %s", exc)

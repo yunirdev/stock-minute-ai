@@ -99,6 +99,30 @@ _NON_COMPANY_SYMBOLS = {
     "SPXS",
 }
 
+# 有新闻、但没有财报和分析师评级的 ETF。
+#
+# 不能直接并进 _NON_COMPANY_SYMBOLS：那个集合会把标的整个排除出"个股"处理，
+# 而这些 ETF 的 Finnhub 公司新闻和盘前异动都是有效内容（GLD/TLT 每天都有
+# 实质新闻）。这里只用来跳过财报日历和分析师评级两类查询——对 ETF 调
+# yfinance 的 calendar / upgrades_downgrades 必定返回
+# "No fundamentals data found"，每份晨报都在日志里刷一串 404 告警，还白白
+# 多打了往返请求。
+_ETF_NO_FUNDAMENTALS = {
+    # 债券
+    "TLT", "IEF", "SHY", "AGG", "BND", "LQD", "HYG", "JNK", "TIP", "MUB",
+    # 商品 / 贵金属
+    "GLD", "IAU", "SLV", "USO", "UNG", "DBC", "PDBC",
+    # 货币
+    "UUP", "FXE", "FXY",
+    # 波动率
+    "VXX", "UVXY", "VIXY", "SVXY",
+    # 行业/主题 ETF（成分股有财报，ETF 本身没有）
+    "GDX", "GDXJ", "SMH", "XBI", "IBB", "KRE", "XOP", "XME", "ITB", "JETS",
+    "ARKK", "ARKG", "ARKW",
+    # 海外 / 区域
+    "EEM", "EFA", "FXI", "EWZ", "EWJ", "INDA", "VEA", "VWO",
+}
+
 # 宏观指标（^TYX 30Y 改为 ^IRX 3M 短端，用于计算收益率曲线倒挂）
 _MACRO_MAP = [
     # 利率（^IRX 只用于收益率曲线计算，不单独显示）
@@ -163,7 +187,13 @@ def send_morning_brief(
 ) -> bool:
     from .notify import DiscordNotifier
 
-    notifier = DiscordNotifier()
+    # Both callers of send_morning_brief() — the "发送晨报" UI button and the
+    # 9AM ET auto-brief in runtime._maybe_morning_brief — are already a
+    # deliberate, authorized send (explicit click, or a schedule the user
+    # turned on). Not passing external_send_enabled=True here left every
+    # brief silently BLOCKED behind the DISCORD_EXTERNAL_SEND_ENABLED gate,
+    # unlike manual_push.py's send_intraday_levels_push() which does opt in.
+    notifier = DiscordNotifier(external_send_enabled=True)
     msgs = build_morning_brief(symbols=symbols, db_path=db_path)
     ok = True
     for msg in msgs:
@@ -202,6 +232,24 @@ def build_morning_brief(
         macro_news=priority_news,
         premarket_movers=premarket_movers,
     )
+    # 整份晨报的措辞（"开盘策略"、"盘前快照"等）默认假设是盘前发的。手动
+    # "发送晨报"按钮没有时段限制，收盘后重发会呈现已经过期的盘前框架，
+    # 之前完全没有提示——这里显式标注一下，而不是让读者误以为是最新判断。
+    from .market_calendar import session_now as _session_now
+    _session = _session_now()
+    if _session != "pre":
+        _session_note = {
+            "open": "⚠️ 当前是盘中，不是盘前——下面的"
+            "「开盘策略」「盘前快照」是这份简报生成时的盘前框架，"
+            "可能已经被盘中走势打破，请结合实时行情判断。",
+            "post": "⚠️ 当前是盘后/已收盘，不是盘前——这份简报的"
+            "「开盘策略」框架针对的是已经过去的开盘时段，"
+            "不适用于隔夜/次日交易，仅供复盘参考。",
+            "closed": "⚠️ 当前休市，不是盘前——这份简报的"
+            "「开盘策略」框架针对的是上一个交易日，"
+            "不代表下一个交易日的最新判断。",
+        }[_session]
+        action_text = _session_note + "\n\n" + action_text
     msg1 = Notification(
         title=f"🎯 {date_str} {wd_cn} · 今日交易作战卡",
         body=action_text[:4000],
@@ -209,7 +257,10 @@ def build_morning_brief(
     )
 
     # ── 消息 2：市场依据 + 板块技术 ──────────────────────────────────────────
-    regime_text, _ = _build_regime_section()
+    _live_vix_data = mkt.get("^VIX")
+    regime_text, _ = _build_regime_section(
+        live_vix=float(_live_vix_data["price"]) if _live_vix_data else None
+    )
     fg_text = _build_fear_greed()
     market_text = _build_market_overview(mkt)  # 合并指数+期货，不再分开
     macro_text = _build_macro_section(mkt)  # 含收益率曲线倒挂判断
@@ -231,7 +282,6 @@ def build_morning_brief(
         "" if "财报" in event_text else _build_earnings_section(company_symbols)
     )
     opex_text = _build_opex_section()
-    wsb_text = _build_wsb_section(symbols)
     trending_text = _build_trending_section(symbols)
     analyst_text = _build_analyst_changes(company_symbols)
     news_text = _build_news_section(symbols, events=priority_news)
@@ -243,7 +293,6 @@ def build_morning_brief(
             earnings_text,
             opex_text,
             analyst_text,
-            wsb_text,
             trending_text,
         ]
     )
@@ -302,6 +351,11 @@ def _company_symbols(symbols: List[str]) -> List[str]:
     return out
 
 
+def _fundamentals_symbols(symbols: List[str]) -> List[str]:
+    """能查到财报/评级的标的：在 _company_symbols 基础上再去掉 ETF。"""
+    return [s for s in _company_symbols(symbols) if s not in _ETF_NO_FUNDAMENTALS]
+
+
 def _build_action_card(
     mkt: Dict[str, dict],
     symbols: List[str],
@@ -352,7 +406,7 @@ def _build_action_card(
         pro_window,
         "",
         "纪律：不追第一根 5m K；事件前后 15-30 分钟不新开仓；所有计划仍以止损和确定性风控为准。",
-        "_这是交易辅助，不是买卖指令。_",
+        "_以上是 AI 模型基于当前数据给出的直接结论，不是万无一失的预测——自行判断是否采纳，仓位/止损自担。_",
     ]
 
     if main_reasons:
@@ -1346,7 +1400,11 @@ def _fetch_batch() -> Dict[str, dict]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def _build_regime_section() -> Tuple[str, int]:
+def _build_regime_section(live_vix: Optional[float] = None) -> Tuple[str, int]:
+    """`live_vix`（可选）：同一次晨报里已经实时拉到的 VIX（_fetch_batch 的
+    ^VIX），用来跟这里读的市场环境缓存（手动刷新才更新，可能是几天前的）
+    做一次核对——避免同一份简报里出现两个互相矛盾又没有互相说明的 VIX 数字。
+    """
     try:
         from .teams.market_env import read_regime_cache
 
@@ -1363,7 +1421,10 @@ def _build_regime_section() -> Tuple[str, int]:
         )
 
     age_h = (datetime.now(timezone.utc) - cached.as_of).total_seconds() / 3600
-    stale = "（数据较旧，建议刷新）" if age_h > 20 else ""
+    if age_h > 20:
+        stale = f"（缓存已 {age_h:.1f} 小时未刷新，建议去 UI「总览」重新刷新）"
+    else:
+        stale = ""
 
     vix = cached.vix
     spy = cached.spy_vs_200ma_pct
@@ -1380,6 +1441,13 @@ def _build_regime_section() -> Tuple[str, int]:
         vix_line = f"VIX {vix:.1f} ⚠️ — 市场在恐慌，价格波动大"
     else:
         vix_line = f"VIX {vix:.1f} 🚨 — 极度恐慌，建议场外观望"
+
+    if (
+        live_vix is not None
+        and vix is not None
+        and abs(live_vix - vix) >= 1.0
+    ):
+        vix_line += f"（同一份简报里的实时 VIX 是 {live_vix:.1f}，缓存已过期，以实时为准）"
 
     if spy is None:
         spy_line = "大盘趋势数据不可用"
@@ -1423,8 +1491,24 @@ def _build_regime_section() -> Tuple[str, int]:
 
 
 def _build_market_overview(mkt: dict) -> str:
-    """合并指数昨收 + 对应期货盘前方向，避免重复显示同一标的。"""
-    lines = ["**📈 大盘昨收 & 盘前方向**"]
+    """合并指数昨收 + 对应期货方向，避免重复显示同一标的。
+
+    期货那一栏的涨跌幅永远是 yfinance "1d" 整根 K 线的涨跌（不区分盘前/
+    盘中/盘后），过去无脑贴"盘前"标签——如果晨报是收盘后手动重发的，这
+    根本不是盘前数据，是当天已经走完的全天涨跌。改成按真实市场时段动态
+    加标签。
+    """
+    from .market_calendar import session_now
+
+    session = session_now()
+    fut_label = {"pre": "盘前", "open": "盘中", "post": "盘后", "closed": "最新"}[session]
+
+    lines = ["**📈 大盘昨收 & 期货方向**"]
+    if session != "pre":
+        lines.append(
+            f"_（当前非盘前时段 [{fut_label}]，下面期货涨跌是最新整根 K 线涨跌，"
+            "不是纯盘前变动）_"
+        )
     any_data = False
     for etf, name in _INDEX_MAP:
         d_etf = mkt.get(etf)
@@ -1441,7 +1525,7 @@ def _build_market_overview(mkt: dict) -> str:
         d_fut = mkt.get(fut_tk) if fut_tk else None
         if d_fut:
             fa = "▲" if d_fut["pct"] >= 0 else "▼"
-            line += f"  │  盘前 {fa}{abs(d_fut['pct']):.2f}%"
+            line += f"  │  {fut_label} {fa}{abs(d_fut['pct']):.2f}%"
         lines.append(line)
 
     es = mkt.get("ES=F")
@@ -1571,18 +1655,6 @@ def _build_macro_section(mkt: dict) -> str:
 
         arrow = "↑" if pct >= 0 else "↓"
         lines.append(f"  {name:<20} {val_str}  {arrow}{abs(pct):.2f}%  {interp}")
-
-    # ── Put/Call Ratio（仅在极端时显示） ──────────────────────────────────
-    pc = _fetch_cboe_put_call()
-    if pc is not None:
-        if pc < 0.7:
-            lines.append(
-                f"  {'Put/Call Ratio':<20} {pc:.2f}  ← 期权过度乐观，警惕短期顶部"
-            )
-        elif pc > 1.2:
-            lines.append(
-                f"  {'Put/Call Ratio':<20} {pc:.2f}  ← 期权防守性强，情绪接近底部"
-            )
 
     # ── 收益率曲线（仅倒挂或趋平时显示） ─────────────────────────────────
     tnx = mkt.get("^TNX")
@@ -1834,11 +1906,12 @@ def _build_event_section(symbols: List[str], result: Any = None) -> str:
 
 def _build_earnings_section(symbols: List[str]) -> str:
     """本周自选股财报日历（yfinance calendar）。"""
-    symbols = _company_symbols(symbols)
+    symbols = _fundamentals_symbols(symbols)
     if not symbols:
         return ""
     try:
         import yfinance as yf
+        from datetime import date as _date_cls
         from datetime import timedelta
 
         today = _today_pacific_date()
@@ -1858,7 +1931,17 @@ def _build_earnings_section(symbols: List[str]) -> str:
                     dates_raw = [dates_raw]
                 for raw_dt in dates_raw:
                     try:
-                        dt = raw_dt.date() if hasattr(raw_dt, "date") else None
+                        # yfinance returns plain datetime.date objects for
+                        # calendar entries, not datetime.datetime/Timestamp —
+                        # a date has no .date() method, so the old
+                        # hasattr(raw_dt, "date") check was always False and
+                        # this whole function always returned "" silently.
+                        if isinstance(raw_dt, datetime):
+                            dt = raw_dt.date()
+                        elif isinstance(raw_dt, _date_cls):
+                            dt = raw_dt
+                        else:
+                            dt = None
                         if dt and today <= dt <= week_end:
                             upcoming.append({"symbol": sym, "date": dt})
                             break
@@ -1902,8 +1985,10 @@ def _fetch_priority_market_news(symbols: Optional[List[str]] = None) -> List[Any
         from .news import WallStreetCNSource
 
         since = datetime.now(timezone.utc) - timedelta(hours=14)
+        # us 频道已废弃（code=20000 但 items 恒为空），去掉以免每次多打一个
+        # 无效请求；global/forex/oil/gold 实测都正常返回。
         src = WallStreetCNSource(
-            channels=["global", "us", "forex", "oil", "gold"],
+            channels=["global", "forex", "oil", "gold"],
             num=40,
             min_score=2,
             timeout=8.0,
@@ -1966,7 +2051,8 @@ def _build_news_section(
 ) -> str:
     """
     国际宏观要闻 — 直接复用 trader/news.WallStreetCNSource（华尔街见闻全球快讯）。
-    覆盖：全球要闻 · 美股 · 外汇 · 原油 · 黄金，score≥2 重要以上，中文内容。
+    覆盖：全球要闻 · 外汇 · 原油 · 黄金，score≥2 重要以上，中文内容。
+    （美股频道已被上游废弃，见 _fetch_priority_market_news 注释。）
     """
     if events is None:
         events = _fetch_priority_market_news(symbols)
@@ -1993,34 +2079,10 @@ def _format_dt_pt(ts: datetime) -> str:
     return ts.astimezone(_PACIFIC_TZ).strftime("%H:%M PT")
 
 
-def _fetch_cboe_put_call() -> Optional[float]:
-    """CBOE 总 Put/Call Ratio（公开 CSV，无需 Key）；失败返回 None。"""
-    try:
-        import urllib.request
-
-        for url in [
-            "https://cdn.cboe.com/api/global/us_indices/daily_prices/PC_1_0.csv",
-            "https://www.cboe.com/data/US_Options_Volume_PC_Ratio.csv",
-        ]:
-            try:
-                req = urllib.request.Request(
-                    url, headers={"User-Agent": "Mozilla/5.0 (compatible)"}
-                )
-                with urllib.request.urlopen(req, timeout=8) as resp:
-                    text = resp.read().decode("utf-8", errors="replace")
-                rows = [
-                    r
-                    for r in text.strip().split("\n")
-                    if r.strip() and not r.startswith("DATE")
-                ]
-                if rows:
-                    last_val = rows[-1].split(",")[-1].strip()
-                    return float(last_val)
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return None
+# CBOE Put/Call Ratio 已移除：两个公开 CSV 端点分别返回 403 / 404（CBOE 已
+# 撤下免费下载），官方 market_statistics JSON 同样 403，只剩需要爬 HTML 的
+# 页面，不值得为一个可选指标背这个脆弱性。情绪维度已由 VIX（_build_regime_
+# section）和 CNN Fear & Greed（_build_fear_greed）覆盖。
 
 
 def _build_fear_greed() -> str:
@@ -2033,8 +2095,22 @@ def _build_fear_greed() -> str:
         import json
 
         url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+        # CNN 的边缘防护要求 UA + Referer + Accept 三个头同时存在，缺任何
+        # 一个都返回 418（实测：UA 单独、UA+Referer、UA+Accept 全是 418，
+        # 三者齐备才 200）。原来只发 "Mozilla/5.0 (compatible)"，于是每天
+        # 都在日志里刷 "Fear & Greed 获取失败: HTTP Error 418"，晨报这一
+        # 节长期是空的。
         req = urllib.request.Request(
-            url, headers={"User-Agent": "Mozilla/5.0 (compatible)"}
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/126.0.0.0 Safari/537.36"
+                ),
+                "Referer": "https://www.cnn.com/markets/fear-and-greed",
+                "Accept": "application/json",
+            },
         )
         with urllib.request.urlopen(req, timeout=6) as resp:
             data = json.loads(resp.read())
@@ -2080,7 +2156,7 @@ def _build_fear_greed() -> str:
             f"→ {note}"
         )
     except Exception as exc:
-        logger.debug("Fear & Greed 获取失败: %s", exc)
+        logger.warning("Fear & Greed 获取失败: %s", exc)
         return ""
 
 
@@ -2146,7 +2222,7 @@ def _build_opex_section() -> str:
 
 def _build_analyst_changes(symbols: List[str]) -> str:
     """近 48h 自选股分析师评级变动（yfinance upgrades_downgrades）。"""
-    symbols = _company_symbols(symbols)
+    symbols = _fundamentals_symbols(symbols)
     if not symbols:
         return ""
     try:
@@ -2179,16 +2255,30 @@ def _build_analyst_changes(symbols: List[str]) -> str:
         if not changes:
             return ""
 
-        lines = ["**📊 分析师评级变动（近 48h）**"]
+        # yfinance 的 Action 取值：up / down / main(维持) / reit(重申) / init(首次覆盖)。
+        # 原来把 reit/init 也画成 ⬆️ 升级箭头，于是 "Buy → Buy" 这种"维持原评级"
+        # 被摆在"评级变动"标题下面显示成利好——对交易者是实打实的误导。
+        # 现在按真实含义分开标注，标题也改成如实描述。
+        _ACTION_LABEL = {
+            "up":   ("⬆️", "上调"),
+            "down": ("⬇️", "下调"),
+            "init": ("🆕", "首次覆盖"),
+            "reit": ("🔁", "重申"),
+            "main": ("➖", "维持"),
+        }
+        lines = ["**📊 分析师评级动态（近 48h）**"]
         for c in changes[:8]:
-            if "up" in c["action"] or c["action"] in ("init", "reit"):
-                emoji = "⬆️"
-            elif "down" in c["action"]:
-                emoji = "⬇️"
+            action = str(c["action"]).lower()
+            if action in _ACTION_LABEL:
+                emoji, label = _ACTION_LABEL[action]
+            elif "up" in action:
+                emoji, label = "⬆️", "上调"
+            elif "down" in action:
+                emoji, label = "⬇️", "下调"
             else:
-                emoji = "🔄"
+                emoji, label = "🔄", action or "变动"
             grade = f"{c['from']} → {c['to']}" if c["from"] and c["to"] else c["to"]
-            lines.append(f"{emoji} **{c['symbol']}**  {grade}  （{c['firm']}）")
+            lines.append(f"{emoji} **{c['symbol']}**  {label}：{grade}  （{c['firm']}）")
         return "\n".join(lines)
     except Exception as exc:
         logger.debug("分析师评级获取失败: %s", exc)
@@ -2326,7 +2416,14 @@ def _format_news_age(ts: Any) -> str:
 
 
 def _build_stock_catalysts(symbols: List[str]) -> str:
-    """各股关键动态：华尔街见闻美股频道（按标的过滤）+ Finnhub 公司新闻（48h，不过滤关键词）。"""
+    """各股关键动态：Finnhub 公司新闻（48h，不过滤关键词）。
+
+    原本这里还有一段华尔街见闻 us-channel 的"按标的过滤"逻辑，已删除：该频道
+    上游已废弃（返回 code=20000 但 items 恒为空），而且即便改抓 global 频道也
+    没用——那边是中文宏观快讯，几乎不带美股 ticker，按 ticker 过滤永远匹配不
+    到。这一节的用途（个股 48h 催化剂）由 Finnhub 公司新闻完整覆盖，它本身就
+    是按 symbol 拉取的英文源。
+    """
     symbols = _company_symbols(symbols)
     if not symbols:
         return ""
@@ -2334,33 +2431,6 @@ def _build_stock_catalysts(symbols: List[str]) -> str:
     lines = ["**📌 各股关键动态（48h）**"]
     any_content = False
     since = datetime.now(timezone.utc) - timedelta(hours=48)
-    sym_set = {s.upper() for s in symbols}
-
-    # ── 华尔街见闻美股频道（us-channel，按自选股标的过滤） ──────────────────────
-    try:
-        from .news import WallStreetCNSource
-
-        src = WallStreetCNSource(
-            universe=symbols,
-            channels=["us"],
-            num=50,
-            min_score=1,
-            timeout=8.0,
-        )
-        matched = [
-            e for e in src.poll(since) if e.symbol and e.symbol.upper() in sym_set
-        ]
-        if matched:
-            any_content = True
-            selected = _select_balanced_company_news(matched, limit=8, per_symbol=2)
-            lines.append("**📰 华尔街见闻（美股频道）**")
-            for ev in selected:
-                text = (ev.summary or ev.title)[:120]
-                lines.append(
-                    f"• **{ev.symbol}**  {text}  _({_format_news_age(ev.ts)})_"
-                )
-    except Exception as exc:
-        logger.debug("stock_catalysts wscn: %s", exc)
 
     # ── Finnhub 公司新闻（不过滤关键词，需 FINNHUB_API_KEY）────────────────────
     try:
@@ -2370,7 +2440,7 @@ def _build_stock_catalysts(symbols: List[str]) -> str:
         fh_ev = [ev for ev in fh.poll(since) if _company_news_score(ev) > 0]
         if fh_ev:
             any_content = True
-            lines.append("\n**📋 Finnhub 公司新闻**")
+            lines.append("**📋 Finnhub 公司新闻**")
             for ev in _select_balanced_company_news(fh_ev, limit=8, per_symbol=2):
                 title = (ev.title or "")[:110]
                 tag = _company_news_tag(ev)
@@ -2384,117 +2454,12 @@ def _build_stock_catalysts(symbols: List[str]) -> str:
     return "\n".join(lines) if any_content else ""
 
 
-def _build_wsb_section(symbols: Optional[List[str]] = None) -> str:
-    """r/WallStreetBets 异常热度 — 只在高热度或自选股相关时显示。"""
-    try:
-        import json
-        import re
-        import urllib.request
-
-        url = "https://www.reddit.com/r/wallstreetbets/hot.json?limit=20"
-        req = urllib.request.Request(
-            url, headers={"User-Agent": "Mozilla/5.0 (compatible; morning-brief/1.0)"}
-        )
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read())
-
-        _SKIP = {
-            "THE",
-            "FOR",
-            "AND",
-            "ARE",
-            "WITH",
-            "THAT",
-            "FROM",
-            "THIS",
-            "BEEN",
-            "HAVE",
-            "WILL",
-            "WHAT",
-            "THEY",
-            "YOUR",
-            "PUT",
-            "BUY",
-            "SELL",
-            "HOLD",
-            "CALL",
-            "YOLO",
-            "MOON",
-            "ETF",
-            "CEO",
-            "IPO",
-            "ALL",
-            "NOW",
-            "NEW",
-            "TOP",
-            "ANY",
-            "GET",
-            "ITS",
-            "BUT",
-            "NOT",
-            "YOU",
-            "HAS",
-            "WAS",
-            "WHO",
-            "HOW",
-            "WHY",
-            "CAN",
-            "DID",
-            "OUT",
-            "USE",
-            "SAY",
-            "TWO",
-            "WAY",
-            "MAY",
-            "DAY",
-            "OUR",
-            "ONE",
-            "IRS",
-            "SEC",
-            "FED",
-        }
-        ticker_re = re.compile(r"\b([A-Z]{2,5})\b")
-        sym_set = {s.upper() for s in (symbols or [])}
-        mentions: dict[str, int] = {}
-        hot: list[tuple[str, int, bool]] = []
-
-        for child in data["data"]["children"]:
-            post = child["data"]
-            title = post.get("title", "")
-            score = post.get("score", 0)
-            tickers = [
-                m.group(1) for m in ticker_re.finditer(title) if m.group(1) not in _SKIP
-            ]
-            watched_hit = any(t in sym_set for t in tickers)
-            if score >= 1500 or (watched_hit and score >= 500):
-                hot.append(
-                    (title[:68] + ("…" if len(title) > 68 else ""), score, watched_hit)
-                )
-            for tk in tickers:
-                mentions[tk] = mentions.get(tk, 0) + 1
-
-        notable_mentions = [
-            (tk, c) for tk, c in mentions.items() if c >= 2 or tk in sym_set
-        ]
-        notable_mentions.sort(key=lambda x: (x[0] not in sym_set, -x[1], x[0]))
-
-        if not notable_mentions and not hot:
-            return ""
-
-        lines = ["**🐸 r/WallStreetBets 异常热度**"]
-        if notable_mentions:
-            top = notable_mentions[:6]
-            lines.append("热议标的：" + "  ".join(f"**{t}**({c})" for t, c in top))
-        for title, score, watched_hit in sorted(hot, key=lambda x: x[1], reverse=True)[
-            :4
-        ]:
-            tag = "自选股相关 · " if watched_hit else ""
-            lines.append(f"• {tag}{title}  [{score:,}↑]")
-
-        return "\n".join(lines) if len(lines) > 1 else ""
-    except Exception as exc:
-        logger.debug("WSB 获取失败: %s", exc)
-        return ""
+# r/WallStreetBets 板块已移除：Reddit 自 2023 年起封锁未授权的 .json 接口，
+# hot.json 无论换什么 User-Agent 都返回 403（old.reddit 同样 403）。唯一还能
+# 匿名访问的是 RSS，但 RSS 不带 upvote 分数，而原实现的"异常热度"判定完全
+# 建立在 score>=1500 / 自选股相关 score>=500 的阈值上——没有分数就只剩"有人
+# 提过"，噪音远大于信号。散户热度这一维度改由 _build_trending_section
+# （Yahoo Finance 热搜，实测可用）承担。
 
 
 def _build_trending_section(symbols: Optional[List[str]] = None) -> str:
@@ -2831,9 +2796,8 @@ def _build_status_section(db_path: str, movers: Optional[List[dict]] = None) -> 
 
     except Exception as exc:
         logger.debug("账户状态获取失败: %s", exc)
-        out.append("账户数据获取失败（检查 Alpaca API Key）")
+        out.append("⚠️ 账户数据获取失败（检查 Alpaca API Key），以上仓位/盈亏可能不是最新的。")
 
-    out.append("_以上数据仅供参考，不构成投资建议。_")
     return "\n".join(out)
 
 
