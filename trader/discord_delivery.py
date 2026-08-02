@@ -19,11 +19,19 @@ _SECRET_PATTERNS = (
 
 
 def sanitize_notification(note: Notification) -> Notification:
+    """脱敏，不负责裁剪长度。
+
+    原来这里对每个字段做 ``text[:4000]``，既不是 Discord 的真实限制（正文是
+    4096、字段值是 1024），又会在脱敏阶段就把内容砍掉，让下游再想按语义分页
+    也无米下锅。长度整形统一交给 discord_limits.fit_notification()，脱敏只做
+    脱敏。
+    """
+
     def clean(value: Any) -> str:
         text = str(value)
         for pattern in _SECRET_PATTERNS:
             text = pattern.sub("[REDACTED]", text)
-        return text[:4000]
+        return text
 
     return Notification(
         title=clean(note.title),

@@ -210,7 +210,13 @@ def build_morning_brief(
     symbols: List[str],
     db_path: str = _DB_PATH,
 ) -> List[Notification]:
-    """组装 4 条 Notification，不实际推送，方便测试。"""
+    """组装 4 条 Notification，不实际推送，方便测试。
+
+    这里刻意不做任何长度裁剪：内容该写多完整就写多完整，压进 Discord 尺寸是
+    发送层 discord_limits.fit_notification() 的职责（沿语义边界分页，并如实
+    标注省略量）。以前每条正文各写一次 ``[:4000]``，数字既不对（正文上限是
+    4096），又会从半句话中间砍断。
+    """
     now = _now_pacific()
     date_str = now.strftime("%m/%d")
     wd_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now.weekday()]
@@ -252,7 +258,7 @@ def build_morning_brief(
         action_text = _session_note + "\n\n" + action_text
     msg1 = Notification(
         title=f"🎯 {date_str} {wd_cn} · 今日交易作战卡",
-        body=action_text[:4000],
+        body=action_text,
         kind="review",
     )
 
@@ -272,7 +278,7 @@ def build_morning_brief(
     )
     msg2 = Notification(
         title="📊 市场依据 · 指标计算",
-        body=(body2 or "市场依据暂不可用，请以开盘价格和账户风控为准。")[:4000],
+        body=body2 or "市场依据暂不可用，请以开盘价格和账户风控为准。",
         kind="review",
     )
 
@@ -298,9 +304,7 @@ def build_morning_brief(
     )
     msg3 = Notification(
         title="📅 事件风险 · 异常新闻",
-        body=(body3 or "暂无可确认的高优先级事件/新闻，请开盘前人工核对经济日历。")[
-            :4000
-        ],
+        body=body3 or "暂无可确认的高优先级事件/新闻，请开盘前人工核对经济日历。",
         kind="news",
     )
 
@@ -312,7 +316,7 @@ def build_morning_brief(
     body4 = _join([catalysts_text, premarket_text, status_text])
     msg4 = Notification(
         title="📋 今日准备清单 · 各股前瞻",
-        body=body4[:4000],
+        body=body4,
         kind="plan",
     )
 

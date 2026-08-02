@@ -641,8 +641,14 @@ def _score(recommendation: str, confidence: float) -> float:
 
 
 def _thesis(value: Any) -> str:
-    text = _decision_text(value).strip()
-    return text[:4000]
+    """研究结论原文，不在这里裁剪。
+
+    原来这里 ``text[:4000]`` 是想防 Discord 超限，但位置不对：thesis 会进
+    embed 的 field.value，那里的上限是 1024 而不是 4096，4000 根本挡不住；
+    而且 thesis 还要落库供决策台展示，在数据层就砍掉等于永久丢失。长度整形
+    交给推送层（discord_limits + build_daily_research_message 的预算分配）。
+    """
+    return _decision_text(value).strip()
 
 
 def _risks(value: Any) -> list[str]:
@@ -1321,6 +1327,7 @@ class DailyResearchStore:
                 weight_coverage=1.0,
                 has_llm=True,
                 fallback_count=0,
+                recommendation=item.recommendation,
             )
         return snapshots
 

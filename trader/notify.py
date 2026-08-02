@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from .discord_delivery import DiscordDeliveryStore
+from .discord_limits import fit_notification
 from .models import Notification
 
 logger = logging.getLogger(__name__)
@@ -116,11 +117,26 @@ class DiscordNotifier:
         return result["status"] == "SENT"
 
     def _send_configured(self, note: Notification) -> bool:
-        if self._token and self._channel:
-            return self._send_bot(note)
-        if self._webhook:
-            return self._send_webhook(note)
-        return False
+        """整形到 Discord 允许的尺寸后逐条发出。
+
+        整形放在审计之后、POST 之前：审计库留存的是完整原文（便于事后追溯
+        "我们本来打算发什么"），而 Discord 上呈现的是按语义分好页的版本。一
+        条业务通知仍然只对应一条审计记录，分页不会污染去重身份。
+        """
+        pages = fit_notification(note)
+        ok = True
+        for page in pages:
+            if self._token and self._channel:
+                sent = self._send_bot(page)
+            elif self._webhook:
+                sent = self._send_webhook(page)
+            else:
+                return False
+            ok = sent and ok
+            if not sent:
+                # 分页里有一页失败就别继续刷了，剩下的页对读者也是残缺的
+                break
+        return ok
 
     # ── Bot Token 方式 ────────────────────────────────────────────────────────
 

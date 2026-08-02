@@ -4,6 +4,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from .discord_limits import (
+    EMBED_TOTAL_MAX,
+    FIELD_VALUE_MAX,
+    allocate_budget,
+    truncate_text,
+)
 from .models import Notification
 
 
@@ -41,14 +47,32 @@ def build_daily_research_message(run: Any, items: list[Any]) -> Notification:
         ),
         "数据截止": _fmt_time(getattr(run, "data_cutoff", None)),
     }
-    for item in completed[:5]:
+    # thesis 的篇幅按实际内容动态分配，而不是每条都硬切 180 字：几个标的都写得
+    # 短时一个字都不裁，有人写得特别长时才逐步压缩，且压缩是均摊的。分配总额
+    # 取自还没被上面几个固定字段占掉的 embed 额度。
+    shown = completed[:5]
+    if shown:
+        theses = [str(getattr(item, "thesis", "") or "") for item in shown]
+        used = sum(len(k) + len(v) for k, v in fields.items()) + len("\n".join(lines))
+        pool = max(
+            len(shown) * 80,
+            EMBED_TOTAL_MAX - used - 400,  # 400 给标题和每条的分数行留白
+        )
+        quotas = allocate_budget([len(t) for t in theses], pool, min_each=80)
+    else:
+        theses, quotas = [], []
+
+    for item, thesis, quota in zip(shown, theses, quotas):
         recommendation = str(getattr(item, "recommendation", "HOLD")).upper()
         icon = {"BUY": "🟢", "SELL": "🔴"}.get(recommendation, "🟡")
         score = float(getattr(item, "ai_score", 0.0) or 0.0)
         screening = float(getattr(item, "screening_score", 0.0) or 0.0)
+        headline = f"深度分 {score:.1f} · 初筛 {screening:.1f}"
+        # 单个 field.value 上限 1024，扣掉分数行才是 thesis 的真实可用额度
+        room = min(quota, FIELD_VALUE_MAX - len(headline) - 2)
+        body = truncate_text(thesis, room) if thesis else "无摘要"
         fields[f"{icon} {getattr(item, 'symbol', '—')} · {recommendation}"] = (
-            f"深度分 {score:.1f} · 初筛 {screening:.1f}\n"
-            f"{_trunc(getattr(item, 'thesis', ''), 180) or '无摘要'}"
+            f"{headline}\n{body}"
         )
     if not completed:
         lines.extend(["", "⚠️ 本批次没有产生可验证的深度研究结果。"])
