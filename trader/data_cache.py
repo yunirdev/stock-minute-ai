@@ -475,8 +475,66 @@ def list_cached_names() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# 观察列表清理 — 被踢出观察池且无持仓/挂单的 symbol，删除其本地 bar 缓存
+# 观察列表清理 — 被踢出观察池的 symbol 删除其本地 bar 缓存
+#
+# data/bars/ 是多个互不相干的消费方共用的：选股池、Runtime 的 --symbols、
+# daily_research、全市场扫描、UI 手动下载。调用方（选股池重建）只知道自己那
+# 一份名单，所以"其余消费方还要什么"必须在这里统一兜住，否则会删掉 Runtime
+# 正在交易的标的——而 data_cache 是严格本地优先、绝不自动联网，删了不会自
+# 动补回来，后果是 get_bars() 返回空、快照标记 BAR_CACHE_EMPTY、决策门禁静
+# 默拦下所有交易。
 # ---------------------------------------------------------------------------
+def _configured_universe() -> set[str]:
+    """.env 的 SYMBOLS —— 数据下载/预热脚本的默认标的池。
+
+    Settings 刻意不读这个键（引擎 universe 由 CLI 控制），但它仍是用户声明
+    "我关心这些标的"的唯一持久化信号，所以清理时必须尊重它。
+    """
+    import os
+    try:
+        from . import config as _config  # noqa: F401  (imported for load_dotenv)
+    except Exception:
+        pass
+    raw = os.getenv("SYMBOLS", "") or ""
+    return {s.strip().upper() for s in raw.split(",") if s.strip()}
+
+
+def _recent_research_symbols(
+    ai_db_path: str | Path | None = None,
+    *,
+    days: int = 30,
+) -> set[str]:
+    """最近做过研究的标的 —— Runtime 的 --symbols universe 的可观测代理。
+
+    Runtime 的标的来自命令行、不落盘，这里无法直接读到；但 Runtime 跑过什么，
+    daily_research 就会给什么留下快照，所以用近期快照反推交易 universe。
+    """
+    symbols: set[str] = set()
+    path = Path(ai_db_path) if ai_db_path else _ROOT / "ai_states.duckdb"
+    if not path.exists():
+        return symbols
+    try:
+        import duckdb
+        con = duckdb.connect(str(path), read_only=True)
+        try:
+            # trading_date is stored as an ISO date string, so compare as text
+            # (ISO dates sort lexicographically) rather than binding a date.
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(days=days)
+            ).date().isoformat()
+            rows = con.execute(
+                "SELECT DISTINCT symbol FROM research_snapshots "
+                "WHERE CAST(trading_date AS VARCHAR) >= ?",
+                [cutoff],
+            ).fetchall()
+            symbols.update(str(r[0]).upper() for r in rows if r[0])
+        finally:
+            con.close()
+    except Exception as exc:
+        logger.warning("data_cache _recent_research_symbols: %s", exc)
+    return symbols
+
+
 def _protected_symbols(db_path: str | Path | None = None) -> set[str]:
     """有实仓持仓或未终结挂单的 symbol，永远不清理，无论是否还在观察池里。
     只读、尽力而为：数据库/表不存在时静默返回空集合，不影响调用方自己的
@@ -522,17 +580,33 @@ def prune_bar_cache(
     keep_symbols: Iterable[str],
     *,
     db_path: str | Path | None = None,
+    ai_db_path: str | Path | None = None,
+    grace_days: int = 7,
 ) -> dict:
     """删除不在 keep_symbols 里的本地 bar 缓存文件（跨所有 timeframe）。
 
-    无论 keep_symbols 是什么，持仓中或有未终结挂单的 symbol 一律豁免——
-    这个保护在这里统一做，调用方不需要自己记得排除持仓。
+    调用方只需要传自己那份名单。其余消费方的需求在这里统一兜住，一律豁免：
+      - 有实仓持仓、或有未终结挂单的标的
+      - .env SYMBOLS 声明的标的池
+      - 最近 30 天做过研究的标的（Runtime --symbols universe 的代理）
+      - 最近 grace_days 天内下载过的文件（刚下好还没来得及被任何名单收录）
+
+    grace_days=0 关闭时间宽限，只按名单删。
     """
     keep = {str(s).strip().upper() for s in keep_symbols if str(s).strip()}
     keep |= _protected_symbols(db_path)
+    keep |= _configured_universe()
+    keep |= _recent_research_symbols(ai_db_path)
+
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=grace_days)
+        if grace_days > 0
+        else None
+    )
 
     removed: list[str] = []
     removed_bytes = 0
+    kept_by_grace: list[str] = []
     if _BARS_DIR.exists():
         for path in sorted(_BARS_DIR.glob("*.parquet")):
             stem = path.stem
@@ -542,7 +616,13 @@ def prune_bar_cache(
             if symbol in keep:
                 continue
             try:
-                size = path.stat().st_size
+                stat = path.stat()
+                if cutoff is not None:
+                    mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+                    if mtime >= cutoff:
+                        kept_by_grace.append(path.name)
+                        continue
+                size = stat.st_size
                 path.unlink()
                 removed.append(path.name)
                 removed_bytes += size
@@ -557,10 +637,17 @@ def prune_bar_cache(
             "prune_bar_cache removed %d file(s), %.1f MB reclaimed: %s",
             len(removed), removed_bytes / (1024 * 1024), ", ".join(removed),
         )
+    if kept_by_grace:
+        logger.info(
+            "prune_bar_cache kept %d recently-downloaded file(s) within the "
+            "%d-day grace window: %s",
+            len(kept_by_grace), grace_days, ", ".join(kept_by_grace),
+        )
     return {
         "removed_files": removed,
         "removed_bytes": removed_bytes,
         "kept_symbols": sorted(keep),
+        "kept_by_grace": kept_by_grace,
     }
 
 
