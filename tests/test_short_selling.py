@@ -15,7 +15,6 @@ from trader.models import (
     Fill,
     Position,
     PositionPlanStatus,
-    RiskVerdict,
     Side,
     TradePlan,
 )

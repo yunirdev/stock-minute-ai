@@ -10,7 +10,6 @@
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from trader.audit import AuditLog
 from trader.config import RiskConfig, TradingConfig
 from trader.execution_pipeline import marketable_limit_price
 from trader.invalidation_events import InvalidationEventStore

@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from .market_calendar import market_holidays, session_at
+from .market_calendar import market_holidays
 
 _ET = ZoneInfo("America/New_York")
 

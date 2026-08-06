@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-import pytest
 
 import trader.manual_push as mp
 from trader.report_period import resolve_daily_period, resolve_weekly_period
