@@ -61,7 +61,7 @@ Entrypoints:
 - models.py: shared data models and AgentContext
 - selection.py, plan.py, allocator.py, risk_engine.py: decision pipeline
 - broker/alpaca.py: only execution adapter
-- order_store.py, portfolio.py, audit.py: durable state and audit
+- order_lifecycle.py, portfolio.py, audit.py: durable state and audit
 - daily_research.py, research_screening.py, and daily_runtime_support.py: daily analysis system
 - position_plans.py: immutable filled-position baseline and version-chain store
 - invalidation_events.py: authoritative invalidation fact validation and store
@@ -70,11 +70,7 @@ Entrypoints:
 - execution_pipeline.py: CandidatePlan/FinalTradePlan/OrderIntent state machine
 - trade_episodes.py: immutable fill/slippage/PnL episode attribution
 - episode_reviews.py: frozen layered reviews and stable error taxonomy
-- strategy_candidates.py and strategy_promotion.py: immutable candidate,
-  champion/challenger evidence, release, rejection, and rollback versions
-- universe_registry.py, focus_pool.py, research_budget.py, and
-  universe_research_quality.py: versioned market scope, focus selection,
-  capacity-controlled research work, and daily quality gates
+- strategy_candidates.py: immutable strategy candidate and version store
 - ai/manager.py and ai/agents: legacy/manual research tools, not the production tick loop
 - signal_reports.py and runtime_status.py: customer-signal audit and live status sidecar
 - data_hub_shadow.py: read-only real-source double-read quality runner
@@ -82,14 +78,20 @@ Entrypoints:
 - monitor_nice.py and monitor_data.py: UI and read models
 - operations_observability.py and discord_delivery.py: 17-action UI contracts,
   explainability, authorization, delivery, and audit evidence
-- operational_recovery.py and closed_loop_delivery.py: verified database
-  recovery and frozen complete-loop delivery evidence
-- paper_maturity.py, paper_resilience.py, and paper_migration_signoff.py:
-  scheduled REAL/SYNTHETIC maturity, fixed fault drills, and two-level sign-off
+- operational_recovery.py: verified database recovery evidence
+- paper_maturity.py: scheduled REAL/SYNTHETIC maturity evidence
 - strategies, strategy_core.py, factors, backtest: research
-- watchdog.py and kill_switch.py: runtime safety
+- watchdog.py: runtime safety
 
 Do not restore Scheduler, in-memory PaperBroker, separate yfinance feed, OrchestratorAgent, Streamlit preferences, per-trade approval, Protocol shells, PendingOrder, BrokerAdapter, or PaperDecision enabled/shadow dual paths.
+
+Removed 2026-08-06 as unreachable from every production entrypoint (built and
+tested, never wired into a runtime path). Do not restore without first wiring an
+actual caller:
+universe_registry.py, focus_pool.py, research_budget.py,
+universe_research_quality.py, corporate_data_sources.py,
+macro_sentiment_sources.py, news_event_sources.py, strategy_promotion.py,
+closed_loop_delivery.py, paper_migration_signoff.py, paper_resilience.py.
 
 ## Data rules
 

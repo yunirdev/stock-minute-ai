@@ -7,32 +7,36 @@ AI 辅助的美股分钟级 Alpaca Paper 交易系统：多智能体研究 + 经
 ## 它怎么工作
 
 ```
-【选股 / 研究】盘前或盘后各跑一次
+【研究】盘前或盘后跑一次，当日只跑一次
         │
         ▼
-data_cache (Alpaca/yfinance 本地 Parquet 缓存)
-   │
-   ▼
-selection_pools  长线池 / 日内决策池，按流动性 + 数据质量确定性打分排序
-   │
-   ▼
 daily_research → TradingAgents（多智能体：技术面/基本面/宏观/新闻/期权/ETF流向…）
-   只跑一次，结果冻结写入 ai_states.duckdb（当日不重跑 LLM）
+   结果冻结写入 ai_states.duckdb，盘中不再重跑 LLM
         │
         ▼
-【Runtime，交易时段内持续运行】
+【Runtime】交易时段内持续运行，标的由 --symbols 指定
         │
         ▼
 runtime.py 读取当日冻结研究结果 + 实时分钟线
-   → PaperDecision 决策门（策略信号 + holdout 统计 + 当日研究都齐才放行）
+   → PaperDecision 决策门（策略信号 + holdout 统计 + 当日研究，三者齐备才放行）
    → ATR 计划 / 仓位分配 / 确定性风控（risk_engine）
    → CandidatePlan → FinalTradePlan → OrderIntent → Alpaca Paper LMT 单
         │
         ▼
-DuckDB 审计 (trade.duckdb / ai_states.duckdb) + 每日收盘校验备份 + NiceGUI 监控台
+DuckDB 审计 (trade.duckdb / ai_states.duckdb) + 每日收盘校验备份
+
+
+【选股辅助】独立于 Runtime，在监控台里手动触发
+        │
+        ▼
+data_cache（Alpaca/yfinance 本地 Parquet 缓存）
+   → selection_pools 构建长线池 / 日内决策池 → conf/selection_pools.json
+   → decision_trade_plans 生成候选计划供人工参考
 ```
 
 **Runtime 是唯一能下单的组件**：AI agents 只产出分析，从不直接调用 broker。
+
+选股池（`selection_pools`）是监控台侧的研究工具，**不在 Runtime 的自动执行链路上**——Runtime 的标的来自 `--symbols` 参数，选股结果需要你自己决定是否采纳。
 
 ## 功能
 

@@ -4,6 +4,10 @@
 状态：当前 Alpaca Paper 闭环小目标已签收  
 范围：Alpaca Paper；不授权自动实盘交易
 
+> 历史记录，保留原文不改。2026-08-06 死代码清理中删除了
+> `trader/closed_loop_delivery.py`（任何生产入口都不可达），本文下方对
+> `ClosedLoopDeliveryStore` 的描述记录的是当时的实现，该模块现已不存在。
+
 ## 已形成的闭环
 
 ```text
