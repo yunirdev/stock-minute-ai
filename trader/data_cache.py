@@ -770,6 +770,73 @@ def upsert_bars(symbol: str, timeframe: str, df: pd.DataFrame) -> None:
         _save_to_disk(symbol, timeframe, merged)
 
 
+# 每个周期补多长的窗口。必须让 min_rows 在该窗口内可达，否则每次调用都会
+# 对同一批标的重复下载：日线 30 天只有 21 根，永远到不了阈值。
+_ENSURE_LOOKBACK_DAYS = {
+    "1m": 7,      # Alpaca 免费计划 1m 历史本来就浅
+    "5m": 30,
+    "15m": 60,
+    "30m": 60,
+    "1h": 120,
+    "1d": 400,
+}
+
+
+def ensure_bars(
+    symbols: Iterable[str],
+    timeframe: str,
+    *,
+    lookback_days: int | None = None,
+    min_rows: int = 200,
+) -> dict:
+    """补齐 symbols 在该周期上缺失/过短的本地缓存，best-effort。
+
+    有界拉取（按周期取窗口，见 _ENSURE_LOOKBACK_DAYS），不是 fetch_and_save
+    那种 2016 年至今的全量下载 —— 缓存里实际存的就是几天到几周的近期窗口，
+    全量拉一次 5m 要几十万根。
+
+    min_rows 刻意高于 describe_cached_bars 判 DEGRADED 的 40 根：40 根只够
+    "不被标记为降级"，但远不够跑筛选和生成策略统计。实测 120 根 5m（约 1.5
+    个交易日）就会让 strategy_statistics 完全生不成该标的的记录。
+
+    任何一个标的失败都不抛异常：补数据是尽力而为的前置动作，不该让整个研究
+    批次因为一次网络抖动而失败。
+    """
+    if lookback_days is None:
+        lookback_days = _ENSURE_LOOKBACK_DAYS.get(timeframe, 30)
+    filled: list[str] = []
+    sufficient: list[str] = []
+    failed: list[str] = []
+
+    for raw in symbols:
+        symbol = str(raw).strip().upper()
+        if not symbol:
+            continue
+        if len(get_bars(symbol, timeframe)) >= min_rows:
+            sufficient.append(symbol)
+            continue
+        try:
+            end = datetime.now(timezone.utc) - timedelta(minutes=20)
+            start = end - timedelta(days=lookback_days)
+            df = fetch_alpaca_bars_window(symbol, timeframe, start, end)
+            if df.empty:
+                failed.append(symbol)
+                continue
+            upsert_bars(symbol, timeframe, df)
+            filled.append(symbol)
+        except Exception as exc:
+            logger.warning("ensure_bars %s %s: %s", symbol, timeframe, exc)
+            failed.append(symbol)
+
+    if filled or failed:
+        logger.info(
+            "ensure_bars %s — filled=%d sufficient=%d failed=%d%s",
+            timeframe, len(filled), len(sufficient), len(failed),
+            f" (failed: {', '.join(failed)})" if failed else "",
+        )
+    return {"filled": filled, "sufficient": sufficient, "failed": failed}
+
+
 def fetch_and_save(symbol: str, timeframe: str) -> pd.DataFrame:
     """
     显式拉取全量数据并保存到本地 Parquet 文件。

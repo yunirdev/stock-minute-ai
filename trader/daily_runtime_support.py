@@ -49,6 +49,9 @@ class DailyRuntimeSupport:
             # "明天做什么"一节）。这里再接一个 notifier 会让同一批研究结论在
             # 频道里出现两次。
             notifier=None,
+            # 研究 universe 通常宽于 Runtime 的 --symbols，缓存里不会有它们的
+            # K 线；不补齐的话这些标的会带着 BAR_CACHE_EMPTY 进研究。
+            ensure_bars=True,
         )
         self.worker = DailyResearchWorker(
             service,

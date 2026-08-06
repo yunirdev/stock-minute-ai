@@ -237,8 +237,40 @@ def test_daily_candidate_as_of_uses_the_injected_batch_clock(monkeypatch):
     assert rows[0].as_of == now.isoformat()
 
 
-def test_real_screening_clock_builds_a_replayable_snapshot(tmp_path):
+def test_real_screening_clock_builds_a_replayable_snapshot(tmp_path, monkeypatch):
+    # Isolate the bar cache. This test pins `now` to a fixed past date, so
+    # reading the ambient data/bars/ makes it depend on what happens to be
+    # downloaded: any AAPL 5m cache reaching past 2026-07-27 makes the snapshot's
+    # as_of land after fetched_at and the run fails with SOURCE_AS_OF_AFTER_FETCH.
+    # It previously passed only because no AAPL 5m file existed locally.
+    import pandas as pd
+
+    from trader import data_cache
+
+    bars_dir = tmp_path / "bars"
+    bars_dir.mkdir()
+    monkeypatch.setattr(data_cache, "_BARS_DIR", bars_dir)
+    monkeypatch.setattr(data_cache, "_CACHE", {})
+
     now = datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
+    ts = pd.date_range(end=now - timedelta(hours=1), periods=120, freq="5min", tz="UTC")
+    data_cache._save_to_disk(
+        "AAPL",
+        "5m",
+        pd.DataFrame(
+            {
+                "symbol": ["AAPL"] * len(ts),
+                "timestamp_utc": ts,
+                "timestamp": ts,
+                "open": [100.0] * len(ts),
+                "high": [101.0] * len(ts),
+                "low": [99.0] * len(ts),
+                "close": [100.5] * len(ts),
+                "volume": [1_000_000.0] * len(ts),
+            }
+        ),
+    )
+
     store = DailyResearchStore(str(tmp_path / "ai.duckdb"))
 
     run = DailyResearchService(store, _Analyzer()).run(

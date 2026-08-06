@@ -1077,6 +1077,7 @@ def _render_overview():
                         DailyResearchStore(_settings.daily_research_db),
                         TradingAgentsAdapter(),
                         notifier=None,
+                        ensure_bars=True,
                     )
                     # AI 决策池 ∪ 自选（跟"启动引擎"/"全部重建"用的同一个规则）——
                     # 手动研究不该只覆盖自选，否则 AI 选出来的标的反而没有研究依据。

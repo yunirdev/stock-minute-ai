@@ -1606,6 +1606,20 @@ class DailyResearchStore:
         )
 
 
+def _ensure_research_bars(symbols: list[str], timeframe: str) -> None:
+    """Top up the local bar cache for this run's universe before screening.
+
+    Best-effort by design: a download failure degrades a snapshot's
+    local_bar_cache source, which the quality report already surfaces. Letting
+    it abort the whole research batch would be strictly worse.
+    """
+    try:
+        from .data_cache import ensure_bars
+        ensure_bars(symbols, timeframe)
+    except Exception as exc:
+        logger.warning("daily_research ensure_bars: %s", exc)
+
+
 class DailyResearchService:
     def __init__(
         self,
@@ -1615,10 +1629,16 @@ class DailyResearchService:
         notifier: Any | None = None,
         snapshot_store: ResearchSnapshotStore | None = None,
         stale_run_seconds: int | None = None,
+        ensure_bars: bool = False,
     ) -> None:
         self.store = store
         self.analyzer = analyzer
         self.notifier = notifier
+        # Off by default so run() stays free of network I/O: it is the pure
+        # analysis step the tests drive, and a download there would both hit
+        # Alpaca from unit tests and write into the shared data/bars cache.
+        # The production entrypoints turn it on explicitly.
+        self.ensure_bars = ensure_bars
         self.snapshot_store = snapshot_store or ResearchSnapshotStore(
             store.db_path
         )
@@ -1664,6 +1684,12 @@ class DailyResearchService:
         )
         if not symbols:
             raise ValueError("DAILY_RESEARCH_UNIVERSE_EMPTY")
+        # Runtime only writes bars for its own --symbols at its own --tf, so the
+        # research universe is routinely wider than anything the cache has seen.
+        # Without this, screening silently runs on symbols with no price data and
+        # every such snapshot records local_bar_cache=BAR_CACHE_EMPTY.
+        if self.ensure_bars:
+            _ensure_research_bars(symbols, timeframe)
         screening_inputs: dict[str, Any] = {}
         candidates = build_daily_candidates(
             symbols,
@@ -2294,6 +2320,7 @@ def build_default_service(db_path: str) -> DailyResearchService:
         DailyResearchStore(db_path),
         TradingAgentsAdapter(),
         notifier=None,
+        ensure_bars=True,
     )
 
 
