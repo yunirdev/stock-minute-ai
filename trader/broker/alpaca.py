@@ -18,6 +18,33 @@ from ..models import Fill, OrderIntent, OrderStatus, Position, Side, utc_now
 
 logger = logging.getLogger(__name__)
 
+# alpaca-py 的 RESTClient 内部用一个裸 requests.Session 发请求，从不传 timeout
+# （见 alpaca.common.rest.RESTClient._request：opts 里只有 headers/params/json/
+# allow_redirects，没有 timeout）。这意味着一次网络抖动/TCP 半连接能把
+# get_account()/get_positions() 卡到操作系统级别的重传超时（经验上能到几分钟），
+# 而 Runtime._tick() 是单线程同步跑的：这一次调用卡多久，心跳表就有多久不更新。
+# WATCHDOG_WATCHDOG（心跳超时 137s > 阈值 120s）就是这么触发的——alpaca.py:227
+# 那条注释里提过的"生产环境真实发生过的 transient timeout"，根源就在这里没有
+# 一个硬超时。挂一个强制 timeout 的 HTTPAdapter，让请求最多卡 _ALPACA_HTTP_TIMEOUT
+# 秒就抛异常，交给下面 get_account_equity() 等方法里已有的 except/raise 处理
+# （Runtime._tick() 的 broker.snapshot 分支会跳过本轮而不是无限期挂起）。
+_ALPACA_HTTP_TIMEOUT = 15.0  # 秒；正常请求 <1s，留够余量但要显著小于 120s 心跳阈值
+
+
+def _mount_timeout_adapter(session, timeout: float = _ALPACA_HTTP_TIMEOUT) -> None:
+    """给 requests.Session 挂一个强制默认 timeout 的 HTTPAdapter。"""
+    from requests.adapters import HTTPAdapter
+
+    class _TimeoutHTTPAdapter(HTTPAdapter):
+        def send(self, request, **kwargs):
+            kwargs.setdefault("timeout", timeout)
+            return super().send(request, **kwargs)
+
+    adapter = _TimeoutHTTPAdapter()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+
 # Alpaca 订单状态 → 平台统一 OrderStatus
 _STATUS_MAP = {
     "filled": OrderStatus.FILLED,
@@ -40,7 +67,14 @@ _STATUS_MAP = {
 
 def _map_status(raw) -> OrderStatus:
     s = str(getattr(raw, "value", raw)).lower()
-    return _STATUS_MAP.get(s, OrderStatus.SUBMITTED)
+    mapped = _STATUS_MAP.get(s)
+    if mapped is None:
+        # 默认按 SUBMITTED 处理（保守：继续轮询而不是当成已结束），但必须留痕：
+        # 如果 Alpaca 新增了一个"终态"而我们不认识，订单会永远留在 _open_orders
+        # 里轮询不掉，静默的话没人会发现。
+        logger.warning("ALPACA 未知订单状态 %r，按 SUBMITTED 处理（请补充 _STATUS_MAP）", s)
+        return OrderStatus.SUBMITTED
+    return mapped
 
 
 def _side_of(raw) -> Side:
@@ -56,6 +90,16 @@ class AlpacaBroker:
                 "AlpacaBroker 需要 ALPACA_API_KEY / ALPACA_API_SECRET（请填入 .env）")
         from alpaca.trading.client import TradingClient  # 延迟导入，未装时不影响其它 broker
         self._client = TradingClient(api_key, secret_key, paper=paper)
+        try:
+            _mount_timeout_adapter(self._client._session)
+        except Exception as exc:
+            # _session 是 alpaca-py 的私有实现细节，SDK 升级可能改名/移除。
+            # 挂不上超时适配器不该阻止 broker 启动——退化成"没有硬超时"这个
+            # 老状态，但至少留痕，而不是让整个交易引擎起不来。
+            logger.warning(
+                "无法给 Alpaca session 挂 timeout adapter（%s: %s）；"
+                "网络卡顿时请求可能无限期挂起", type(exc).__name__, exc,
+            )
         self._paper = paper
         logger.info("AlpacaBroker 已连接 (%s)", "PAPER 虚拟盘" if paper else "LIVE 实盘")
 
@@ -73,7 +117,30 @@ class AlpacaBroker:
         from alpaca.trading.requests import LimitOrderRequest
 
         side = OrderSide.BUY if intent.side == Side.BUY else OrderSide.SELL
-        qty = max(int(intent.qty), 1)
+        # Alpaca 限价单只接受整股（小数股仅支持市价单），而 allocator 会算出
+        # 4 位小数的 qty，平仓单更是精确等于当前持仓数。
+        #
+        # 原来这里写的是 max(int(qty), 1)，两个方向都会错：
+        #   - int() 向下取整 → 持有 2.5 股平仓只卖 2 股，剩 0.5 股永远平不掉
+        #   - max(...,1) 把不足 1 股的 qty 抬成 1 → 0.5 股平仓变成卖出 1 股，
+        #     超卖 0.5 股，在保证金账户上会把"平仓"变成裸空单
+        # 而且风控是按小数 qty 审批的，提交的却是另一个数字，两者对不上。
+        #
+        # 现在：只向下取整（绝不放大敞口），取整后为 0 就明确报错，让它出现在
+        # 审计和日志里，而不是静默改成 1 股。
+        qty = int(intent.qty)
+        if qty < 1:
+            raise ValueError(
+                f"ORDER_QTY_BELOW_ONE_SHARE: {intent.symbol} "
+                f"计划 qty={intent.qty:g}，限价单不支持不足 1 股，已拒绝提交"
+            )
+        dropped = float(intent.qty) - qty
+        if dropped > 1e-9:
+            logger.warning(
+                "ALPACA %s %s: 计划 qty=%g 取整为 %d 股，剩余 %g 股未提交"
+                "（限价单只接受整股）",
+                intent.side.value, intent.symbol, intent.qty, qty, dropped,
+            )
         tif = TimeInForce.DAY
 
         px = intent.limit_price if intent.limit_price else intent.reference_price

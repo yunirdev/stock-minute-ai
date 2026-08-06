@@ -132,3 +132,65 @@ def test_cancel_order_returns_true_on_success():
     client = SimpleNamespace(cancel_order_by_id=lambda _id: None)
     broker = _broker(client)
     assert broker.cancel_order("order-1") is True
+
+
+def test_init_mounts_timeout_adapter_on_alpaca_session():
+    """alpaca-py's RESTClient._request never passes `timeout=` to requests
+    (opts only carries headers/params/json/allow_redirects — verified against
+    alpaca.common.rest.RESTClient), so a stalled TCP connection to Alpaca's
+    API blocks get_account()/get_positions() indefinitely. Runtime._tick()
+    calls those synchronously and only writes the heartbeat afterwards, so an
+    unbounded hang there directly produces WATCHDOG_WATCHDOG (heartbeat stale
+    past the 120s threshold) — this is what happened in production (see
+    module docstring). __init__ must mount a default-timeout HTTPAdapter on
+    the SDK's session so these calls fail fast instead of hanging.
+    """
+    pytest.importorskip("alpaca")
+    from requests.adapters import HTTPAdapter
+
+    from trader.broker.alpaca import _ALPACA_HTTP_TIMEOUT
+
+    broker = AlpacaBroker("fake_key", "fake_secret", paper=True)
+    session = broker._client._session
+
+    captured: dict = {}
+
+    def fake_send(self, request, **kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop before any real network call")
+
+    original_send = HTTPAdapter.send
+    HTTPAdapter.send = fake_send
+    try:
+        for prefix in ("https://", "http://"):
+            adapter = session.get_adapter(prefix + "example.com")
+            assert type(adapter).__name__ == "_TimeoutHTTPAdapter"
+            captured.clear()
+            with pytest.raises(RuntimeError, match="stop before any real network call"):
+                adapter.send(SimpleNamespace())
+            # The whole point of the adapter: when the caller (alpaca-py)
+            # doesn't pass a timeout, one gets injected anyway.
+            assert captured.get("timeout") == _ALPACA_HTTP_TIMEOUT
+    finally:
+        HTTPAdapter.send = original_send
+
+    # And the constant itself must be well under the watchdog's 120s
+    # threshold, or "fail fast" stops being true.
+    assert 0 < _ALPACA_HTTP_TIMEOUT < 120
+
+
+def test_init_still_works_if_mounting_the_timeout_adapter_fails(monkeypatch):
+    """A future alpaca-py upgrade could rename/remove the private `_session`
+    attribute this fix relies on. That must degrade to "no hard timeout"
+    (today's old behavior), not prevent the broker — and the whole engine —
+    from starting.
+    """
+    pytest.importorskip("alpaca")
+    import trader.broker.alpaca as alpaca_module
+
+    def boom(_session):
+        raise AttributeError("_session")
+
+    monkeypatch.setattr(alpaca_module, "_mount_timeout_adapter", boom)
+    broker = AlpacaBroker("fake_key", "fake_secret", paper=True)
+    assert broker is not None
