@@ -754,6 +754,21 @@ def save_selection_pools(results: dict[str, PoolResult], path: Path | str = _STO
         },
     }
     out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    _prune_bar_cache_to_watchlist(results)
+
+
+def _prune_bar_cache_to_watchlist(results: dict[str, PoolResult]) -> None:
+    """观察池每次重建落盘后，清掉被踢出观察池的 symbol 的本地 bar 缓存
+    （持仓/挂单中的 symbol 由 data_cache.prune_bar_cache 内部强制豁免）。
+    失败不影响主流程——清理是维护性动作，不该让选股重建报错。"""
+    try:
+        from .data_cache import prune_bar_cache
+        watchlist: set[str] = set()
+        for result in results.values():
+            watchlist.update(item.symbol for item in result.items if item.symbol)
+        prune_bar_cache(watchlist)
+    except Exception:
+        pass
 
 
 def save_selection_pool(result: PoolResult, path: Path | str = _STORE) -> None:

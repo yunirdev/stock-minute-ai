@@ -25,7 +25,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import pandas as pd
 
@@ -472,6 +472,96 @@ def list_cached_files() -> list:
 def list_cached_names() -> list[str]:
     """只列缓存文件名，不读取 Parquet 内容。"""
     return sorted(path.name for path in _BARS_DIR.glob("*.parquet"))
+
+
+# ---------------------------------------------------------------------------
+# 观察列表清理 — 被踢出观察池且无持仓/挂单的 symbol，删除其本地 bar 缓存
+# ---------------------------------------------------------------------------
+def _protected_symbols(db_path: str | Path | None = None) -> set[str]:
+    """有实仓持仓或未终结挂单的 symbol，永远不清理，无论是否还在观察池里。
+    只读、尽力而为：数据库/表不存在时静默返回空集合，不影响调用方自己的
+    keep 列表继续生效。"""
+    protected: set[str] = set()
+    path = Path(db_path) if db_path else _ROOT / "trade.duckdb"
+    if not path.exists():
+        return protected
+    try:
+        import duckdb
+        con = duckdb.connect(str(path), read_only=True)
+        try:
+            try:
+                rows = con.execute(
+                    """
+                    SELECT symbol
+                    FROM fills
+                    GROUP BY symbol
+                    HAVING SUM(CASE WHEN side = 'BUY' THEN filled_qty ELSE -filled_qty END) <> 0
+                    """
+                ).fetchall()
+                protected.update(str(r[0]).upper() for r in rows if r[0])
+            except Exception:
+                pass
+            try:
+                rows = con.execute(
+                    """
+                    SELECT DISTINCT symbol FROM order_intents
+                    WHERE state NOT IN ('FILLED', 'CANCELED', 'REJECTED', 'EXPIRED')
+                    """
+                ).fetchall()
+                protected.update(str(r[0]).upper() for r in rows if r[0])
+            except Exception:
+                pass
+        finally:
+            con.close()
+    except Exception as exc:
+        logger.warning("data_cache _protected_symbols: %s", exc)
+    return protected
+
+
+def prune_bar_cache(
+    keep_symbols: Iterable[str],
+    *,
+    db_path: str | Path | None = None,
+) -> dict:
+    """删除不在 keep_symbols 里的本地 bar 缓存文件（跨所有 timeframe）。
+
+    无论 keep_symbols 是什么，持仓中或有未终结挂单的 symbol 一律豁免——
+    这个保护在这里统一做，调用方不需要自己记得排除持仓。
+    """
+    keep = {str(s).strip().upper() for s in keep_symbols if str(s).strip()}
+    keep |= _protected_symbols(db_path)
+
+    removed: list[str] = []
+    removed_bytes = 0
+    if _BARS_DIR.exists():
+        for path in sorted(_BARS_DIR.glob("*.parquet")):
+            stem = path.stem
+            if "_" not in stem:
+                continue
+            symbol = stem.rsplit("_", 1)[0].upper()
+            if symbol in keep:
+                continue
+            try:
+                size = path.stat().st_size
+                path.unlink()
+                removed.append(path.name)
+                removed_bytes += size
+                with _CACHE_LOCK:
+                    for cache_key in [k for k in _CACHE if k[0] == symbol]:
+                        _CACHE.pop(cache_key, None)
+            except Exception as exc:
+                logger.warning("prune_bar_cache unlink %s: %s", path.name, exc)
+
+    if removed:
+        logger.info(
+            "prune_bar_cache removed %d file(s), %.1f MB reclaimed: %s",
+            len(removed), removed_bytes / (1024 * 1024), ", ".join(removed),
+        )
+    return {
+        "removed_files": removed,
+        "removed_bytes": removed_bytes,
+        "kept_symbols": sorted(keep),
+    }
 
 
 # Timeframes Alpaca supports for bar history (1m excluded — free plan too shallow).
