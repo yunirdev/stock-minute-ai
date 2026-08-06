@@ -158,8 +158,14 @@ class CalendarEventsResult:
 
     @property
     def warning_text(self) -> str:
-        if self.economic_available:
-            return ""
+        """列出所有出问题的经济数据源。
+
+        原来这里在 economic_available 为真时直接返回 ""，跟
+        has_partial_source_issue（只在 economic_available 为真时才成立）
+        结构上互斥 —— 于是"部分数据源挂了"这条路径永远拿不到文案，
+        推送里只会显示「⚠️ 部分/全部经济事件数据源不可用（未知原因）」，
+        BLS/EIA 的名字一次都没显示出来过。这里不再短路。
+        """
         issues = [
             f"{s.name}: {s.detail or s.state}"
             for s in self.sources

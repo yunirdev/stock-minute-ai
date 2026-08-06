@@ -49,8 +49,51 @@ class Portfolio:
                     raise
                 time.sleep(0.1 * (_attempt + 1))
 
+    _LEGACY_TS_SUFFIX = "__legacy_naive_ts"
+
+    def _migrate_naive_timestamp_table(
+        self, conn, *, table: str, converted_columns: str, ts_column: str,
+    ) -> dict:
+        """Same fix as AuditLog's heartbeat/signals/orders/risk_events migration:
+        a naive TIMESTAMP column silently stores a tz-aware Python datetime as
+        *local* wall-clock time, dropping the UTC offset. `fills.fill_time` and
+        `equity_snapshots.ts` had the same bug — currently it happens not to
+        surface visibly because DuckDB applies the same implicit local-time
+        conversion to query bind parameters too, so filtering "since" with a
+        tz-aware value still matches, but it's one code path away from silently
+        breaking (different host timezone, a reader that treats the column as
+        real UTC, etc). Migrate in place, preserving data."""
+        pending: dict = {}
+        row = conn.execute(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_name = ? AND column_name = ?",
+            [table, ts_column],
+        ).fetchone()
+        if row and row[0] != "TIMESTAMP WITH TIME ZONE":
+            conn.execute(f"ALTER TABLE {table} RENAME TO {table}{self._LEGACY_TS_SUFFIX}")
+            pending[table] = converted_columns
+        return pending
+
+    def _finish_naive_timestamp_migration(self, conn, table: str, pending: dict) -> None:
+        converted_columns = pending.pop(table, None)
+        if converted_columns is None:
+            return
+        legacy = f"{table}{self._LEGACY_TS_SUFFIX}"
+        conn.execute(f"INSERT INTO {table} SELECT {converted_columns} FROM {legacy}")
+        conn.execute(f"DROP TABLE {legacy}")
+        logger.info("portfolio: migrated %s to TIMESTAMPTZ (data preserved)", table)
+
     def _init_db(self) -> None:
         conn = self._connect()
+        pending = self._migrate_naive_timestamp_table(
+            conn,
+            table="fills",
+            converted_columns=(
+                "order_id, intent_id, symbol, side, filled_qty, avg_price, "
+                "timezone(current_setting('TimeZone'), fill_time), fee"
+            ),
+            ts_column="fill_time",
+        )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS fills (
                 order_id    TEXT,
@@ -59,19 +102,31 @@ class Portfolio:
                 side        TEXT,
                 filled_qty  DOUBLE,
                 avg_price   DOUBLE,
-                fill_time   TIMESTAMP,
+                fill_time   TIMESTAMPTZ,
                 fee         DOUBLE
             )
         """)
+        self._finish_naive_timestamp_migration(conn, "fills", pending)
+
+        pending = self._migrate_naive_timestamp_table(
+            conn,
+            table="equity_snapshots",
+            converted_columns=(
+                "timezone(current_setting('TimeZone'), ts), cash, total_equity, "
+                "unrealized_pnl, realized_pnl"
+            ),
+            ts_column="ts",
+        )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS equity_snapshots (
-                ts              TIMESTAMP,
+                ts              TIMESTAMPTZ,
                 cash            DOUBLE,
                 total_equity    DOUBLE,
                 unrealized_pnl  DOUBLE,
                 realized_pnl    DOUBLE
             )
         """)
+        self._finish_naive_timestamp_migration(conn, "equity_snapshots", pending)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS portfolio_reconciliation_baselines (
@@ -101,34 +156,69 @@ class Portfolio:
         price: float,
         fee: float,
     ) -> None:
+        """多空对称的持仓更新。Position.qty 有符号（正=多头，负=空头，见
+        models.py 的约定）；side/qty 只描述这一笔成交本身（方向+数量，都是
+        正的 qty），仓位方向变化完全靠"这笔成交跟现有仓位是同向还是反向"来
+        判断，不是靠 side==BUY/SELL 本身——BUY 既可能是开多/加多，也可能是
+        回补空头；SELL 既可能是平多/减多，也可能是开空/加空。
+
+        现金流公式不用跟着方向分支：BUY 花钱、SELL 收钱，跟这笔成交是在加
+        仓还是平仓、多头还是空头都无关（卖空同样是先收到现金，回补时再付
+        出去）。
+        """
         if side == Side.BUY:
             self._cash -= qty * price + fee
-            if symbol in self._positions:
-                pos = self._positions[symbol]
-                new_qty = pos.qty + qty
+            delta = qty
+        else:
+            self._cash += qty * price - fee
+            delta = -qty
+
+        pos = self._positions.get(symbol)
+        prior_qty = pos.qty if pos is not None else 0.0
+        new_qty = prior_qty + delta
+        same_direction_or_flat = prior_qty == 0.0 or (prior_qty > 0) == (delta > 0)
+
+        if same_direction_or_flat:
+            # 开新仓，或者顺着原方向加仓（多头再买、空头再卖）——按加权平均
+            # 结转成本价，跟原来 BUY-only 那支逻辑完全一致，只是不再要求
+            # prior_qty 一定是正数。
+            if pos is None:
+                self._positions[symbol] = Position(
+                    symbol=symbol, qty=new_qty, avg_entry_px=price,
+                )
+            else:
                 pos.avg_entry_px = (
-                    pos.avg_entry_px * pos.qty + price * qty
-                ) / new_qty
+                    pos.avg_entry_px * abs(prior_qty) + price * qty
+                ) / abs(new_qty)
                 pos.qty = new_qty
                 pos.last_updated = utc_now()
-            else:
-                self._positions[symbol] = Position(
-                    symbol=symbol,
-                    qty=qty,
-                    avg_entry_px=price,
-                )
             return
 
-        self._cash += qty * price - fee
-        if symbol in self._positions:
-            pos = self._positions[symbol]
-            trade_pnl = (price - pos.avg_entry_px) * qty
-            pos.realized_pnl += trade_pnl
-            self._realized_pnl += trade_pnl
-            pos.qty -= qty
+        # 反着原方向的成交——多头被卖出，或空头被买入回补。先把能对冲掉的
+        # 部分结算实现盈亏；如果这笔量超过现有仓位（穿仓），原方向仓位在
+        # 这里已经全部结清，剩下的部分按当前价开一张全新的反方向仓位——
+        # 不是原来那样"qty<=0 就直接删记录"，那样会把穿仓之后真实存在的
+        # 反向仓位凭空丢掉。
+        closing_qty = min(qty, abs(prior_qty))
+        if prior_qty > 0:
+            trade_pnl = (price - pos.avg_entry_px) * closing_qty
+        else:
+            trade_pnl = (pos.avg_entry_px - price) * closing_qty
+        pos.realized_pnl += trade_pnl
+        self._realized_pnl += trade_pnl
+
+        if new_qty == 0:
+            del self._positions[symbol]
+        elif (prior_qty > 0) == (new_qty > 0):
+            # 没穿仓，只是减仓——剩余部分成本价不变。
+            pos.qty = new_qty
             pos.last_updated = utc_now()
-            if pos.qty <= 0:
-                del self._positions[symbol]
+        else:
+            # 穿仓反向：原方向已经在上面全部结算完，剩下的部分是全新的反向
+            # 仓位，成本价就是这笔成交价，不能沿用原来那个方向的成本价。
+            self._positions[symbol] = Position(
+                symbol=symbol, qty=new_qty, avg_entry_px=price,
+            )
 
     def _restore_from_fills(self) -> None:
         """Rebuild in-memory positions from durable incremental fill rows."""

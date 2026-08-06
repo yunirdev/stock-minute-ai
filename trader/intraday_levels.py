@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -21,6 +22,7 @@ class IntradayLevels:
     vwap: Optional[float]
     close_vs_vwap_pct: Optional[float]
     state: str
+    is_stale: bool
 
 
 def compute_intraday_levels(
@@ -54,10 +56,17 @@ def compute_intraday_levels(
     if vwap and vwap > 0:
         close_vs_vwap_pct = (last - vwap) / vwap * 100
 
+    # A cache that hasn't been refreshed since a prior trading day still has
+    # "regular session" rows, so the checks above alone can't catch it — the
+    # caller must be told this isn't today's session before it presents these
+    # numbers as a live "现价".
+    today_local = datetime.now(timezone.utc).astimezone(ZoneInfo(tz_name)).date()
+    is_stale = session_date != today_local
+
     return IntradayLevels(
         symbol=symbol.upper(),
         session_date=str(session_date),
-        as_of=session["_local_ts"].iloc[-1].strftime("%H:%M %Z"),
+        as_of=session["_local_ts"].iloc[-1].strftime("%m/%d %H:%M %Z"),
         open_range_minutes=open_range_minutes,
         open_range_high=open_range_high,
         open_range_low=open_range_low,
@@ -67,19 +76,25 @@ def compute_intraday_levels(
         vwap=vwap,
         close_vs_vwap_pct=close_vs_vwap_pct,
         state=_classify_state(last, open_range_high, open_range_low, vwap),
+        is_stale=is_stale,
     )
 
 
-def build_intraday_followup(levels: IntradayLevels | None) -> str:
+def build_intraday_followup(levels: IntradayLevels | None, symbol: str = "") -> str:
     if levels is None:
-        return "盘中 OR/VWAP 暂不可用：缺少当日常规时段分钟线。"
+        label = f"{symbol.upper()} " if symbol else ""
+        return f"{label}盘中 OR/VWAP 暂不可用：缺少当日常规时段分钟线。"
 
     vwap_text = "VWAP 不可用"
     if levels.vwap is not None and levels.close_vs_vwap_pct is not None:
         vwap_text = f"VWAP {levels.vwap:.2f}（现价 {levels.close_vs_vwap_pct:+.2f}%）"
 
+    stale_prefix = ""
+    if levels.is_stale:
+        stale_prefix = f"⚠️ 数据非当日（本地缓存最新仅到 {levels.session_date}，非实时）— "
+
     return (
-        f"{levels.symbol} {levels.as_of}："
+        f"{stale_prefix}{levels.symbol} {levels.as_of}："
         f"OR{levels.open_range_minutes} {levels.open_range_low:.2f}-{levels.open_range_high:.2f}；"
         f"{vwap_text}；"
         f"现价 {levels.last_price:.2f}；"
@@ -157,12 +172,14 @@ def _classify_state(
 
 
 def _state_text(state: str) -> str:
+    """直接给出 OR/VWAP 状态对应的操作结论，不做模糊化处理——用户自行
+    判断是否采纳，但结论本身应该是明确的，不是"偏多但……"这种两头都占。"""
     labels = {
-        "bull_breakout": "突破开盘区间且站上 VWAP，偏多但等回踩确认。",
-        "bear_breakdown": "跌破开盘区间且低于 VWAP，偏防守。",
-        "inside_open_range": "仍在开盘区间内，方向未确认。",
-        "above_vwap": "高于 VWAP 但未有效突破 OR，等待二次确认。",
-        "below_vwap": "低于 VWAP 但未有效跌破 OR，谨慎追空。",
-        "mixed": "信号混合，先降级观察。",
+        "bull_breakout": "站上开盘区间且高于 VWAP：多头结构，可考虑做多，回踩 OR 上沿/VWAP 未跌破前有效。",
+        "bear_breakdown": "跌破开盘区间且低于 VWAP：空头结构，可考虑做空，反抽 OR 下沿/VWAP 未收复前有效。",
+        "inside_open_range": "仍在开盘区间内，方向未定，不建议现在进场，等突破确认。",
+        "above_vwap": "高于 VWAP 但未突破 OR 上沿：偏多但结构还没走完，突破 OR 上沿再做多，现在进场胜率不够。",
+        "below_vwap": "低于 VWAP 但未跌破 OR 下沿：偏空但结构还没走完，跌破 OR 下沿再做空，现在进场胜率不够。",
+        "mixed": "信号矛盾（价格/VWAP/OR 三者不一致），不建议现在进场。",
     }
     return labels.get(state, labels["mixed"])

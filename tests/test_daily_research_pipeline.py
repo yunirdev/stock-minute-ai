@@ -19,7 +19,7 @@ class _Analyzer:
     provider = "fake-tradingagents"
     model = "model"
 
-    def analyze(self, symbol: str, trading_date: str):
+    def analyze(self, symbol: str, trading_date: str, *, complexity: str = ""):
         as_of = (
             datetime.fromisoformat(trading_date)
             .replace(tzinfo=timezone.utc)

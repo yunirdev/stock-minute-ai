@@ -61,7 +61,7 @@ class ContextAnalyzer:
     def describe(self):
         return {"provider": self.provider, "model": self.model}
 
-    def analyze_with_context(self, symbol, trading_date, invocation):
+    def analyze_with_context(self, symbol, trading_date, invocation, *, complexity: str = ""):
         self.invocations.append(invocation)
         return ResearchAnalysis(
             recommendation="BUY",
@@ -399,10 +399,15 @@ def test_worker_registers_configured_external_sources_and_failures():
     assert manifest[3]["failure_code"] == "ANALYST_REPORT_MISSING"
 
 
-def test_untrusted_or_ambiguous_daily_research_is_not_consumed(
+def test_rerunning_same_day_research_serves_the_latest_run_not_nothing(
     tmp_path,
     monkeypatch,
 ):
+    """手动重跑当天研究（"运行今日研究"按钮，force=True）是正常操作，不是数据
+    损坏——两条同日 COMPLETED 记录曾经被当成"无法判断，直接返回空"，代价是
+    runtime 的选股/AI 门槛在这种完全合法的场景下拿不到任何数据，一整天选不
+    出候选（这正是 2026-08-05 那次事故的根因之一）。重跑之后应该采信最新
+    一次的结果，不是把两次都作废。"""
     import trader.daily_research as module
 
     monkeypatch.setattr(
@@ -417,14 +422,15 @@ def test_untrusted_or_ambiguous_daily_research_is_not_consumed(
         trading_date="2026-07-27",
         now=NOW,
     )
-    service.run(
+    second_run = service.run(
         ["AAPL"],
         trading_date="2026-07-27",
         now=NOW + timedelta(seconds=1),
         force=True,
     )
 
-    assert store.score_snapshots(NOW + timedelta(seconds=1)) == {}
+    snapshots = store.score_snapshots(NOW + timedelta(seconds=1))
+    assert snapshots["AAPL"].run_id == second_run.run_id
 
 
 def test_wrong_date_or_model_contract_is_not_consumed(

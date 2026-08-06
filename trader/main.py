@@ -7,6 +7,7 @@ Usage:
     python -m trader.main --symbols AAPL,MSFT --tf 5m
     python -m trader.main --auto-trade              # AI 自动虚拟盘，评分 ≥ 65 自动下单
     python -m trader.main --auto-trade --min-ai-score 70
+    python -m trader.main --auto-trade --allow-short  # 允许开新空单（默认关闭）
     python -m trader.main --broker-type alpaca_live  # 实盘（谨慎）
 """
 from __future__ import annotations
@@ -77,6 +78,18 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--ai-score-max-age-minutes", type=float, default=None)
     parser.add_argument("--daily-research-max-age-hours", type=float, default=None)
+
+    parser.add_argument(
+        "--allow-short",
+        dest="allow_short",
+        action="store_true",
+        default=False,
+        help=(
+            "允许开新空单（默认关闭，只能做多/平多）。开启前确认：Alpaca 账户是"
+            "margin 账户且目标标的可卖空；本仓位记账/持仓计划链路已支持多空对称，"
+            "但这仍是新功能，建议先小仓位观察几天。"
+        ),
+    )
     return parser
 
 
@@ -117,7 +130,7 @@ def main() -> None:
         broker_type=broker_type,
         data_feed_type=data_feed,
         poll_interval_secs=args.interval,
-        risk=RiskConfig(),
+        risk=RiskConfig(allow_short=args.allow_short),
         db_path=args.db_path or os.getenv("TRADE_DB_PATH", "trade.duckdb"),
         # AI 自动交易参数
         auto_trade_paper=args.auto_trade,

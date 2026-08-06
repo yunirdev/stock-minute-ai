@@ -128,6 +128,7 @@ class DailyRuntimeSupport:
         plans: Mapping[str, TradePlan] | None = None,
         open_orders: Iterable[Any] = (),
         message: str = "",
+        auto_trade_paper: bool = False,
     ) -> None:
         snapshots = self.snapshots(now)
         run = self.store.latest_run()
@@ -145,6 +146,7 @@ class DailyRuntimeSupport:
             research_run=run,
             open_orders=open_orders,
             message=message,
+            auto_trade_paper=auto_trade_paper,
         )
         try:
             write_runtime_status(payload)

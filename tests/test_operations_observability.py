@@ -29,10 +29,10 @@ def _wait_for_terminal(store, action_run_id: str) -> dict:
     raise AssertionError("async UI action did not reach a terminal state")
 
 
-def test_all_17_button_actions_have_unique_complete_contracts():
+def test_all_18_button_actions_have_unique_complete_contracts():
     manifest = button_contract_manifest()
-    assert len(BUTTON_ACTIONS) == 17
-    assert len({item["action_id"] for item in manifest}) == 17
+    assert len(BUTTON_ACTIONS) == 18
+    assert len({item["action_id"] for item in manifest}) == 18
     assert all(item["label"] and item["category"] for item in manifest)
     assert sum(item["external_send"] for item in manifest) == 2
     assert not any(

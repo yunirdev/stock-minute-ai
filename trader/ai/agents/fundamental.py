@@ -166,6 +166,7 @@ class FundamentalAgent(AgentBase):
             },
             confidence=float(result.get("confidence", score / 100)),
             model=getattr(self._client, "_model", ""),
+            is_fallback=self._is_fallback_result(result),
         )
 
     # ── 数据获取 ─────────────────────────────────────────────────────────────

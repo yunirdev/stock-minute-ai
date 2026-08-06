@@ -21,6 +21,33 @@ from .models import (
 )
 from .order_lifecycle import client_order_id, idempotency_key
 
+# Marketable-limit 缓冲——LMT 单是硬性红线（AlpacaBroker 拒绝任何非 LMT 提交），
+# 但一口价挂在 plan 生成那一刻的价位上、零缓冲，会让相当一部分信号因为价格
+# 已经走开而整天不成交。这里给限价单主动让一点价换成交概率，同时仍然保留
+# "最坏价格上限"——不是市价单。
+#
+# 出场单（止损/平仓/减仓）用更大的缓冲：入场没成交只是错过一次机会，出场
+# 没成交等于风控失效、敞口继续暴露，两者的代价不对称，缓冲也不该一样大。
+_ENTRY_LIMIT_BUFFER_PCT = 0.0015   # 入场：0.15%
+_EXIT_LIMIT_BUFFER_PCT = 0.005     # 出场（CLOSE/REDUCE）：0.5%
+
+
+def marketable_limit_price(reference_price: float, side: Side, *, action: str) -> float:
+    """给定计划价和方向，算出实际提交给 broker 的限价（含缓冲）。
+
+    BUY 单向上让价（愿意多付一点换成交），SELL 单向下让价（愿意少收一点换
+    成交）——这条规则对入场和出场都成立，出场只是把同一个 side 的规则套用到
+    "平仓方向"上（平多是 SELL，平空是 BUY），缓冲幅度按 action 是否为
+    CLOSE/REDUCE 区分紧急程度。
+    """
+    buffer_pct = (
+        _EXIT_LIMIT_BUFFER_PCT
+        if str(action or "").upper() in {"CLOSE", "REDUCE"}
+        else _ENTRY_LIMIT_BUFFER_PCT
+    )
+    multiplier = (1 + buffer_pct) if side == Side.BUY else (1 - buffer_pct)
+    return round(float(reference_price) * multiplier, 4)
+
 
 class ExecutionPipelineStore:
     def __init__(self, db_path: str | Path) -> None:
@@ -505,7 +532,12 @@ class ExecutionPipelineStore:
             side=final.side,
             qty=final.qty,
             order_type="LMT",
-            limit_price=final.entry_price,
+            limit_price=marketable_limit_price(
+                final.entry_price, final.side, action=final.action
+            ),
+            # reference_price 保留计划里那个"干净"的价格（AI/ATR 算出来的，
+            # 没有掺执行层缓冲）——止损风险计算、审计、回放都锚定这个值，只有
+            # 真正提交给 broker 的 limit_price 加了成交概率缓冲。
             reference_price=final.entry_price,
             idempotency_key=key,
             client_order_id=client_order_id(key),

@@ -182,7 +182,9 @@ class BullBearDebate(AgentBase):
         )
 
         final_score = self._clamp_score(verdict.get("final_score", cand.score))
-        confidence = float(verdict.get("confidence", final_score / 100))
+        # LLM 有时会把 confidence 写成 0-100 而不是 0-1，不夹取会让
+        # AgentManager._run_one 里的 confidence*100 变成 9500 这种脏数据。
+        confidence = max(0.0, min(1.0, float(verdict.get("confidence", final_score / 100))))
 
         logger.info(
             "BullBear %s → %s score=%.0f conf=%.2f",
@@ -212,6 +214,10 @@ class BullBearDebate(AgentBase):
             },
             confidence=confidence,
             model=getattr(self._client, "_model", ""),
+            # 三次 LLM 调用（多方/空方/裁判）任何一次降级，整条辩论结论就
+            # 不是真正的 LLM 产物 —— 尤其 verdict 的 fallback 会仅凭
+            # cand.score >= 65 就给出 "BUY"，绝不能当成真实裁决。
+            is_fallback=self._is_fallback_result(bull, bear, verdict),
         )
 
     @staticmethod

@@ -96,7 +96,11 @@ from trader.ui_health import (  # noqa: E402
     record_ui_health,
 )
 from trader.monitor_research_view import live_research_html  # noqa: E402
-from trader.research_monitor import live_monitor_snapshot  # noqa: E402
+from trader.research_monitor import (  # noqa: E402
+    list_debate_records,
+    live_monitor_snapshot,
+)
+from trader.runtime_status import read_runtime_status  # noqa: E402
 
 
 @app.get("/healthz")
@@ -453,6 +457,27 @@ body{background:var(--bg);color:var(--fg);
 .qa-card .q-table th{color:var(--fg3)!important;font-size:11px;text-transform:uppercase;letter-spacing:.04em;}
 .qa-card .q-table tbody tr:hover{background:var(--panel2)!important;}
 
+/* 每日研究/Runtime 监控用的是原生 <table>（不是 NiceGUI ui.table），
+   上面那组 .q-table 规则管不到它——一直没有专门的样式，表头和数据
+   全靠浏览器默认间距对齐，长短不一就会看着错位。*/
+.qa-table{width:100%;border-collapse:collapse;font-size:12.5px;}
+.qa-table th,.qa-table td{padding:7px 10px;text-align:left;white-space:nowrap;
+  border-bottom:1px solid var(--border);}
+.qa-table th{color:var(--fg3);font-size:11px;font-weight:600;
+  text-transform:uppercase;letter-spacing:.04em;}
+.qa-table td{color:var(--fg);}
+.qa-table tbody tr:hover{background:var(--panel2);}
+.qa-table tbody tr:last-child td{border-bottom:none;}
+
+/* 每日研究表——标的/AI结论就两三个字，压窄让给说明；说明栏是 AI 写的
+   多行简报，要能换行，不能跟别的列一样强制 nowrap。 */
+.qa-table-research th:nth-child(1),.qa-table-research td:nth-child(1){width:9%;white-space:nowrap;}
+.qa-table-research th:nth-child(2),.qa-table-research td:nth-child(2){width:13%;white-space:nowrap;}
+.qa-table-research th:nth-child(3),.qa-table-research td:nth-child(3){width:78%;white-space:normal;line-height:1.55;}
+
+.qa-symbol-link{color:var(--ai);text-decoration:none;cursor:pointer;}
+.qa-symbol-link:hover{text-decoration:underline;}
+
 .qa-badge{display:inline-flex;align-items:center;gap:6px;font-size:11px;
   padding:3px 10px;border-radius:999px;font-weight:600;}
 .qa-badge.demo{background:rgba(210,153,34,.15);color:var(--warn);
@@ -541,6 +566,9 @@ ui.add_head_html("<style>" + _CSS + "</style>")
 
 _state: dict = {"tab": "overview", "updater": None}
 _nav_refs: dict = {}
+#: 点"每日研究"表里的标的名 → 跳转到"研究档案"时带过去的筛选条件。
+#: _select() 每次都整卡重建，读一次就清空，不然下次进研究档案会莫名带着筛选。
+_pending_archive_filter: dict = {}
 
 with ui.element("div").classes("qa-topbar"):
     ui.html(
@@ -562,6 +590,9 @@ with ui.element("div").classes("qa-topbar"):
     with ui.element("div").classes("qa-stat"):
         ui.label("引擎").classes("l")
         top_engine = ui.label("—").classes("v")
+    with ui.element("div").classes("qa-stat"):
+        ui.label("AutoTrade").classes("l")
+        top_autotrade = ui.label("—").classes("v")
     with ui.element("div").classes("qa-stat").style("cursor:pointer") as top_tasks_stat:
         ui.label("任务队列").classes("l")
         top_tasks = ui.label("—").classes("v")
@@ -686,7 +717,9 @@ def _ytd_hours() -> int:
 
 
 def _fetch_benchmark(sym: str, span_key: str) -> "pd.DataFrame | None":
-    """yfinance 收盘价，5 min 缓存，返回 tz-naive UTC DatetimeIndex。"""
+    """yfinance 收盘价，5 min 缓存，返回 tz-naive 美东（ET）DatetimeIndex——
+    整个仪表盘的时间口径统一用美东，跟"研究交易日""收盘报告"这些美东框定
+    的内容对得上，不再是内部自洽但跟别处对不上的 UTC。"""
     import time as _time
 
     key = (sym, span_key)
@@ -705,7 +738,7 @@ def _fetch_benchmark(sym: str, span_key: str) -> "pd.DataFrame | None":
             _BENCH_CACHE[key] = (now_s, None)
             return None
         if hist.index.tz is not None:
-            hist.index = hist.index.tz_convert("UTC").tz_localize(None)
+            hist.index = hist.index.tz_convert("America/New_York").tz_localize(None)
         _BENCH_CACHE[key] = (now_s, hist[["Close"]])
         return hist[["Close"]]
     except Exception:
@@ -728,11 +761,13 @@ def _align_bench(eq: pd.DataFrame, bench: dict) -> dict:
     """
     将基准数据裁剪到与组合权益数据相同的起始时间，确保 0% 基准一致。
 
-    关键细节：
-    - yfinance 日线数据转 UTC 后时间戳为 04:00 UTC（美东午夜 EDT = UTC-4）
-    - 权益快照时间戳为盘中时间（如 14:30 UTC）
-    - 若用精确时间对齐，当天日线 bar（04:00）< 权益起点（14:30）→ 被排除
-    - 修复：日线数据检测为"小时数 < 7 的 bar"→ 用当天零点 UTC 对齐
+    关键细节（现在整条链路都是 tz-naive 美东时间，不是 UTC）：
+    - yfinance 日线数据本来就是美东午夜（00:00 ET）打的时间戳
+    - 权益快照时间戳是盘中时间（如 10:30 ET）
+    - 若用精确时间对齐，当天日线 bar（00:00）< 权益起点（10:30）→ 被排除
+    - 修复：日线数据检测为"小时数 < 7 的 bar"→ 用当天零点 ET 对齐
+      （这个阈值本来是为了兼容"转 UTC 后 04:00/05:00"的旧逻辑留的余量，
+      现在日线本来就是 00:00，< 7 依然成立，不用改）
     """
     if eq is None or eq.empty or "total_equity" not in eq.columns:
         return bench
@@ -742,14 +777,13 @@ def _align_bench(eq: pd.DataFrame, bench: dict) -> dict:
         if hist is None or hist.empty:
             continue
         idx = hist.index
-        # 检测日线 / 周线：转换后时间戳在 UTC 07:00 之前（04:00 或 05:00 UTC）
-        # 分钟线 / 小时线：市场开盘 13:30+ UTC
+        # 检测日线 / 周线：美东午夜附近（0 点）；分钟线 / 小时线：盘中 9-16 点 ET
         sample_hours = [t.hour for t in idx[: min(10, len(idx))]]
         is_daily = max(sample_hours) < 7  # True = 日线或周线
 
         if is_daily:
-            # 日线对齐到当天零点 UTC，否则 04:00 < 14:30 → 当天 bar 被误切
-            cutoff = first_ts.normalize()  # 2026-05-15 14:32 → 2026-05-15 00:00
+            # 日线对齐到当天零点 ET，否则 00:00 < 10:30 → 当天 bar 被误切
+            cutoff = first_ts.normalize()  # 2026-05-15 10:32 → 2026-05-15 00:00
         else:
             cutoff = first_ts  # 分钟线用精确时间
 
@@ -833,7 +867,7 @@ def _equity_fig(eq: pd.DataFrame, bench: dict, uirev: str) -> go.Figure:
                 name="我的组合",
                 fill="tozeroy",
                 fillcolor="rgba(88,166,255,0.08)",
-                hovertemplate="<b>我的组合</b>  %{x|%m-%d %H:%M}<br><b>%{y:+.2f}%</b><extra></extra>",
+                hovertemplate="<b>我的组合</b>  %{x|%m-%d %H:%M} ET<br><b>%{y:+.2f}%</b><extra></extra>",
             )
         )
 
@@ -886,7 +920,12 @@ def _equity_fig(eq: pd.DataFrame, bench: dict, uirev: str) -> go.Figure:
             traceorder="normal",
         ),
         uirevision=uirev,
-        xaxis=dict(gridcolor="#21262d", showgrid=True, tickfont=dict(size=10)),
+        xaxis=dict(
+            gridcolor="#21262d",
+            showgrid=True,
+            tickfont=dict(size=10),
+            title=dict(text="美东时间 (ET)", font=dict(size=10)),
+        ),
         yaxis=dict(
             gridcolor="#21262d",
             showgrid=True,
@@ -994,6 +1033,30 @@ def _render_overview():
         research_live = ui.html(
             live_research_html(live_monitor_snapshot(_DAILY_RESEARCH_DB))
         ).style("margin-top:10px")
+        # ui.html() 内容会被 DOMPurify 清洗，标的名那个 <a> 上不能挂内联
+        # onclick（会被剥掉，实测验证过）——改用事件委托：在 document 上挂
+        # 一次监听，点击命中 .qa-symbol-link 就读 data-symbol 触发 emitEvent。
+        # 挂在 document 上 + 加个标记位防重复绑定，这样研究表内容刷新/整卡
+        # 重建都不用重新挂监听。
+        try:
+            import asyncio as _aio
+
+            _aio.get_running_loop()  # 没有事件循环时（如模块刚加载、ui.run() 还没起服务器）
+            ui.run_javascript(
+                """
+                if (!window.__qaSymbolClickBound) {
+                    window.__qaSymbolClickBound = true;
+                    document.addEventListener('click', function (ev) {
+                        const link = ev.target.closest('.qa-symbol-link');
+                        if (link && link.dataset.symbol) {
+                            emitEvent('research_symbol_click', link.dataset.symbol);
+                        }
+                    });
+                }
+                """
+            )  # 直接跳过，否则会创建一个永远没人 await 的协程
+        except Exception:
+            pass
 
         def _run_daily_research_now():
             run_research_btn.props("disable")
@@ -1015,14 +1078,26 @@ def _render_overview():
                         TradingAgentsAdapter(),
                         notifier=None,
                     )
+                    # AI 决策池 ∪ 自选（跟"启动引擎"/"全部重建"用的同一个规则）——
+                    # 手动研究不该只覆盖自选，否则 AI 选出来的标的反而没有研究依据。
+                    try:
+                        from trader.selection_pools import (
+                            decision_symbols as _decision_symbols,
+                        )
+
+                        _pool_symbols = list(_decision_symbols(limit=8))
+                    except Exception:
+                        _pool_symbols = []
+                    _manual_symbols = [
+                        symbol.strip().upper()
+                        for symbol in str(_pref("sys_sym", "")).split(",")
+                        if symbol.strip()
+                    ]
+                    research_symbols = list(
+                        dict.fromkeys([*_pool_symbols, *_manual_symbols])
+                    ) or ["SPY", "QQQ", "AAPL", "MSFT", "NVDA"]
                     result = service.run(
-                        [
-                            symbol.strip().upper()
-                            for symbol in str(
-                                _pref("sys_sym", "SPY,QQQ,AAPL,MSFT,NVDA")
-                            ).split(",")
-                            if symbol.strip()
-                        ],
+                        research_symbols,
                         trading_date=research_target_date(now),
                         timeframe=str(_pref("sys_tf", "5m")),
                         screen_limit=_settings.daily_research_screen_limit,
@@ -1183,6 +1258,17 @@ def _render_overview():
         else:
             _fetch_h = _cfg_hours
         eq = equity_df(_fetch_h)
+        if not eq.empty and "ts" in eq.columns:
+            # DuckDB 的 TIMESTAMPTZ 读出来带时区（如 America/Los_Angeles）；这个
+            # 文件里图表相关的时间戳一律用"tz-naive but 美东（ET）"约定（参考
+            # _fetch_benchmark 对 yfinance 数据的处理）——全仪表盘统一按美东
+            # 显示，不用 UTC，这里统一转成 naive ET，否则下面和 _now_ts /
+            # _align_bench 的裸时间戳比较会直接 TypeError。
+            eq["ts"] = (
+                pd.to_datetime(eq["ts"], utc=True)
+                .dt.tz_convert("America/New_York")
+                .dt.tz_localize(None)
+            )
         has = not eq.empty and "total_equity" in eq.columns
 
         if live is not None:
@@ -1226,10 +1312,11 @@ def _render_overview():
         # equity_snapshots 由引擎定期写入，最新点可能几分钟前；
         # live 有当前值，注入后曲线才会延伸到当前时刻。
         if live is not None:
-            _now_ts = pd.Timestamp.now("UTC").tz_localize(None)
+            # eq["ts"] 已在上面归一化成 naive 美东（ET），这里保持同一约定。
+            _now_ts = pd.Timestamp.now("America/New_York").tz_localize(None)
             _live_row = pd.DataFrame([{"ts": _now_ts, "total_equity": live["equity"]}])
             if has:
-                _last_eq_ts = pd.to_datetime(eq["ts"]).iloc[-1]
+                _last_eq_ts = eq["ts"].iloc[-1]
                 if _now_ts > _last_eq_ts:
                     eq = pd.concat(
                         [eq[["ts", "total_equity"]], _live_row], ignore_index=True
@@ -1477,8 +1564,13 @@ def _render_model_schedule_settings():
             provider_sel.on_value_change(lambda e: _save("LLM_PROVIDER", e.value))
 
         _NUMERIC_ENV_FIELDS = [
-            ("每日研究触发时（美东）", "DAILY_RESEARCH_CLOSE_HOUR_ET", settings.daily_research_close_hour_et, 0, 23),
-            ("每日研究触发分", "DAILY_RESEARCH_CLOSE_MINUTE_ET", settings.daily_research_close_minute_et, 0, 59),
+            # 这两项不再是"触发时刻"——研究批次只在盘前 5:30-9:15 ET 这一个固定
+            # 窗口跑（daily_research.py::in_daily_run_window，未暴露成配置项）。
+            # close_hour/minute 现在只用来判断一个批次算今天还是明天的研究
+            # （research_target_date 的收盘分界线），标签要如实反映这一点，
+            # 不能再叫"触发时"——原来的收盘后触发窗口已经删掉了。
+            ("研究收盘分界（美东，时）", "DAILY_RESEARCH_CLOSE_HOUR_ET", settings.daily_research_close_hour_et, 0, 23),
+            ("研究收盘分界（美东，分）", "DAILY_RESEARCH_CLOSE_MINUTE_ET", settings.daily_research_close_minute_et, 0, 59),
             # AGENT_CYCLE_INTERVAL_MINUTES 这一项已移除：它是死配置，没有任何
             # 代码读取它，但界面上却标着"Runtime 轮询周期(分钟)"，让人以为在
             # 调引擎的 tick 频率。真正的轮询间隔是「系统」页的「间隔(秒)」
@@ -1509,7 +1601,8 @@ def _render_system():
         ui.label("引擎控制").classes("qa-card-title")
         ui.label(
             "启动 / 停止实时交易引擎 (trader.main · Runtime 管道)。"
-            "标的/策略留空 = 引擎自动使用「机会中心」当前决策池标的 + 全部 24 个策略共识投票。"
+            "策略留空 = 全部 24 个策略共识投票。标的框始终叠加在「机会中心」当前决策池"
+            "之上——留空只用决策池，填了就是决策池 + 你手动加的标的（不会替换决策池）。"
         ).classes("qa-card-sub")
         with ui.row().classes("items-end gap-3 flex-wrap"):
 
@@ -1523,7 +1616,7 @@ def _render_system():
 
             sym_in = _persist(
                 ui.input(
-                    "标的（留空=当前决策池）",
+                    "手动追加标的（叠加到决策池，留空=不加）",
                     value=_pref("sys_sym", ""),
                     placeholder=_default_pool_symbols() or "QQQ",
                 )
@@ -1590,14 +1683,18 @@ def _render_system():
         with ui.row().classes("gap-3").style("margin-top:14px"):
 
             def _do_start():
-                resolved_symbols = (sym_in.value or "").strip()
-                if not resolved_symbols:
-                    try:
-                        from trader.selection_pools import decision_symbols
+                try:
+                    from trader.selection_pools import decision_symbols
 
-                        resolved_symbols = ", ".join(decision_symbols(limit=8))
-                    except Exception:
-                        resolved_symbols = ""
+                    pool_symbols = list(decision_symbols(limit=8))
+                except Exception:
+                    pool_symbols = []
+                manual_symbols = [
+                    s.strip().upper() for s in (sym_in.value or "").split(",") if s.strip()
+                ]
+                # 手动标的永远叠加在决策池之上，不做替换——留空时行为和过去一致。
+                resolved_list = list(dict.fromkeys([*pool_symbols, *manual_symbols]))
+                resolved_symbols = ", ".join(resolved_list)
                 ui.notify(
                     _start_engine(
                         resolved_symbols or "QQQ",
@@ -2003,6 +2100,123 @@ def _render_research():
                 f"{html.escape(str(release.get('to_version', '—')))} "
                 f"· {html.escape(str(release.get('created_at', '—')))}</div>"
             )
+
+    with ui.element("div").classes("qa-card"):
+        ui.label("研究档案").classes("qa-card-title")
+        ui.label(
+            "历史研究记录 · 完整多空辩论存档 · 从「今日总览」点标的名会自动跳转到这里"
+        ).classes("qa-card-sub")
+
+        _pending_symbol = str(_pending_archive_filter.pop("symbol", "") or "")
+        with ui.row().classes("items-end gap-3"):
+            archive_symbol_in = (
+                ui.input("标的代码（留空=全部）", value=_pending_symbol)
+                .props("dark dense outlined")
+                .style("width:180px")
+            )
+            archive_days_sel = ui.select(
+                {0: "全部", 7: "最近 7 天", 30: "最近 30 天", 90: "最近 90 天"},
+                value=30,
+                label="时间范围",
+            ).props("dark dense outlined").style("width:140px")
+            archive_refresh_btn = ui.button("查询").props("unelevated dense")
+
+        archive_columns = [
+            {"name": "trading_date", "label": "研究交易日", "field": "trading_date", "align": "left", "sortable": True},
+            {"name": "symbol", "label": "标的", "field": "symbol", "align": "left", "sortable": True},
+            {"name": "conclusion", "label": "AI 结论", "field": "conclusion", "align": "left"},
+        ]
+        with ui.row().classes("w-full gap-3").style("align-items:flex-start;margin-top:10px"):
+            with ui.element("div").style("flex:1;min-width:420px"):
+                archive_table = (
+                    ui.table(columns=archive_columns, rows=[], row_key="row_id", pagination=15)
+                    .props("flat dense bordered")
+                    .classes("w-full")
+                )
+            with ui.element("div").style("width:420px;min-width:340px;flex:0 0 420px"):
+                archive_detail = ui.html(
+                    '<div class="qa-note">点左边表格里的一行，看完整多空辩论记录。</div>'
+                )
+
+        def _archive_row_id(rec: dict) -> str:
+            return f"{rec.get('run_id', '')}:{rec.get('symbol', '')}"
+
+        _archive_cache: dict[str, dict] = {}
+
+        def _refresh_archive() -> None:
+            days = int(archive_days_sel.value or 0) or None
+            records = list_debate_records(
+                _AI_DB,
+                symbol=str(archive_symbol_in.value or ""),
+                days=days,
+                limit=300,
+            )
+            _archive_cache.clear()
+            rows = []
+            for rec in records:
+                row_id = _archive_row_id(rec)
+                _archive_cache[row_id] = rec
+                score = rec.get("ai_score")
+                conclusion = (
+                    f"{rec.get('recommendation', '—')} · {float(score):.1f} 分"
+                    if score is not None
+                    else str(rec.get("recommendation") or "—")
+                )
+                rows.append(
+                    {
+                        "row_id": row_id,
+                        "trading_date": rec.get("trading_date", "—"),
+                        "symbol": rec.get("symbol", ""),
+                        "conclusion": conclusion,
+                    }
+                )
+            archive_table.rows = rows
+            archive_table.update()
+            if not rows:
+                archive_detail.set_content(
+                    '<div class="qa-note">没有符合条件的记录——换个标的或者放宽时间范围试试。</div>'
+                )
+
+        def _on_archive_row(e) -> None:
+            args = getattr(e, "args", None)
+            row = {}
+            if isinstance(args, dict):
+                row = args.get("row") or args
+            elif isinstance(args, (list, tuple)):
+                for part in args:
+                    if isinstance(part, dict) and part.get("row_id"):
+                        row = part
+                        break
+            rec = _archive_cache.get(str(row.get("row_id", "")))
+            if rec is None:
+                return
+            debate = str(rec.get("debate") or "").strip()
+            body = (
+                html.escape(debate).replace("\n", "<br>")
+                if debate
+                else "（这条记录没有完整辩论正文，可能是较早版本产生的，只有简报）"
+                + (f"<br><br>{html.escape(str(rec.get('thesis') or ''))}" if rec.get("thesis") else "")
+            )
+            score = rec.get("ai_score")
+            conclusion = (
+                f"{rec.get('recommendation', '—')} · {float(score):.1f} 分"
+                if score is not None
+                else str(rec.get("recommendation") or "—")
+            )
+            archive_detail.set_content(
+                f'<div style="display:grid;gap:8px">'
+                f'<div><b style="font-size:15px">{html.escape(str(rec.get("symbol", "")))}</b> '
+                f'<span style="color:var(--fg3)">· {html.escape(str(rec.get("trading_date", "")))} '
+                f'· {html.escape(conclusion)}</span></div>'
+                f'<div style="line-height:1.6;font-size:12.5px">{body}</div>'
+                f"</div>"
+            )
+
+        archive_table.on("rowClick", _on_archive_row)
+        archive_refresh_btn.on_click(
+            _audited_callback("research.archive_query", _refresh_archive)
+        )
+        _refresh_archive()
 
     with ui.row().classes("items-center gap-2").style("margin-bottom:10px"):
         ui.label("研究工具").classes("qa-card-title")
@@ -2933,6 +3147,13 @@ def _render_selection_pools():
     def _source_value() -> str:
         return str(source_in.value or "").strip()
 
+    def _manual_symbols_value() -> list[str]:
+        # 自选来自"系统运营"引擎控制卡片的"手动追加标的"框（_pref("sys_sym", ...)），
+        # 两处共用同一份持久化值，重建决策池时也要把自选算进去，不能只在启动引擎
+        # 那一刻才临时拼一次——否则"决策池"这些分析卡片永远看不到自选标的。
+        raw = str(_pref("sys_sym", "") or "").strip()
+        return [s.strip().upper() for s in raw.split(",") if s.strip()]
+
     def _decision_style_value() -> str:
         return (
             DECISION_STYLE_AGGRESSIVE
@@ -3115,6 +3336,7 @@ def _render_selection_pools():
                 ai_db_path=_AI_DB,
                 save=False,
                 download_missing_decision_etfs=True,
+                manual_symbols=_manual_symbols_value(),
                 progress_callback=_progress_update,
             )
             save_selection_pools(results)
@@ -3151,6 +3373,7 @@ def _render_selection_pools():
                 decision_style=_decision_style_value(),
                 ai_db_path=_AI_DB,
                 download_missing_decision_etfs=True,
+                manual_symbols=_manual_symbols_value(),
                 progress_callback=_progress_update,
             )
             save_selection_pool(result)
@@ -4599,6 +4822,17 @@ def _select(name: str):
         _state["updater"] = _RENDERERS[name]()
 
 
+def _on_research_symbol_click(e) -> None:
+    symbol = str(getattr(e, "args", "") or "").strip().upper()
+    if not symbol:
+        return
+    _pending_archive_filter["symbol"] = symbol
+    _select("research")
+
+
+ui.on("research_symbol_click", _on_research_symbol_click)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 定时器：顶栏 + 当前页增量更新（绝不 clear+rebuild，所以不闪）
 # ═══════════════════════════════════════════════════════════════════════════
@@ -4608,6 +4842,24 @@ def _update_topbar():
     running = _engine_running()
     top_engine.set_text("● 运行中" if running else "○ 停止")
     top_engine.classes(remove="pos neg", add="pos" if running else "neg")
+    # AutoTrade 状态必须读引擎自己写出来的 runtime_status.json，不能读
+    # Dashboard 自己的 _cfg——Dashboard 和引擎是两个独立进程，_cfg 只反映
+    # Dashboard 上次用来启动引擎时传的参数，引擎也可能是手动起的，两者会
+    # 对不上。
+    if not running:
+        top_autotrade.set_text("—")
+        top_autotrade.classes(remove="pos neg ai")
+    else:
+        status = read_runtime_status()
+        if status is None:
+            top_autotrade.set_text("未知")
+            top_autotrade.classes(remove="pos neg ai")
+        elif status.get("auto_trade_paper"):
+            top_autotrade.set_text("● 已开启")
+            top_autotrade.classes(remove="pos neg", add="ai")
+        else:
+            top_autotrade.set_text("○ 关闭")
+            top_autotrade.classes(remove="pos neg ai")
     snapshot = _ASYNC_ACTION_RUNNER.queue_snapshot()
     pending_count = len(snapshot["queued"]) + (1 if snapshot["current"] else 0)
     top_tasks.set_text(f"{pending_count} 个" if pending_count else "空闲")

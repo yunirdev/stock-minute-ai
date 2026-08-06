@@ -36,7 +36,19 @@ class AgentBase(ABC):
         payload: Dict[str, Any],
         confidence: float = 0.0,
         model: str = "",
+        is_fallback: bool | None = None,
     ) -> Advisory:
+        """`is_fallback` 必须由调用方显式传入 `_llm_json()` 结果里的
+        `_is_fallback`。
+
+        原来这里只从 payload 里读 `_is_fallback`，但所有 agent 都是另起一个
+        全新的 dict 当 payload（不会把 `_is_fallback` 带过去），导致这个标记
+        对每个 agent 永远是 False —— 而 get_score_snapshots_from_db 正是靠它
+        把 LLM 不可用时的硬编码降级分排除在加权综合分之外。结果就是 Ollama
+        挂掉时，一堆硬编码的 50 分被当成真实 LLM 结论算进综合分。
+        """
+        if is_fallback is None:
+            is_fallback = bool(payload.get("_is_fallback", False))
         return Advisory(
             advisory_id=new_id(),
             kind=kind,
@@ -45,8 +57,13 @@ class AgentBase(ABC):
             confidence=confidence,
             model=model,
             created_at=utc_now(),
-            is_fallback=bool(payload.get("_is_fallback", False)),
+            is_fallback=bool(is_fallback),
         )
+
+    @staticmethod
+    def _is_fallback_result(*results: Dict[str, Any]) -> bool:
+        """只要有一次 LLM 调用降级了，整条 advisory 就算降级产物。"""
+        return any(bool(r.get("_is_fallback")) for r in results if isinstance(r, dict))
 
     # ── LLM 调用工具（子类使用）─────────────────────────────────────────────
 

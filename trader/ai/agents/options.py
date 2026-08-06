@@ -157,6 +157,8 @@ class OptionsAgent(AgentBase):
             },
             confidence=confidence,
             model="algorithmic",
+            # 同 quant：没有任何因子参与 = 分数就是初始值，不是真实判断
+            is_fallback=not factors,
         )
 
 

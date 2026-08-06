@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -31,19 +32,39 @@ HEARTBEAT_JSON = _ROOT / "logs" / "heartbeat.json"
 
 
 def db_query(sql: str, params: list | None = None, db_path: str = DB_PATH) -> pd.DataFrame:
-    """Run a read-only query against the audit DB. Returns empty frame on any error."""
+    """Run a read-only query against the audit DB. Returns empty frame on any error.
+
+    This dashboard polls every few seconds, and DuckDB's single-writer lock on
+    Windows means an open-close-per-call read can occasionally land on the
+    same instant the engine process is mid-write. That's a timing collision,
+    not a real failure — a couple of short retries clears it without holding
+    a connection open (which would itself block the engine's writes, see the
+    2026-08-03 investigation that ruled out a long-lived connection).
+    """
     if not Path(db_path).exists():
         return pd.DataFrame()
-    try:
-        conn = duckdb.connect(db_path, read_only=True)
-    except Exception:
-        return pd.DataFrame()
-    try:
-        return conn.execute(sql, params or []).df()
-    except Exception:
-        return pd.DataFrame()
-    finally:
-        conn.close()
+    for attempt in range(3):
+        try:
+            conn = duckdb.connect(db_path, read_only=True)
+        except duckdb.IOException:
+            if attempt == 2:
+                return pd.DataFrame()
+            time.sleep(0.15)
+            continue
+        except Exception:
+            return pd.DataFrame()
+        try:
+            return conn.execute(sql, params or []).df()
+        except duckdb.IOException:
+            if attempt == 2:
+                return pd.DataFrame()
+            time.sleep(0.15)
+            continue
+        except Exception:
+            return pd.DataFrame()
+        finally:
+            conn.close()
+    return pd.DataFrame()
 
 
 def heartbeat(db_path: str = DB_PATH, heartbeat_json: Path = HEARTBEAT_JSON) -> Optional[datetime]:
@@ -75,8 +96,25 @@ def signals_df(hours: int, db_path: str = DB_PATH) -> pd.DataFrame:
 
 
 def orders_df(hours: int, db_path: str = DB_PATH) -> pd.DataFrame:
-    return db_query("SELECT * FROM orders WHERE created_at >= ? ORDER BY created_at DESC",
-                    [_since(hours)], db_path)
+    """Reads order_intents — the table Runtime actually writes real order
+    submissions to since the M0 contracts refactor. The older `orders` table
+    has a log_order()/update_order_status() writer that nothing calls
+    anymore (last row 2026-06-14), so it never has data to show."""
+    return db_query(
+        """
+        SELECT
+            submitted_at AS created_at,
+            symbol,
+            side,
+            qty,
+            state AS status,
+            plan_id
+        FROM order_intents
+        WHERE submitted_at >= ?
+        ORDER BY submitted_at DESC
+        """,
+        [_since(hours)], db_path,
+    )
 
 
 def fills_df(hours: int, db_path: str = DB_PATH) -> pd.DataFrame:
@@ -84,9 +122,19 @@ def fills_df(hours: int, db_path: str = DB_PATH) -> pd.DataFrame:
                     [_since(hours)], db_path)
 
 
-def risk_events_df(hours: int, db_path: str = DB_PATH) -> pd.DataFrame:
-    return db_query("SELECT * FROM risk_events WHERE ts >= ? ORDER BY ts DESC",
-                    [_since(hours)], db_path)
+def plan_risk_events_df(
+    hours: int, db_path: str = DB_PATH, *, blocked_only: bool = False
+) -> pd.DataFrame:
+    """Reads plan_risk_events — the table Runtime actually writes plan-level
+    risk verdicts (APPROVED and BLOCKED) to. The older `risk_events` table
+    has a `log_risk_event()` writer that is defined but never called
+    anywhere in the live pipeline, so it never has data to show."""
+    sql = "SELECT * FROM plan_risk_events WHERE ts >= ?"
+    params: list = [_since(hours)]
+    if blocked_only:
+        sql += " AND verdict = 'BLOCKED'"
+    sql += " ORDER BY ts DESC"
+    return db_query(sql, params, db_path)
 
 
 def latest_reconciliation(db_path: str = DB_PATH) -> dict | None:

@@ -210,6 +210,11 @@ class EliteHoldingsAgent(AgentBase):
             },
             confidence=confidence,
             model="algorithmic",
+            # 五路持仓数据（ARK/伯克希尔/Scion/机构/内部人）全部为空时，
+            # score 就是初始的 50.0，不是"大咖态度中性"而是"什么都没查到"。
+            is_fallback=not any(
+                (ark_detail, berk_detail, scion_detail, inst_detail, insider_detail)
+            ),
         )
 
     def _congress_twitter(self, symbol: str) -> Tuple[float, List[str]]:
@@ -262,9 +267,12 @@ def _fetch_all_ark() -> Dict[str, Any]:
                         "recent_sell": False,
                     }
                 result[ticker]["held_by"].append(fund)
+                # arkfunds.io v2 的字段名就是 "weight"；原来读的
+                # weight_pct / market_value_weight 两个键都不存在，
+                # 于是所有标的的 ARK 权重恒为 0.0（落库 21/21 条全是 0）。
                 result[ticker]["weight"] = max(
                     result[ticker]["weight"],
-                    float(h.get("weight_pct") or h.get("market_value_weight") or 0),
+                    float(h.get("weight") or 0),
                 )
         except Exception as exc:
             logger.debug("ARK %s holdings 失败: %s", fund, exc)
@@ -495,10 +503,20 @@ def _yf_institutional(symbol: str) -> Tuple[float, Dict]:
         if df is None or df.empty:
             return 0.0, {}
         top = df.head(5)
+        # yfinance 的列名是 pctHeld，不是 "% Out"。用错的键名不会抛异常，
+        # 只会静默拿到默认值 0 —— 于是真实的机构名配上捏造的 0.0% 一起展示。
+        # 实测 AAPL 真实值：Blackrock 7.79% / Vanguard 6.49% / State Street 4.10%
+        if "pctHeld" not in df.columns:
+            logger.warning(
+                "EliteHoldings: yfinance institutional_holders 缺少 pctHeld 列"
+                "（实际列: %s），机构持仓占比不可用",
+                list(df.columns),
+            )
+            return 0.0, {}
         holders = [
             {
                 "holder": row.get("Holder", ""),
-                "pct_out": round(float(row.get("% Out", 0)) * 100, 2),
+                "pct_out": round(float(row.get("pctHeld", 0) or 0) * 100, 2),
             }
             for _, row in top.iterrows()
         ]
@@ -526,11 +544,24 @@ def _yf_insider(symbol: str) -> Tuple[float, Dict]:
         if df.empty:
             return 0.0, {"recent_transactions": 0}
 
-        txn_col = "Transaction" if "Transaction" in df.columns else "Typ"
-        buy_mask = df.get(txn_col, "").str.contains(
-            "Buy|Purchase", na=False, case=False
-        )
-        sell_mask = df.get(txn_col, "").str.contains("Sell|Sale", na=False, case=False)
+        # yfinance 当前版本的 "Transaction" 整列都是空字符串，方向信息实际在
+        # "Text" 列里（例如 "Sale at price 295.14 per share."）。原来只读
+        # Transaction，导致 buy/sell 恒为 0、net_direction 恒为 neutral。
+        # 优先用有实际内容的列，避免再次静默失活。
+        txn_col = None
+        for candidate in ("Transaction", "Typ", "Text"):
+            if candidate in df.columns and df[candidate].astype(str).str.strip().any():
+                txn_col = candidate
+                break
+        if txn_col is None:
+            logger.warning(
+                "EliteHoldings: insider_transactions 没有可用的方向列（列: %s）",
+                list(df.columns),
+            )
+            return 0.0, {"recent_transactions": len(df)}
+        txn_text = df[txn_col].astype(str)
+        buy_mask = txn_text.str.contains("Buy|Purchase", na=False, case=False)
+        sell_mask = txn_text.str.contains("Sell|Sale", na=False, case=False)
         share_col = "Shares" if "Shares" in df.columns else "Value"
         buy_v = int(df[buy_mask][share_col].fillna(0).sum()) if buy_mask.any() else 0
         sell_v = int(df[sell_mask][share_col].fillna(0).sum()) if sell_mask.any() else 0

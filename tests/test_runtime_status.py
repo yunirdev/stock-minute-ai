@@ -40,10 +40,27 @@ def test_runtime_status_tracks_candidate_distance_and_round_trips(tmp_path):
         positions={"AAPL": Position("AAPL", 0, 0)},
         plans={"AAPL": plan},
         research_snapshots={"AAPL": snapshot},
+        auto_trade_paper=True,
     )
     assert payload["candidates"][0]["state"] == "READY"
     assert payload["candidates"][0]["distance_to_entry_pct"] == 1.0
+    # Dashboard 顶栏的 AutoTrade 指示灯读的就是这个字段——它必须来自引擎自己
+    # 写出来的状态文件，不是 Dashboard 自己的启动参数猜测。
+    assert payload["auto_trade_paper"] is True
 
     path = tmp_path / "runtime_status.json"
     write_runtime_status(payload, path)
     assert read_runtime_status(path) == payload
+
+
+def test_runtime_status_defaults_auto_trade_paper_to_false(tmp_path):
+    now = datetime(2026, 7, 27, 15, 0, tzinfo=timezone.utc)
+    payload = build_runtime_status(
+        now=now,
+        tick_count=1,
+        session="open",
+        equity=10_000,
+        reconciliation_blocked=False,
+        kill_switch=False,
+    )
+    assert payload["auto_trade_paper"] is False

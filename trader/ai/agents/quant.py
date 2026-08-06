@@ -45,7 +45,10 @@ class QuantAgent(AgentBase):
 
     def run(self, ctx: AgentContext) -> List[Advisory]:
         # 提前获取 SPY 基准（计算 beta 用）
-        spx_daily = _fetch_daily("SPY", "1y")
+        # 跟个股一样取 2y：_compute_beta 用 join="inner" 按日期对齐，长度不同
+        # 不会算错 beta，但两边周期保持一致更省心，也避免以后有人加个按位置
+        # 对齐的计算时踩坑。
+        spx_daily = _fetch_daily("SPY", "2y")
 
         advisories: List[Advisory] = []
         for cand in ctx.candidates:
@@ -61,7 +64,10 @@ class QuantAgent(AgentBase):
 
     def _analyze(self, symbol: str, spx_daily) -> Optional[Advisory]:
         # ① 日线动量 & Beta（yfinance）
-        daily = _fetch_daily(symbol, "1y")
+        # 必须拉 2y：yfinance 的 "1y" 只给 ~251 个交易日，而下面 12-1 月动量
+        # 要求 len(daily) >= 252 —— 差一根，导致这个权重 0.30 的经典因子
+        # 从来没有生效过（落库的 momentum_12m1_pct 全是 null）。
+        daily = _fetch_daily(symbol, "2y")
         mom_1m = mom_3m = mom_6m = mom_12m = beta = None
         if daily is not None and len(daily) >= _MIN_DAYS_DAILY:
             mom_1m = _ret(daily, 21)
@@ -126,6 +132,10 @@ class QuantAgent(AgentBase):
             },
             confidence=confidence,
             model="algorithmic",
+            # factors 为空 = 所有数据源都没取到，_composite_score 直接返回它的
+            # 50.0 初始值。那不是"中性判断"，是"什么都没算出来"，必须标成
+            # fallback，否则会以真实量化分的身份占据 15% 综合分权重。
+            is_fallback=not factors,
         )
 
 

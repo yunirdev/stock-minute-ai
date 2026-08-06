@@ -98,6 +98,7 @@ def _configured_graph(payload: dict[str, Any]):
     for key, value in overrides.items():
         if value not in (None, ""):
             config[key] = value
+    _apply_complexity_overrides(config, payload.get("complexity_overrides"))
     _prepare_runtime_paths(config)
     return (
         TradingAgentsGraph(
@@ -106,6 +107,21 @@ def _configured_graph(payload: dict[str, Any]):
         ),
         config,
     )
+
+
+def _apply_complexity_overrides(
+    config: dict[str, Any], overrides: dict[str, Any] | None
+) -> None:
+    """Mirrors daily_research._apply_complexity() on this side of the subprocess
+    boundary — the parent process can't reach into our config dict directly."""
+    if not overrides:
+        return
+    for key, value in overrides.items():
+        if key == "use_quick_model_only":
+            if value and config.get("quick_think_llm"):
+                config["deep_think_llm"] = config["quick_think_llm"]
+            continue
+        config[key] = value
 
 
 def _prepare_runtime_paths(config: dict[str, Any]) -> None:

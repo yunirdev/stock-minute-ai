@@ -111,7 +111,10 @@ def test_runtime_constructs_only_lmt_intents(tmp_path):
 
     assert len(captured) == 1
     assert captured[0].order_type == "LMT"
-    assert captured[0].limit_price == 100.0
+    # 入场限价单带 marketable-limit 缓冲（+0.15%），不再是原始 entry_price
+    # 原样提交——reference_price 才是那个"干净"的计划价。
+    assert captured[0].limit_price == 100.15
+    assert captured[0].reference_price == 100.0
 
 
 def test_alpaca_adapter_rejects_live_order_submission():

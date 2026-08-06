@@ -30,6 +30,27 @@ _TF_MAP: Dict[str, str] = {
     "1d": "1Day",
 }
 
+_TIMEFRAME_MINUTES: Dict[str, int] = {
+    "1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60,
+}
+_RTH_MINUTES_PER_DAY = 390  # 6.5h 常规交易时段
+
+
+def _bars_per_trading_day(timeframe: str) -> int:
+    """一个常规交易日大致能攒出多少根这个周期的 bar。
+
+    lookback_days 原来写死用 78 除（78 = 390/5，是 5 分钟 bar 一天的根数），
+    换成 30m/1h 等其它周期时这个常数就不对了——30 分钟一天只有 13 根，用 78
+    去除会把回看窗口算得远小于实际需要的天数，导致拉回来的 bar 数量长期不够
+    filter（`len(bars) < 30`）要求的下限，尤其在 IEX 之类成交没那么密的 feed
+    下更明显。这里按实际周期分钟数动态算，"1d" 之类未收录的周期按 1 根/天
+    退化（回看天数直接约等于要求的根数）。
+    """
+    minutes = _TIMEFRAME_MINUTES.get(timeframe)
+    if not minutes:
+        return 1
+    return max(1, _RTH_MINUTES_PER_DAY // minutes)
+
 
 class AlpacaDataFeed:
     """Fetches bars and latest prices from Alpaca Data REST API v2."""
@@ -47,7 +68,8 @@ class AlpacaDataFeed:
         # Free Alpaca plan: SIP data has 15-min delay; use 20-min buffer to avoid 403
         end = datetime.now(timezone.utc) - timedelta(minutes=20)
         # Request a wider window; Alpaca skips after-hours gaps
-        lookback_days = max(2, n_bars // 78 + 3)
+        bars_per_day = _bars_per_trading_day(self._cfg.timeframe)
+        lookback_days = max(2, n_bars // bars_per_day + 3)
         start = end - timedelta(days=lookback_days)
 
         params = {

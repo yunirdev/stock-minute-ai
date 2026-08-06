@@ -41,6 +41,7 @@ def build_runtime_status(
     research_run: Any | None = None,
     open_orders: Iterable[Any] = (),
     message: str = "",
+    auto_trade_paper: bool = False,
 ) -> dict[str, Any]:
     bars = bars or {}
     positions = positions or {}
@@ -121,6 +122,11 @@ def build_runtime_status(
         "equity": float(equity),
         "reconciliation_blocked": bool(reconciliation_blocked),
         "kill_switch": bool(kill_switch),
+        # 引擎进程和 Dashboard 是两个独立进程——Dashboard 自己的 _cfg 只反映
+        # 它上次用来启动引擎的参数，不代表真正在跑的那个引擎当前的实际配置
+        # （引擎也可能是手动起的）。这个字段由引擎自己写出来，是唯一准确的
+        # 来源，Dashboard 顶栏的 AutoTrade 指示灯必须读这个，不能读自己的 _cfg。
+        "auto_trade_paper": bool(auto_trade_paper),
         "message": str(message),
         "daily_research": (
             {

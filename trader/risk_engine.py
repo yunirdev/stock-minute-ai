@@ -83,8 +83,16 @@ class RiskEngine:
         current_equity: float,
         positions: Dict[str, Position],
         pending_buy_notional: Mapping[str, float] | None = None,
+        buying_power: float | None = None,
     ) -> RiskVerdict:
-        """Plan-level pre-trade checks（用于 runtime.py 计划驱动管道）。"""
+        """Plan-level pre-trade checks（用于 runtime.py 计划驱动管道）。
+
+        `buying_power` (equity × configured leverage, computed by the caller)
+        sizes the position-value cap; it defaults to `current_equity` when
+        omitted (no leverage). The per-trade stop-loss risk check below stays
+        anchored to real `current_equity` regardless of leverage — leverage
+        buys bigger size, not a bigger real-dollar loss tolerance per trade.
+        """
         if self._halted:
             return RiskVerdict(False, "系统熔断中: " + self._halt_reason)
 
@@ -121,6 +129,14 @@ class RiskEngine:
             )
 
         increases_exposure = plan.action not in {"CLOSE", "REDUCE"}
+        if (
+            plan.side == Side.SELL
+            and increases_exposure
+            and not self._cfg.risk.allow_short
+        ):
+            held = positions.get(plan.symbol)
+            if not held or float(held.qty) <= 0:
+                return RiskVerdict(False, "做空未启用 (risk.allow_short=False)")
         if increases_exposure:
             try:
                 max_trade_risk_pct = float(
@@ -144,7 +160,8 @@ class RiskEngine:
                 )
 
         cost = entry_price * qty
-        max_cost = equity * self._cfg.risk.max_position_pct
+        sizing_base = float(buying_power) if buying_power is not None else equity
+        max_cost = sizing_base * self._cfg.risk.max_position_pct
         increases_long = (
             plan.side == Side.BUY
             and increases_exposure
@@ -179,7 +196,10 @@ class RiskEngine:
 
         if plan.action == "OPEN" and plan.symbol in positions:
             pos = positions[plan.symbol]
-            if pos is not None and pos.qty > 0:
+            # 不分多空——已经有仓位（不管是多头还是空头）时 OPEN 计划都该被拒，
+            # 该用的是 ADD/REDUCE。原来只查 qty>0，空头持仓（qty<0）时这道防线
+            # 形同虚设。
+            if pos is not None and pos.qty != 0:
                 return RiskVerdict(
                     False, f"{plan.symbol} 已有持仓 {pos.qty:.0f} 股，OPEN 计划被拒"
                 )

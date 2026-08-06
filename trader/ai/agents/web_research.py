@@ -217,4 +217,5 @@ class WebResearchAgent(AgentBase):
             },
             confidence=confidence,
             model=getattr(self._llm, "_model", ""),
+            is_fallback=self._is_fallback_result(result),
         )

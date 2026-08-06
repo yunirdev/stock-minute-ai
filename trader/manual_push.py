@@ -237,7 +237,7 @@ def build_intraday_levels_messages(symbols: Iterable[str]) -> List[Notification]
 
     return [
         Notification(
-            title=f"盘中 OR/VWAP 跟踪 · {datetime.now():%m/%d %H:%M}",
+            title=f"盘中 OR/VWAP 跟踪 · {datetime.now(_ET_TZ):%m/%d %H:%M} ET",
             body="\n".join(f"• {line}" for line in lines),
             kind="alert",
             fields={"用途": "盘中手动跟踪", "数据": "实时拉取（失败时回退本地缓存，回退会在正文标注）"},

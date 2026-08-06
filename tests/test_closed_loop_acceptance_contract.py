@@ -30,12 +30,12 @@ def test_nicegui_button_inventory_matches_acceptance_contract():
     )
     assigned_handlers = len(re.findall(r"\.on_click\(", source))
 
-    assert len(calls) == 16
+    assert len(calls) == 17
     assert inline_handlers == 7
-    assert assigned_handlers == 9
+    assert assigned_handlers == 10
     assert inline_handlers + assigned_handlers == len(calls)
-    assert len(BUTTON_ACTIONS) == 17
-    assert "17 个按钮动作" in contract
+    assert len(BUTTON_ACTIONS) == 18
+    assert "18 个按钮动作" in contract
     assert "实盘下单请改" not in source
     assert "自动实盘不受支持" in source
     assert 'os.getenv("QUANT_HOST", "127.0.0.1")' in source

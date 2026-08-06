@@ -163,6 +163,12 @@ class StrategyDecision:
 
 
 class PaperDecisionService:
+    """AI 直选决策：方向和入场资格完全由每日 AI 深度研究的多空裁判
+    （bull_bear_debate → recommendation）驱动，不再依赖 24 策略回测统计
+    投票 —— 那套机制既不产生真正的方向信号，历史回测表现也不好。
+    `strategy_statistics` 参数保留只是为了不破坏调用方签名，不再参与决策。
+    """
+
     def __init__(
         self,
         *,
@@ -172,6 +178,7 @@ class PaperDecisionService:
         ai_min_contributors: int = 3,
         ai_min_weight_coverage: float = 0.50,
         min_ai_score: float = 0.0,
+        allow_short: bool = False,
     ) -> None:
         self.allow_without_ai = allow_without_ai
         self.ai_max_age = ai_max_age_minutes
@@ -179,6 +186,7 @@ class PaperDecisionService:
         self.ai_min_contributors = ai_min_contributors
         self.ai_min_weight_coverage = ai_min_weight_coverage
         self.min_ai_score = min_ai_score
+        self.allow_short = allow_short
 
     def decide(
         self,
@@ -194,25 +202,13 @@ class PaperDecisionService:
         universe_version: str = "",
         data_version: str = "",
     ) -> list[StrategyDecision]:
-        del positions  # explicit broker input; sizing remains downstream
+        del strategy_statistics  # no longer used — AI recommendation drives direction
         now = _utc(now)
-        repo = strategy_statistics if isinstance(strategy_statistics, StrategyStatisticsRepository) else StrategyStatisticsRepository(strategy_statistics)
         decisions = []
         for candidate in candidates:
             symbol = getattr(candidate, "symbol", None) or candidate.get("symbol")
-            reasons = getattr(candidate, "reasons", None) or (
-                candidate.get("reasons", {}) if isinstance(candidate, dict) else {}
-            )
-            votes = reasons.get("votes", {})
-            stats = [
-                record for record in repo.find(symbol, timeframe, market_regime, now)
-                if int(votes.get(record.strategy, 0)) != 0
-            ]
-            if not stats or symbol not in bars:
+            if symbol not in bars:
                 continue
-            stats.sort(key=lambda r: (-r.out_of_sample_net_return, -r.sharpe, r.max_drawdown, -r.trade_count, r.strategy))
-            chosen, alternatives = stats[0], stats[1:]
-            side = Side.BUY if int(votes[chosen.strategy]) > 0 else Side.SELL
             advisory = ai_advisories.get(symbol)
             ai_result = AIScoreValidator(
                 AIScorePolicy(
@@ -226,25 +222,46 @@ class PaperDecisionService:
             ).validate(advisory)
             if not ai_result.valid and not self.allow_without_ai:
                 continue
-            evidence = {}
-            reasons = ["STRATEGY_STATISTICS_VALID", "REGIME_MATCH"]
+            recommendation = advisory.recommendation if advisory is not None else "HOLD"
+            if recommendation not in ("BUY", "SELL"):
+                continue  # AI didn't take a decisive side — no trade
+            if recommendation == "SELL" and not self.allow_short:
+                # Still lets an existing long be closed downstream (planner picks
+                # REDUCE/CLOSE from current_qty); only blocks opening a *new* short.
+                held_qty = getattr(positions.get(symbol), "qty", 0.0) if positions else 0.0
+                if not held_qty:
+                    continue
+            side = Side.BUY if recommendation == "BUY" else Side.SELL
+            evidence: dict[str, Any] = {}
+            reasons = [f"AI_RECOMMENDATION_{recommendation}"]
             run_id = None
             if ai_result.valid and advisory is not None:
-                evidence["ai"] = {"score": advisory.score, "provider": advisory.provider, "model": advisory.model}
+                evidence["ai"] = {
+                    "score": advisory.score,
+                    "provider": advisory.provider,
+                    "model": advisory.model,
+                    "recommendation": recommendation,
+                }
                 run_id = advisory.run_id
                 reasons.append("AI_EVIDENCE_VALID")
             else:
                 reasons.append("AI_NOT_USED")
-            payload = {"symbol": symbol, "strategy": chosen.strategy, "stats": chosen.statistics_id, "regime": market_regime, "now": now.isoformat(), "universe": universe_version, "data": data_version}
+            payload = {
+                "symbol": symbol, "recommendation": recommendation, "regime": market_regime,
+                "now": now.isoformat(), "universe": universe_version, "data": data_version,
+            }
             decision_id = "dec-" + hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:24]
-            confidence = max(0.0, min(1.0, 0.5 + chosen.sharpe / 10 - chosen.max_drawdown / 2))
+            confidence = max(
+                0.0,
+                min(1.0, (advisory.score / 100.0) if (advisory is not None and advisory.score is not None) else 0.5),
+            )
             decisions.append(StrategyDecision(
-                decision_id, symbol, chosen.strategy, chosen.strategy_version, dict(chosen.params),
+                decision_id, symbol, "ai_consensus", "v1", {},
                 side, confidence, 0.0, now,
                 now + timedelta(minutes=self.ttl), market_regime,
                 getattr(candidate, "source", None) or (candidate.get("source") if isinstance(candidate, dict) else None) or "runtime",
-                evidence, run_id, chosen.statistics_id, data_version, now, tuple(reasons),
-                tuple({"strategy": r.strategy, "reason_code": "LOWER_VALIDATED_NET_RETURN"} for r in alternatives),
+                evidence, run_id, "", data_version, now, tuple(reasons),
+                (),
                 universe_version,
             ))
         return decisions

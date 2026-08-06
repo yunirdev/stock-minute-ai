@@ -46,8 +46,61 @@ class AuditLog:
                     raise
                 time.sleep(0.1 * (_attempt + 1))
 
+    _LEGACY_TS_SUFFIX = "__legacy_naive_ts"
+
+    def _migrate_naive_timestamp_table(
+        self,
+        conn,
+        *,
+        table: str,
+        converted_columns: str,
+        ts_column: str,
+    ) -> None:
+        """Rename `table` out of the way if `ts_column` is still a naive
+        TIMESTAMP. `_finish_naive_timestamp_migration` completes the copy
+        after the fresh TIMESTAMPTZ table has been created."""
+        row = conn.execute(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_name = ? AND column_name = ?",
+            [table, ts_column],
+        ).fetchone()
+        if row and row[0] != "TIMESTAMP WITH TIME ZONE":
+            conn.execute(
+                f"ALTER TABLE {table} RENAME TO {table}{self._LEGACY_TS_SUFFIX}"
+            )
+            self._pending_ts_migrations = getattr(self, "_pending_ts_migrations", {})
+            self._pending_ts_migrations[table] = converted_columns
+
+    def _finish_naive_timestamp_migration(self, conn, table: str) -> None:
+        pending = getattr(self, "_pending_ts_migrations", {})
+        converted_columns = pending.pop(table, None)
+        if converted_columns is None:
+            return
+        legacy = f"{table}{self._LEGACY_TS_SUFFIX}"
+        conn.execute(f"INSERT INTO {table} SELECT {converted_columns} FROM {legacy}")
+        conn.execute(f"DROP TABLE {legacy}")
+        logger.info("audit: migrated %s to TIMESTAMPTZ (data preserved)", table)
+
     def _init_db(self) -> None:
         conn = self._connect()
+        # signals/orders/risk_events used naive TIMESTAMP columns — same class
+        # of bug fixed for `heartbeat` below: a tz-aware Python datetime
+        # written into a naive column is silently converted to *local*
+        # wall-clock time. Unlike heartbeat (a disposable single-row status
+        # table), these carry real trade history, so migrate in place rather
+        # than dropping: rename the legacy table, recreate with TIMESTAMPTZ,
+        # and reinterpret each stored naive value as local time (DuckDB's
+        # session timezone, which is what produced it on write) to recover
+        # the correct UTC instant.
+        self._migrate_naive_timestamp_table(
+            conn,
+            table="signals",
+            converted_columns=(
+                "signal_id, symbol, strategy, side, exec_price, timeframe, "
+                "timezone(current_setting('TimeZone'), signal_time), bar_close, metadata"
+            ),
+            ts_column="signal_time",
+        )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS signals (
                 signal_id   TEXT,
@@ -56,11 +109,23 @@ class AuditLog:
                 side        TEXT,
                 exec_price  DOUBLE,
                 timeframe   TEXT,
-                signal_time TIMESTAMP,
+                signal_time TIMESTAMPTZ,
                 bar_close   DOUBLE,
                 metadata    TEXT
             )
         """)
+        self._finish_naive_timestamp_migration(conn, "signals")
+
+        self._migrate_naive_timestamp_table(
+            conn,
+            table="orders",
+            converted_columns=(
+                "intent_id, signal_id, symbol, side, qty, order_type, "
+                "limit_price, risk_tag, timezone(current_setting('TimeZone'), created_at), "
+                "broker_order_id, status, timezone(current_setting('TimeZone'), updated_at)"
+            ),
+            ts_column="created_at",
+        )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 intent_id       TEXT,
@@ -71,15 +136,26 @@ class AuditLog:
                 order_type      TEXT,
                 limit_price     DOUBLE,
                 risk_tag        TEXT,
-                created_at      TIMESTAMP,
+                created_at      TIMESTAMPTZ,
                 broker_order_id TEXT,
                 status          TEXT,
-                updated_at      TIMESTAMP
+                updated_at      TIMESTAMPTZ
             )
         """)
+        self._finish_naive_timestamp_migration(conn, "orders")
+
+        self._migrate_naive_timestamp_table(
+            conn,
+            table="risk_events",
+            converted_columns=(
+                "timezone(current_setting('TimeZone'), ts), symbol, strategy, "
+                "side, verdict, reason"
+            ),
+            ts_column="ts",
+        )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS risk_events (
-                ts          TIMESTAMP,
+                ts          TIMESTAMPTZ,
                 symbol      TEXT,
                 strategy    TEXT,
                 side        TEXT,
@@ -87,6 +163,7 @@ class AuditLog:
                 reason      TEXT
             )
         """)
+        self._finish_naive_timestamp_migration(conn, "risk_events")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS plan_risk_events (
                 ts          TIMESTAMPTZ,
@@ -128,9 +205,22 @@ class AuditLog:
                 decision_id TEXT, plan_id TEXT UNIQUE, created_at TIMESTAMPTZ
             )
         """)
+        # heartbeat.ts must be TIMESTAMPTZ, not the naive TIMESTAMP used by most
+        # other audit tables: DuckDB silently converts a tz-aware Python
+        # datetime to *local* wall-clock time when it lands in a naive
+        # TIMESTAMP column, dropping the offset. HeartbeatWatchdog then
+        # re-labels that local value as UTC, so on a UTC-7 machine every
+        # heartbeat reads ~7h stale and fires a false CRITICAL alert every
+        # tick. Migrate any pre-existing naive-typed table in place.
+        legacy_heartbeat_type = conn.execute(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_name = 'heartbeat' AND column_name = 'ts'"
+        ).fetchone()
+        if legacy_heartbeat_type and legacy_heartbeat_type[0] != "TIMESTAMP WITH TIME ZONE":
+            conn.execute("DROP TABLE heartbeat")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS heartbeat (
-                ts          TIMESTAMP,
+                ts          TIMESTAMPTZ,
                 tick_count  INTEGER,
                 equity      DOUBLE
             )

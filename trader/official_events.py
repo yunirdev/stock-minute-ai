@@ -11,9 +11,15 @@ from typing import Callable, Optional
 logger = logging.getLogger(__name__)
 
 _HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; stock-minute-ai/1.0)",
+    # bls.gov 会对伪装成浏览器的 UA 返回 403（实测 3/3 次全部被拒），
+    # 换成标识型 UA 就正常返回（symbol_master.py 一直用的就是这种）。
+    # 这直接决定 CPI/PPI/就业/JOLTS 的官方确认能不能进晨报。
+    "User-Agent": "stock-minute-ai/1.0 (contact: cle19@uci.edu)",
     "Accept": "text/html,application/xhtml+xml",
 }
+
+# EIA 的周报页面实测要 8.5s 才返回，原来的 8s 超时几乎必然失败
+_FETCH_TIMEOUT_SECS = 30
 
 
 @dataclass
@@ -70,7 +76,7 @@ def get_official_events(
 
 def _fetch_text(url: str) -> str:
     req = urllib.request.Request(url, headers=_HEADERS)
-    with urllib.request.urlopen(req, timeout=8) as resp:
+    with urllib.request.urlopen(req, timeout=_FETCH_TIMEOUT_SECS) as resp:
         return resp.read().decode("utf-8", errors="replace")
 
 

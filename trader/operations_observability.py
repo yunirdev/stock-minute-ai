@@ -46,6 +46,7 @@ def _contracts() -> tuple[ButtonActionContract, ...]:
         ("risk.trigger", "触发急停", "risk", True, False),
         ("risk.clear", "解除急停", "risk", True, False),
         ("maintenance.run", "运行维护分析", "maintenance", False, False),
+        ("research.archive_query", "查询研究档案", "research", False, False),
     ]
     return tuple(ButtonActionContract(*values) for values in raw)
 

@@ -154,6 +154,10 @@ class ETFFlowAgent(AgentBase):
             },
             confidence=0.5 if sector_etf else 0.3,
             model="algorithmic",
+            # 大盘、行业、风险偏好三路数据全部缺失时，composite 会正好是
+            # 50*0.4+50*0.4+50*0.2 = 50 —— 一个"看起来很中性"但其实什么
+            # 都没读到的分数。标成 fallback，别让它占 10% 权重。
+            is_fallback=not broad_scores and not sector_detail and not (risk_on or risk_off),
         )
 
 

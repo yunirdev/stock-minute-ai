@@ -33,12 +33,18 @@ def test_long_term_pool_scores_and_ranks(monkeypatch):
 
 
 def test_selection_pipeline_builds_long_and_decision_layers(monkeypatch):
+    import trader.decision_trade_plans as dtp
     import trader.selection_pools as sp
 
     monkeypatch.setattr(sp, "_load_bars", lambda _symbol, _tf: _bars(step=0.55))
     monkeypatch.setattr(sp, "_load_ai_scores", lambda _path: {"NVDA": 80.0, "AAPL": 62.0})
     monkeypatch.setattr(sp, "save_daily_candidates", lambda _rows: None)
     monkeypatch.setattr(sp, "save_decision_pool_report", lambda _report: None)
+    # save=False here only skips save_selection_pools()/save_daily_candidates —
+    # build_daily_decision_pool() still unconditionally calls
+    # build_decision_trade_plan_report(save=True) internally, which leaks
+    # into the live conf/decision_trade_plans.json without this patch.
+    monkeypatch.setattr(dtp, "build_decision_trade_plan_report", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         sp,
         "load_selection_pool",
@@ -60,6 +66,7 @@ def test_selection_pipeline_builds_long_and_decision_layers(monkeypatch):
 
 
 def test_decision_pool_writes_change_report(monkeypatch, tmp_path: Path):
+    import trader.decision_trade_plans as dtp
     import trader.selection_pools as sp
 
     report_path = tmp_path / "decision_report.json"
@@ -67,6 +74,22 @@ def test_decision_pool_writes_change_report(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(sp, "_load_bars", lambda _symbol, _tf: _bars(step=0.6))
     monkeypatch.setattr(sp, "_load_ai_scores", lambda _path: {"NVDA": 82.0, "AAPL": 65.0, "MSFT": 64.0})
     monkeypatch.setattr(sp, "save_daily_candidates", lambda _rows: None)
+    # build_daily_decision_pool() unconditionally persists the change report
+    # and trade-plan report as internal side effects (selection_pools.py
+    # ~L262-265) using their default real conf/ paths — without neutralizing
+    # the no-path call this test silently overwrites the live dashboard's
+    # decision_pool_report.json / decision_trade_plans.json with fixture data.
+    # The test's own explicit call below (with report_path) still needs the
+    # real writer, so only no-op the default-path (internal) call.
+    _real_save_report = sp.save_decision_pool_report
+    monkeypatch.setattr(
+        sp,
+        "save_decision_pool_report",
+        lambda report, path=None: (
+            _real_save_report(report, path) if path is not None else None
+        ),
+    )
+    monkeypatch.setattr(dtp, "build_decision_trade_plan_report", lambda *_args, **_kwargs: None)
     previous = sp.PoolResult(
         layer=sp.DAILY_DECISION,
         updated_at="old",
@@ -96,6 +119,7 @@ def test_decision_pool_writes_change_report(monkeypatch, tmp_path: Path):
 
 
 def test_aggressive_decision_style_expands_candidate_count(monkeypatch):
+    import trader.decision_trade_plans as dtp
     import trader.selection_pools as sp
 
     symbols = ["AAPL", "MSFT", "NVDA", "AMAT", "LRCX", "PANW", "QCOM"]
@@ -103,6 +127,10 @@ def test_aggressive_decision_style_expands_candidate_count(monkeypatch):
     monkeypatch.setattr(sp, "_load_ai_scores", lambda _path: {symbol: 70.0 for symbol in symbols})
     monkeypatch.setattr(sp, "save_daily_candidates", lambda _rows: None)
     monkeypatch.setattr(sp, "save_decision_pool_report", lambda _report: None)
+    # Same real-file leak as test_decision_pool_writes_change_report — this
+    # test never gave build_decision_trade_plan_report a fake, so every run
+    # overwrote the live conf/decision_trade_plans.json with fixture data.
+    monkeypatch.setattr(dtp, "build_decision_trade_plan_report", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         sp,
         "load_selection_pool",
@@ -118,6 +146,40 @@ def test_aggressive_decision_style_expands_candidate_count(monkeypatch):
 
     assert result.selected_size >= 5
     assert any("风格 aggressive" in item.reasons for item in result.items)
+
+
+def test_manual_symbol_is_pinned_even_when_ai_would_reject_it(monkeypatch):
+    """用户自选标的必须始终出现在决策池里，即便 AI 评分/淘汰逻辑本来会把它筛掉——
+    自选是用户的明确指令，不该被 AI 的名额/评分门槛悄悄挤掉。"""
+    import trader.decision_trade_plans as dtp
+    import trader.selection_pools as sp
+
+    def fake_bars(symbol: str, _tf: str) -> pd.DataFrame:
+        if symbol == "DUD":
+            return _bars(step=-0.6)  # 持续下跌，评分会很差甚至 AVOID_NOW
+        return _bars(step=0.6)
+
+    monkeypatch.setattr(sp, "_load_bars", fake_bars)
+    monkeypatch.setattr(sp, "_load_ai_scores", lambda _path: {"NVDA": 82.0, "AAPL": 65.0, "MSFT": 64.0})
+    monkeypatch.setattr(sp, "save_daily_candidates", lambda _rows: None)
+    monkeypatch.setattr(sp, "save_decision_pool_report", lambda _report: None)
+    monkeypatch.setattr(dtp, "build_decision_trade_plan_report", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        sp,
+        "load_selection_pool",
+        lambda layer, path=sp._STORE: sp.PoolResult(layer=layer, updated_at="", source_size=0, selected_size=0, items=[]),
+    )
+
+    result = sp.build_daily_decision_pool(
+        ["AAPL", "NVDA", "MSFT"],
+        limit=3,
+        ai_db_path=":memory:",
+        manual_symbols=["DUD"],
+    )
+
+    dud = next((item for item in result.items if item.symbol == "DUD"), None)
+    assert dud is not None, "自选标的 DUD 应该始终出现在决策池里"
+    assert any("自选" in reason for reason in dud.reasons)
 
 
 def test_decision_etf_data_preparation_downloads_only_missing(monkeypatch):

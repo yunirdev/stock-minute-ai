@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
+import duckdb
 import pandas as pd
 
 from .allocator import EqualWeightAllocator
@@ -29,6 +30,8 @@ from .models import (
     CandidatePlanStatus,
     FinalTradePlanStatus,
     InvalidationEvent,
+    InvalidationEventType,
+    InvalidationSource,
     Notification,
     OrderIntent,
     OrderStatus,
@@ -50,14 +53,14 @@ from .news import (
 from .notify import DiscordNotifier
 from .plan import ATRPlanner
 from .portfolio import Portfolio
-from .invalidation_events import InvalidationEventStore
+from .invalidation_events import InvalidationEventStore, build_invalidation_event
 from .position_adjustments import PositionAdjustmentStore
 from .position_plans import PositionPlanFillProjector, PositionPlanStore
 from .position_quality import PositionQualityStore
 from .post_trade_learning import PostTradeLearningCoordinator
 from .production_evidence import ProductionEvidenceCoordinator
 from .production_operations import ProductionOperationsCoordinator
-from .position_monitor import StopTakeProfitMonitor
+from .position_monitor import StopTakeProfitMonitor, TrailingStopEvaluator
 from .review import SimpleReviewer
 from .risk_engine import RiskEngine
 from .order_lifecycle import (
@@ -154,6 +157,55 @@ def _get_score_threshold() -> float | None:
         return _MIN_CANDIDATE_SCORE
 
 
+# TRAILING_ONLY 止盈风格的开启门槛——AI 结论强度（信心+复杂度分层）达到这
+# 个线才不设固定止盈上限，交给追踪止损让盈利单继续跑。这个判断只在开仓那
+# 一刻做一次（见 _make_decision_plan 调用点附近的 AI 安全门代码），之后
+# 整个持仓生命周期都按锁定的风格走，不会在 tick 级别临场再问一次 AI ——
+# AI 出结论，执行层照确定性规则分支，这是同一个原则的延伸应用。
+#
+# 门槛比的是方向无关的 conviction（0-1，AIScoreValidationResult.confidence），
+# 不是双极的 ai_score——原来直接比 ai_score>=85 时，SELL 的双极分数上限是
+# 50，无论信心多足都够不到 85，等于这条"高信念"待遇实际上只有 BUY 能拿到。
+# 换成 conviction 之后 BUY/SELL 用同一把尺子，allow_short 打开后空头高信心
+# 单也能正确享受追踪止损而不是被固定止盈提前锁死。
+_TRAILING_ONLY_MIN_CONVICTION = 0.85
+_TRAILING_ONLY_COMPLEXITY = "HIGH"
+_FAR_TAKE_PROFIT_RISK_MULTIPLE = 8.0
+
+
+def _select_stop_style(conviction: float | None, complexity: str) -> str:
+    """把 AI 结论强度映射成一次性锁定的止盈风格。
+
+      TRAILING_ONLY：不设固定止盈上限，完全交给追踪止损锁盈/离场。
+      CAPPED（默认）：保留固定止盈上限，落袋为安优先。
+    """
+    if (
+        conviction is not None
+        and conviction >= _TRAILING_ONLY_MIN_CONVICTION
+        and str(complexity or "").upper() == _TRAILING_ONLY_COMPLEXITY
+    ):
+        return "TRAILING_ONLY"
+    return "CAPPED"
+
+
+def _far_take_profit(plan: TradePlan) -> float:
+    """TRAILING_ONLY 风格下的占位止盈价。
+
+    TradePlan.take_profit 是必填正数字段，不支持"无上限"（None）；这里用
+    ATRPlanner 已经算好的止损风险距离（entry 到 stop 的距离，本质就是
+    k×ATR）按倍数放大，得到一个几乎打不到的远值占位——真正的出场机制交给
+    追踪止损，这个数不是真实目标价，只是满足数据模型的必填约束。
+    """
+    risk_distance = abs(plan.entry_price - plan.stop_loss)
+    if plan.side == Side.BUY:
+        return round(
+            plan.entry_price + _FAR_TAKE_PROFIT_RISK_MULTIPLE * risk_distance, 4
+        )
+    return round(
+        plan.entry_price - _FAR_TAKE_PROFIT_RISK_MULTIPLE * risk_distance, 4
+    )
+
+
 def _alpaca_bar_to_model(raw, symbol: str, timeframe: str) -> Bar:
     """把 alpaca-py bar 对象转成 trader.models.Bar（duck typing 兼容）。"""
     return Bar(
@@ -210,6 +262,7 @@ class Runtime:
         if config.auto_trade_paper and config.broker_type != "alpaca_paper":
             raise ValueError("AUTO_TRADE_REQUIRES_ALPACA_PAPER")
         self._pos_monitor = StopTakeProfitMonitor()
+        self._trailing_stop = TrailingStopEvaluator()
         # 授权由 DISCORD_EXTERNAL_SEND_ENABLED 总闸统一决定（默认放行，显式
         # 设成 false 才拦）。引擎的所有推送——成交、信号、异常、各类报告——都
         # 走这一个 notifier，所以总闸对它们一视同仁。
@@ -701,27 +754,41 @@ class Runtime:
         logger.info("── tick #%d  %s ──", self._tick_count, ts.strftime("%H:%M:%S UTC"))
 
         self._daily_research.tick(ts)
-        try:
-            position_report = self._position_quality_store.build_report(
-                as_of=ts.astimezone(ZoneInfo("America/New_York")).date(),
-                required_days=30,
-                observation_kind="REAL",
-            )
-            self._production_evidence.tick(
-                now=ts,
-                research_run=self._daily_research.store.latest_run(),
-                position_report=position_report,
-                reconciliation_blocked=self._reconciliation_blocked,
-            )
-        except Exception as exc:
-            self._bug_reporter.capture_exception(
-                exc,
-                operation="runtime.production_evidence",
-            )
-            logger.error(
-                "production evidence capture failed: %s",
-                type(exc).__name__,
-            )
+        # DuckDB on Windows can raise IOException when this tick's connection
+        # briefly overlaps another one (the background research thread, or
+        # another process) touching the same file — it's a timing collision,
+        # not a real failure, and it clears itself in milliseconds. A couple
+        # of short retries avoids losing a whole day's evidence capture to
+        # a lock we'd have gotten a moment later anyway.
+        for attempt in range(3):
+            try:
+                position_report = self._position_quality_store.build_report(
+                    as_of=ts.astimezone(ZoneInfo("America/New_York")).date(),
+                    required_days=30,
+                    observation_kind="REAL",
+                )
+                self._production_evidence.tick(
+                    now=ts,
+                    research_run=self._daily_research.store.latest_run(),
+                    position_report=position_report,
+                    reconciliation_blocked=self._reconciliation_blocked,
+                )
+                break
+            except duckdb.IOException:
+                if attempt == 2:
+                    logger.error("production evidence capture failed: IOException (3 次重试后仍失败)")
+                else:
+                    time.sleep(0.3)
+            except Exception as exc:
+                self._bug_reporter.capture_exception(
+                    exc,
+                    operation="runtime.production_evidence",
+                )
+                logger.error(
+                    "production evidence capture failed: %s",
+                    type(exc).__name__,
+                )
+                break
         try:
             backup = self._production_operations.tick(now=ts)
             if backup["status"] == "FAILED":
@@ -883,6 +950,12 @@ class Runtime:
             self._maybe_daily_review(ts)
             return
 
+        # 9b. 追踪止损：浮盈仓位收紧止损线（只收紧不放松），在下面的止损/止盈
+        # 判定之前跑——这样如果本 tick 刚收紧的止损恰好已经被当前价碰到，
+        # 同一轮就能触发平仓，不用再等下一 tick。
+        if self._live_plans and positions:
+            self._apply_trailing_stops(positions, raw_bars_map, ts)
+
         # 10. 持仓监控：止损/止盈触发 → 生成 CLOSE 计划并立即执行
         if self._live_plans and model_bars:
             triggered = self._pos_monitor.check(positions, self._live_plans, model_bars)
@@ -1040,10 +1113,31 @@ class Runtime:
                         self._ai_score_policy(self._cfg.min_ai_score)
                     ).validate(snapshot)
                     if result.valid:
-                        plan.confidence = result.score / 100.0
+                        # plan.confidence 要用方向无关的 confidence，不能用 result.score/100
+                        # ——双极 score 会让一个高信心 SELL 被记成"低信心"（比如 score=7.5
+                        # 就会写成 confidence=0.075），审计/复盘看到的置信度会跟实际信号强度
+                        # 正好相反。
+                        plan.confidence = (
+                            result.confidence if result.confidence is not None else 0.0
+                        )
+                        if plan.action in ("OPEN", "ADD"):
+                            style = _select_stop_style(
+                                result.confidence,
+                                getattr(snapshot, "complexity", ""),
+                            )
+                            plan.metadata["stop_style"] = style
+                            if style == "TRAILING_ONLY":
+                                plan.take_profit = _far_take_profit(plan)
+                                logger.info(
+                                    "%s AI 高信念（confidence=%.2f complexity=HIGH）"
+                                    "→ 不设固定止盈，交给追踪止损",
+                                    plan.symbol, result.confidence or 0.0,
+                                )
                         logger.info(
-                            "AI score %s: %.1f → confidence=%.2f",
-                            plan.symbol, result.score if result.score is not None else 0.0, plan.confidence,
+                            "AI score %s: %.1f (confidence=%.2f) → plan.confidence=%.2f",
+                            plan.symbol, result.score if result.score is not None else 0.0,
+                            result.confidence if result.confidence is not None else 0.0,
+                            plan.confidence,
                         )
                     else:
                         plan.confidence = (self._cfg.min_ai_score - 1) / 100.0
@@ -1152,6 +1246,7 @@ class Runtime:
             plans=self._monitor_plans,
             open_orders=self._open_orders.values(),
             message=message,
+            auto_trade_paper=bool(self._cfg.auto_trade_paper),
         )
 
     # ── 执行单个计划 ─────────────────────────────────────────────────────────
@@ -1363,6 +1458,78 @@ class Runtime:
                         order_idempotency_key=key,
                     )
         return adjustment
+
+    def _apply_trailing_stops(
+        self,
+        positions: Dict[str, Position],
+        raw_bars_map: Dict[str, list],
+        ts: datetime,
+    ) -> None:
+        """追踪止损：把 TrailingStopEvaluator 算出的候选值落地。
+
+        走的是 M0 就已经建好、但一直没人调用的 TIGHTEN_STOP 机制
+        （PositionAdjustmentEvaluator，只在这次改动之前从未被生产代码触发
+        过）——复用它是因为校验规则（新止损必须比旧止损更紧，且落在止盈价
+        内侧）已经写好测过了，没必要重新发明一遍。
+
+        两处写入缺一不可：
+          1) process_invalidation_event 落一条持久化的 PositionAdjustment/
+             PositionPlan 新版本（审计、可回放）；
+          2) 同步内存里 _live_plans[symbol].stop_loss——否则
+             StopTakeProfitMonitor 还是拿旧的静态止损判断触发，追踪止损就只
+             是一条审计记录，不影响真实平仓判定。
+        """
+        candidates = self._trailing_stop.evaluate(
+            positions, self._live_plans, raw_bars_map
+        )
+        for candidate in candidates:
+            position_plan = self._position_plan_store.current_for_symbol(
+                candidate.symbol
+            )
+            if position_plan is None:
+                continue
+            source_event_id = (
+                f"trailing-stop-{candidate.symbol}-{ts.isoformat()}"
+            )
+            try:
+                event = build_invalidation_event(
+                    plan=position_plan,
+                    event_type=InvalidationEventType.STRATEGY_INVALIDATED,
+                    source=InvalidationSource.STRATEGY_ENGINE,
+                    source_event_id=source_event_id,
+                    as_of=ts,
+                    observed_at=ts,
+                    facts={
+                        # STRATEGY_INVALIDATED 的 fact 校验（invalidation_events.py）
+                        # 要求 evaluation_id + valid=False；这里的"invalidated"
+                        # 指的是"开仓时那个静态止损不再是最优的了"，不是策略本身
+                        # 判定错误——沿用同一套已验证的事件类型，只是给它一个更
+                        # 贴切的语境说明，不重新定义一套新的事件类型。
+                        "evaluation_id": source_event_id,
+                        "valid": False,
+                        "requested_action": "TIGHTEN_STOP",
+                        "new_stop_loss": candidate.new_stop_loss,
+                    },
+                    evidence_refs=(f"bar:{candidate.symbol}:{ts.isoformat()}",),
+                )
+                self.process_invalidation_event(
+                    event, limit_price=None, received_at=ts
+                )
+            except Exception as exc:
+                # 追踪止损收紧失败不影响原有静态止损——它还在生效，不是没有
+                # 保护，只是这一次没能收得更紧，下个 tick 会用新价格再试一次。
+                logger.warning(
+                    "[TRAILING_STOP] %s 收紧失败，沿用原止损: %s",
+                    candidate.symbol, exc,
+                )
+                continue
+            live_plan = self._live_plans.get(candidate.symbol)
+            if live_plan is not None:
+                live_plan.stop_loss = candidate.new_stop_loss
+            logger.info(
+                "[TRAILING_STOP] %s 止损收紧至 %.4f",
+                candidate.symbol, candidate.new_stop_loss,
+            )
 
     def _submit_pipeline_intent(
         self,
@@ -1608,15 +1775,18 @@ class Runtime:
     def _read_ai_scores(
         self, now: Optional[datetime] = None
     ) -> Dict[str, AIScoreSnapshot]:
-        """Read today's frozen research; legacy snapshots are opt-in fallback."""
-        if self._cfg.daily_research_enabled:
-            return self._daily_research.snapshots(now or utc_now())
-        try:
-            from .ai.manager import get_score_snapshots_from_db
-            return get_score_snapshots_from_db(self._cfg.ai_score_db)
-        except Exception as exc:
-            logger.warning("_read_ai_scores 失败: %s", exc)
+        """Read today's frozen daily research.
+
+        原来 daily_research_enabled=False 时会退回读 ai_advisories（AgentManager
+        那套并行 6-block 实时打分）；那条调度链路（get_manager()）在当前代码里
+        已经零调用方，表里最后一条记录停留在很多天前——是一个"写者已经没了、
+        读者还在"的孤儿依赖，会让 runtime 悄悄用上几天前的过期分数而不自知。
+        daily_research 现在是唯一维护中的 AI 信号源，disabled 时就该如实返回
+        没有数据，不能假装还有一条能用的兜底路径。
+        """
+        if not self._cfg.daily_research_enabled:
             return {}
+        return self._daily_research.snapshots(now or utc_now())
 
     def _ai_score_policy(self, minimum: float) -> AIScorePolicy:
         if self._cfg.daily_research_enabled:

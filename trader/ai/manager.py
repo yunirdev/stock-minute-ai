@@ -174,7 +174,15 @@ class AgentManager:
 
         # 等待算法轨完成
         algo_thread.join(timeout=_AGENT_TIMEOUT)
-        all_advs.extend(algo_advs)
+        if algo_thread.is_alive():
+            # 超时后主线程会继续往下走，而算法轨还在后台改 algo_advs —— 综合分
+            # 会少算几个 agent（权重重新归一化，分数含义就变了）。静默降级不
+            # 可接受，至少要留痕。
+            logger.error(
+                "AgentManager: 算法轨超时（%ds）仍未完成，本轮综合分缺少 algo agent 贡献",
+                _AGENT_TIMEOUT,
+            )
+        all_advs.extend(list(algo_advs))
 
         # ── Phase 2：BullBear（依赖全部 Phase 1 结果） ─────────────────────
         if bb_list:
@@ -269,14 +277,21 @@ class AgentManager:
         for sym, sc in scores_by_sym.items():
             # 加权平均（只用有数据的 agent）
             total_w = sum(_AGENT_WEIGHTS.get(k, 0) for k in sc if k in _AGENT_WEIGHTS)
-            if total_w > 0:
-                weighted = sum(
-                    sc[k] * _AGENT_WEIGHTS[k]
-                    for k in sc
-                    if k in _AGENT_WEIGHTS and isinstance(sc[k], (int, float))
-                ) / total_w
-            else:
-                weighted = 50.0
+            if total_w <= 0:
+                # 之前这里是 weighted = 50.0 —— 一个没有任何参与加权的 agent
+                # 产出的标的（比如只有 bull_bear_debate，而它不参与加权）会拿到
+                # 一个凭空捏造的 50 分"中性"综合分，跟真实算出来的 50 分完全
+                # 无法区分。宁可不给分，也不给假分。
+                logger.warning(
+                    "composite score: %s 没有任何参与加权的 agent 分数，跳过（不再伪造 50 分）",
+                    sym,
+                )
+                continue
+            weighted = sum(
+                sc[k] * _AGENT_WEIGHTS[k]
+                for k in sc
+                if k in _AGENT_WEIGHTS and isinstance(sc[k], (int, float))
+            ) / total_w
 
             # 收集所有分数快照
             scores_snapshot = {k: v for k, v in sc.items() if isinstance(v, (int, float))}
@@ -309,21 +324,89 @@ class AgentManager:
                 self._write_state(db_path, agent.role, "error", 0.0, None, {"error": str(exc)})
             return []
 
+    _LEGACY_TS_SUFFIX = "__legacy_naive_ts"
+
+    @staticmethod
+    def _table_columns(con, table: str) -> Dict[str, str]:
+        return {
+            row[0]: row[1]
+            for row in con.execute(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_name = ?",
+                [table],
+            ).fetchall()
+        }
+
+    def _needs_ts_migration(self, con, table: str, ts_columns: List[str]) -> bool:
+        cols = self._table_columns(con, table)
+        if not cols:
+            return False   # 表还不存在，等下按新 schema 建即可
+        return any(
+            cols.get(c) is not None and cols[c] != "TIMESTAMP WITH TIME ZONE"
+            for c in ts_columns
+        )
+
+    def _rename_legacy(self, con, table: str) -> None:
+        con.execute(f"ALTER TABLE {table} RENAME TO {table}{self._LEGACY_TS_SUFFIX}")
+
+    def _copy_from_legacy(self, con, table: str, ts_columns: List[str]) -> None:
+        """把旧表数据搬回新表：时间列按写入时的本地时区还原成正确 UTC 时刻，
+        其余列**原样保留**。列名逐个对齐，旧表没有的列填 NULL —— 早期版本
+        少了 provenance 列，写死列清单会把已有的 run_id/provider 等值清空。"""
+        legacy = f"{table}{self._LEGACY_TS_SUFFIX}"
+        legacy_cols = self._table_columns(con, legacy)
+        new_cols = self._table_columns(con, table)
+        select_parts, insert_parts = [], []
+        for col in new_cols:
+            insert_parts.append(col)
+            if col not in legacy_cols:
+                select_parts.append("NULL")
+            elif col in ts_columns:
+                select_parts.append(f"timezone(current_setting('TimeZone'), {col})")
+            else:
+                select_parts.append(col)
+        con.execute(
+            f"INSERT INTO {table} ({', '.join(insert_parts)}) "
+            f"SELECT {', '.join(select_parts)} FROM {legacy}"
+        )
+        moved = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        con.execute(f"DROP TABLE {legacy}")
+        logger.info(
+            "AgentManager: %s 已迁移为 TIMESTAMPTZ，保留 %d 行（含全部 provenance 列）",
+            table, moved,
+        )
+
     def _init_db(self, db_path: str) -> None:
         with self._lock:
             try:
                 import duckdb
                 con = duckdb.connect(db_path)
+                # 这几列必须是 TIMESTAMPTZ：DuckDB 把带时区的 Python datetime
+                # 写进 naive TIMESTAMP 列时会静默转成本地墙钟时间并丢掉时区，
+                # 读回来再当 UTC 用就会凭空差出一个时区偏移（audit.py 的
+                # heartbeat 表就是这么产生了每 tick 一次的假 CRITICAL 告警）。
+                # 已有的旧表原地迁移，按写入时的本地时区还原成正确的 UTC 时刻。
+                states_ts = ["last_run", "updated_at"]
+                states_legacy = self._needs_ts_migration(con, "agent_states", states_ts)
+                if states_legacy:
+                    self._rename_legacy(con, "agent_states")
                 con.execute("""
                     CREATE TABLE IF NOT EXISTS agent_states (
                         role        VARCHAR PRIMARY KEY,
                         status      VARCHAR DEFAULT 'idle',
                         last_score  FLOAT DEFAULT 0,
-                        last_run    TIMESTAMP,
+                        last_run    TIMESTAMPTZ,
                         summary_json VARCHAR DEFAULT '{}',
-                        updated_at  TIMESTAMP
+                        updated_at  TIMESTAMPTZ
                     )
                 """)
+                if states_legacy:
+                    self._copy_from_legacy(con, "agent_states", states_ts)
+
+                adv_ts = ["created_at"]
+                adv_legacy = self._needs_ts_migration(con, "ai_advisories", adv_ts)
+                if adv_legacy:
+                    self._rename_legacy(con, "ai_advisories")
                 con.execute("""
                     CREATE TABLE IF NOT EXISTS ai_advisories (
                         advisory_id VARCHAR PRIMARY KEY,
@@ -331,9 +414,11 @@ class AgentManager:
                         agent       VARCHAR,
                         payload_json VARCHAR,
                         confidence  FLOAT,
-                        created_at  TIMESTAMP
+                        created_at  TIMESTAMPTZ
                     )
                 """)
+                # provenance 列必须在搬数据之前补齐，否则旧表里已有的
+                # run_id/provider/is_stub 等值会因为新表还没有这些列而丢失。
                 for column, sql_type in {
                     "run_id": "VARCHAR", "provider": "VARCHAR", "model": "VARCHAR",
                     "is_stub": "BOOLEAN", "source": "VARCHAR", "generated_by": "VARCHAR",
@@ -341,6 +426,8 @@ class AgentManager:
                     "is_fallback": "BOOLEAN",
                 }.items():
                     con.execute(f"ALTER TABLE ai_advisories ADD COLUMN IF NOT EXISTS {column} {sql_type}")
+                if adv_legacy:
+                    self._copy_from_legacy(con, "ai_advisories", adv_ts)
                 con.commit()
                 con.close()
             except Exception as exc:
@@ -371,12 +458,30 @@ class AgentManager:
                 import duckdb
                 con = duckdb.connect(db_path)
                 run_id = f"ai-run-{utc_now().strftime('%Y%m%dT%H%M%S%fZ')}"
+                client_name = type(self._client).__name__
+                # 客户端缺失时必须 fail closed。原来的写法在 self._client is None
+                # 时会算出 provider="nonetype"、is_stub=False —— 而 AIScoreValidator
+                # 只检查 provider 非空且 is_stub 为 False，于是一条来源不明的
+                # advisory 会顶着一个假的 provider 名字通过 AI 安全门。
+                client_missing = self._client is None
+                is_stub_client = client_name == "StubLLMClient"
                 for adv in advisories:
-                    provider = ("deterministic" if adv.agent in _ALGO_ROLES
-                                else type(self._client).__name__.removesuffix("Client").lower())
+                    if adv.agent in _ALGO_ROLES:
+                        provider = "deterministic"          # 算法 agent 不用 LLM
+                    elif client_missing:
+                        # 如实标 unknown，而不是笼统写成 "stub"——两者的排查
+                        # 方向完全不同（一个是没配客户端，一个是明确用了 stub）
+                        provider = "unknown"
+                    elif is_stub_client:
+                        provider = "stub"
+                    else:
+                        provider = client_name.removesuffix("Client").lower()
                     model = adv.model or (f"{adv.agent}:v1" if provider == "deterministic"
                                           else getattr(self._client, "_model", ""))
-                    is_stub = type(self._client).__name__ == "StubLLMClient"
+                    # LLM agent 但客户端来源不明 → 也按 stub 处理，让安全门拒掉
+                    is_stub = is_stub_client or (
+                        client_missing and adv.agent not in _ALGO_ROLES
+                    )
                     con.execute(
                         "INSERT OR IGNORE INTO ai_advisories "
                         "(advisory_id, kind, agent, payload_json, confidence, created_at, "
@@ -384,7 +489,7 @@ class AgentManager:
                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         [adv.advisory_id, adv.kind, adv.agent,
                          json.dumps(adv.payload, default=str), adv.confidence, adv.created_at,
-                         run_id, "stub" if is_stub else provider, model, is_stub,
+                         run_id, provider, model, is_stub,
                          "agent_manager", adv.agent, 1, adv.created_at, adv.is_fallback],
                     )
                 con.commit()
@@ -458,27 +563,22 @@ def get_composite_scores_from_db(db_path: str, limit: int = 300) -> Dict[str, fl
     result: Dict[str, float] = {}
     for sym, sc in scores_by_sym.items():
         total_w = sum(_AGENT_WEIGHTS.get(k, 0.0) for k in sc if k in _AGENT_WEIGHTS)
-        if total_w > 0:
-            weighted = sum(
-                sc[k] * _AGENT_WEIGHTS[k]
-                for k in sc
-                if k in _AGENT_WEIGHTS and isinstance(sc[k], (int, float))
-            ) / total_w
-        else:
-            weighted = 50.0
+        if total_w <= 0:
+            # 同 get_composite_scores：不给分好过给一个伪造的中性 50 分。
+            # 这个函数喂的是 daily_candidates / selection_pools 的候选筛选，
+            # 假分会直接把标的送进 AI 深度研究名单。
+            logger.warning(
+                "composite score: %s 没有任何参与加权的 agent 分数，跳过（不再伪造 50 分）",
+                sym,
+            )
+            continue
+        weighted = sum(
+            sc[k] * _AGENT_WEIGHTS[k]
+            for k in sc
+            if k in _AGENT_WEIGHTS and isinstance(sc[k], (int, float))
+        ) / total_w
         result[sym] = round(weighted, 1)
     return result
-
-
-# 模块级单例
-_manager: Optional[AgentManager] = None
-
-
-def get_manager(use_real_agents: bool = True) -> AgentManager:
-    global _manager
-    if _manager is None:
-        _manager = AgentManager(use_real_agents=use_real_agents)
-    return _manager
 
 
 def get_score_snapshots_from_db(db_path: str, limit: int = 300):
@@ -564,5 +664,10 @@ def get_score_snapshots_from_db(db_path: str, limit: int = 300):
             weight_coverage=round(total_weight, 4),
             has_llm=has_llm,
             fallback_count=sum(1 for value in values.values() if value[7]),
+            # 这条 score 是多个 agent 分数的加权平均，从来不是 daily_research 那种
+            # "50=中性、双极编码方向"的量表——直接除以 100 当方向无关的信心强度，
+            # 不能套 conviction_of() 对双极分数做的 abs(score-50)/50 反变换（那套
+            # 变换是 daily_research._score() 专属的，套在这里数值会算错）。
+            confidence=round(score, 1) / 100.0,
         )
     return snapshots

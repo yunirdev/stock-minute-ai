@@ -112,7 +112,9 @@ class MacroAgent(AgentBase):
             "reasoning": result.get("reasoning", ""),
             # raw 数值供审查
             "rate10y": raw.get("rate10y_current"),
-            "tlt_1m_ret": raw.get("tlt_1m_ret"),
+            # _MACRO_TICKERS 的 key 是 "bonds"（→TLT），产出的键名是
+            # bonds_1m_ret；原来读 tlt_1m_ret 永远是 None
+            "tlt_1m_ret": raw.get("bonds_1m_ret"),
             "dollar_1m_ret": raw.get("dollar_1m_ret"),
             "gold_1m_ret": raw.get("gold_1m_ret"),
             "spx_1m_ret": raw.get("spx_1m_ret"),
@@ -126,6 +128,7 @@ class MacroAgent(AgentBase):
                 payload=dict(payload_base, symbol=sym),
                 confidence=float(result.get("confidence", score / 100)),
                 model=getattr(self._client, "_model", ""),
+                is_fallback=self._is_fallback_result(result),
             ))
         logger.info("MacroAgent: regime=%s score=%d symbols=%d",
                     payload_base["regime"], score, len(advisories))
@@ -166,7 +169,7 @@ VOLATILITY (VIX):
   Interpretation: <15=low, 15-25=normal, 25-35=elevated, >35=extreme
 
 INTEREST RATES:
-  10Y Yield: {v('rate10y_current')}% | 1m chg: {v('rate10y_1m_ret')} bps (approx)
+  10Y Yield: {v('rate10y_current')}% | 1m chg: {v('rate10y_1m_ret')}% (relative change of the yield, NOT basis points)
   TLT (Long Bond ETF): 1m ret={v('bonds_1m_ret')}% | 3m ret={v('bonds_3m_ret')}%
 
 US DOLLAR (UUP — DXY proxy):

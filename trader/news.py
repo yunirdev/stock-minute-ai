@@ -243,12 +243,21 @@ class SECEdgarSource:
         since_ts = since.timestamp()
         events: List[NewsEvent] = []
         for symbol in self._universe:
-            try:
-                batch = self._fetch(symbol, since_ts)
-                events.extend(batch)
-                _time.sleep(0.15)       # EDGAR 限速：max 10 req/sec
-            except Exception as exc:
-                logger.warning("SEC EDGAR [%s] 失败: %s", symbol, exc)
+            # EDGAR occasionally stalls on a single request (read timeout)
+            # without being genuinely down — one quick retry clears most of
+            # these before we give up and log a warning for the symbol.
+            for attempt in range(2):
+                try:
+                    batch = self._fetch(symbol, since_ts)
+                    events.extend(batch)
+                    break
+                except Exception as exc:
+                    if attempt == 0:
+                        logger.debug("SEC EDGAR [%s] 超时，重试一次: %s", symbol, exc)
+                        _time.sleep(0.3)
+                        continue
+                    logger.warning("SEC EDGAR [%s] 失败: %s", symbol, exc)
+            _time.sleep(0.15)       # EDGAR 限速：max 10 req/sec
         if events:
             logger.info("SEC EDGAR: +%d 条 8-K 申报", len(events))
         return events

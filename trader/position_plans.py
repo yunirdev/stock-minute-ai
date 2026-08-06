@@ -635,19 +635,24 @@ class PositionPlanFillProjector:
             if current is None:
                 raise RuntimeError("POSITION_PLAN_FILL_EVENT_ORPHANED")
             return current
+        # 多空对称：开新仓看 trade_plan.side（BUY=开多，SELL=开空）；已有仓位
+        # 时看这笔成交跟现有仓位是同向还是反向——同向是加仓（多头再买/空头
+        # 再卖），反向是减仓/平仓（多头卖出/空头买入回补）。原来这里硬编码
+        # "fill.side==BUY 才能开新仓，否则必须已经有仓位"，SELL 在没有持仓
+        # 时开空单会直接走进 else 分支报 POSITION_PLAN_OPEN_POSITION_REQUIRED
+        # 崩掉。
         current = self.store.current_for_symbol(fill.symbol)
-        if fill.side == Side.BUY:
-            if current is None:
-                if trade_plan is None:
-                    raise RuntimeError("POSITION_PLAN_TRADE_PLAN_REQUIRED")
-                projected = self._initial(fill, applied_delta, trade_plan)
-                expected_version = None
-            else:
-                projected = self._increase(current, fill, applied_delta)
-                expected_version = current.version
+        if current is None:
+            if trade_plan is None:
+                raise RuntimeError("POSITION_PLAN_TRADE_PLAN_REQUIRED")
+            if fill.side != trade_plan.side:
+                raise ValueError("POSITION_PLAN_INITIAL_FILL_SIDE_INVALID")
+            projected = self._initial(fill, applied_delta, trade_plan)
+            expected_version = None
+        elif fill.side == current.side:
+            projected = self._increase(current, fill, applied_delta)
+            expected_version = current.version
         else:
-            if current is None:
-                raise RuntimeError("POSITION_PLAN_OPEN_POSITION_REQUIRED")
             projected = self._reduce(current, fill, applied_delta)
             expected_version = current.version
         self.store.commit_fill_projection(
@@ -691,8 +696,11 @@ class PositionPlanFillProjector:
     ) -> PositionPlan:
         if trade_plan.symbol.strip().upper() != fill.symbol.strip().upper():
             raise ValueError("POSITION_PLAN_FILL_SYMBOL_MISMATCH")
-        if trade_plan.side != Side.BUY:
-            raise ValueError("POSITION_PLAN_INITIAL_FILL_SIDE_INVALID")
+        # trade_plan.side==fill.side 已经在 apply() 里校验过了；这里不再要求
+        # 必须是 BUY——SELL 开新仓（做空）走的是同一条路径，PositionPlan 的
+        # side 字段（models.py 里 BUY/SELL 两个方向的价格顺序校验本来就都
+        # 写好了，SHORT_POSITION_PLAN_PRICE_ORDER_INVALID 那支一直都在，只
+        # 是从来没人真正创建过 side=SELL 的 PositionPlan）如实记录方向。
         raw = f"{trade_plan.plan_id}|{fill.symbol}|{fill.order_id}"
         plan_id = "position-plan-" + hashlib.sha256(
             raw.encode()
@@ -703,7 +711,7 @@ class PositionPlanFillProjector:
             version=1,
             parent_version_id="",
             symbol=fill.symbol,
-            side=Side.BUY,
+            side=trade_plan.side,
             status=PositionPlanStatus.ACTIVE,
             source_trade_plan_id=trade_plan.plan_id,
             initial_fill_id=self._fill_event_id(fill),
@@ -720,6 +728,11 @@ class PositionPlanFillProjector:
                     "BROKER_RESTRICTION",
                     "CORPORATE_ACTION",
                     "TRADING_RESTRICTION",
+                    # STRATEGY_INVALIDATED 是追踪止损（TrailingStopEvaluator）
+                    # 收紧止损用的事件类型；不在这个允许列表里，
+                    # InvalidationEventValidator 会用 INVALIDATION_RULE_NOT_CONFIGURED
+                    # 拒掉每一次追踪止损尝试——加进默认规则集才能让它真正生效。
+                    "STRATEGY_INVALIDATED",
                 )
             ),
             change_reason="INITIAL_FILL",

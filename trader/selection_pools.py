@@ -104,6 +104,7 @@ def rebuild_selection_pipeline(
     ai_db_path: Optional[str] = None,
     save: bool = True,
     download_missing_decision_etfs: bool = False,
+    manual_symbols: Iterable[str] = (),
     progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> dict[str, PoolResult]:
     long_pool = build_long_term_pool(
@@ -124,6 +125,7 @@ def rebuild_selection_pipeline(
         sync_daily_store=save,
         base_items=long_pool.items,
         download_missing_decision_etfs=download_missing_decision_etfs,
+        manual_symbols=manual_symbols,
         progress_callback=progress_callback,
     )
     results = {
@@ -214,6 +216,7 @@ def build_daily_decision_pool(
     sync_daily_store: bool = True,
     base_items: Optional[list[PoolItem]] = None,
     download_missing_decision_etfs: bool = False,
+    manual_symbols: Iterable[str] = (),
     progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> PoolResult:
     symbols = _normalize_symbols(source) or pool_symbols(
@@ -224,6 +227,9 @@ def build_daily_decision_pool(
     if not symbols:
         symbols = build_source_universe(None)[: max(limit, 1)]
     symbols = _with_decision_etfs(symbols)
+    manual = _normalize_symbols(list(manual_symbols)) if manual_symbols else []
+    if manual:
+        symbols = list(dict.fromkeys([*symbols, *manual]))
     if download_missing_decision_etfs:
         _ensure_decision_etf_bars(symbols, progress_callback=progress_callback)
 
@@ -252,6 +258,21 @@ def build_daily_decision_pool(
             _progress(progress_callback, DAILY_DECISION, idx, len(symbols), f"{symbol}: {item.status}")
 
     selected = _select_decision_items(scored, min_size=min_size, max_size=max_size, decision_style=style)
+
+    # 自选标的是用户明确要求观察的，不该被 AI 评分/名额挤掉——AI 淘汰的理由
+    # 对自选没有意义，所以这里无条件补回，不受 min_score/max_size/类别名额限制。
+    if manual:
+        scored_by_symbol = {item.symbol: item for item in scored}
+        selected_symbols = {item.symbol for item in selected}
+        for symbol in manual:
+            item = scored_by_symbol.get(symbol)
+            if item is None or symbol in selected_symbols:
+                continue
+            item.reasons = _unique(["自选（用户手动追加，不受评分/名额限制）", *item.reasons])[:9]
+            selected.append(item)
+            selected_symbols.add(symbol)
+        selected.sort(key=lambda row: (-row.score, row.symbol))
+
     _rank(selected)
 
     daily_rows = [_daily_candidate_from_pool_item(item) for item in selected]

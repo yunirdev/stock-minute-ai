@@ -295,7 +295,10 @@ def _ollama_list_models(base_url: str, timeout: float = 3.0) -> List[Dict[str, A
             }
             for m in data.get("models", [])
         ]
-    except Exception:
+    except Exception as exc:
+        # 静默返回 [] 会让 make_client() 直接跳到 Anthropic/Stub 兜底，
+        # "Ollama 没装" 和 "Ollama 在跑但这次查询挂了" 完全无法区分。
+        logger.warning("Ollama /api/tags 查询失败（%s: %s），视为不可用", type(exc).__name__, exc)
         return []
 
 
@@ -308,9 +311,14 @@ def _pick_ollama_model(available: List[Dict[str, Any]], preferred: str) -> str:
       3. 第一个可用模型
     """
     names = [m["name"] for m in available]
-    # 精确匹配或前缀匹配
+    # 精确匹配优先
+    if preferred in names:
+        return preferred
+    # 再退到前缀匹配 —— 注意这可能选到同系列但小得多的模型
+    # （preferred="qwen2.5:14b" 而本地只装了 "qwen2.5:0.5b" 也会命中），
+    # 交给调用方打警告，这里只负责挑。
     for name in names:
-        if name == preferred or name.startswith(preferred.split(":")[0]):
+        if name.startswith(preferred.split(":")[0]):
             return name
     # 选有 tools 能力的最大模型（按名字长度/字母序粗排，优先 qwen/llama/mistral 大模型）
     tools_models = [m for m in available if "tools" in m.get("caps", [])]
@@ -342,7 +350,13 @@ def make_client(provider: str = "", **kwargs) -> LLMClient:
     if available:
         model = _pick_ollama_model(available, preferred)
         if model != preferred:
-            logger.info("Ollama: 指定模型 %r 未安装，自动使用 %r", preferred, model)
+            # WARNING 而不是 INFO：实际跑的模型跟配置的不是同一个，直接影响
+            # 所有 AI 结论的质量（可能从 14b 悄悄掉到 0.5b），必须显眼。
+            logger.warning(
+                "⚠️  Ollama: 配置的模型 %r 未安装，改用 %r —— "
+                "AI 结论质量会随模型大小明显变化，请确认这是你想要的",
+                preferred, model,
+            )
         logger.info("LLM: Ollama @ %s  model=%s", base_url, model)
         return OllamaClient(base_url=base_url, default_model=model, **kwargs)
 

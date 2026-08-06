@@ -103,12 +103,15 @@ class NewsAgent(AgentBase):
                     news_lines.append(f"[yfinance] {t}")
 
         if not news_lines:
+            # 完全没有新闻数据时给的 50 分是个占位值，不是分析结论 ——
+            # 标成 fallback，避免它以真实新闻评分的身份进入加权综合分。
             return self._advisory(
                 kind="news",
                 payload={"symbol": symbol, "news_score": 50,
                          "sentiment": "neutral", "catalysts": [],
                          "risk_flags": [], "reasoning": "无新闻数据"},
                 confidence=0.2,
+                is_fallback=True,
             )
 
         user_prompt = f"""Stock: {symbol}
@@ -143,4 +146,5 @@ Analyze the sentiment and identify key catalysts or risks."""
             },
             confidence=float(result.get("confidence", score / 100)),
             model=getattr(self._client, "_model", ""),
+            is_fallback=self._is_fallback_result(result),
         )

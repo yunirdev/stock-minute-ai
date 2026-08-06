@@ -25,7 +25,7 @@ class _Analyzer:
     def describe(self):
         return {"provider": self.provider, "model": self.model}
 
-    def analyze(self, symbol, trading_date):
+    def analyze(self, symbol, trading_date, *, complexity: str = ""):
         return ResearchAnalysis(
             recommendation="BUY",
             score=80.0,

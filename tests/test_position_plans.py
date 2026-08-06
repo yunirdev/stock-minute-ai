@@ -294,13 +294,18 @@ def test_fill_projector_handles_partial_duplicate_reduce_close_and_restart(
     assert len(reopened.history(closed.position_plan_id)) == 4
 
 
-def test_fill_projector_rejects_reduction_without_open_plan(tmp_path):
+def test_fill_projector_rejects_orphan_fill_with_no_position_or_plan(tmp_path):
+    """一笔既没有对应持仓、也没有 trade_plan 的成交——多空对称之后，SELL
+    没有持仓时不再直接等于"非法减仓"（也可能是合法的开空单），但没有
+    trade_plan 就没法知道止损/止盈该设多少，一样得拒绝，只是错误码变了：
+    POSITION_PLAN_TRADE_PLAN_REQUIRED（"不知道该怎么开仓"）取代了原来的
+    POSITION_PLAN_OPEN_POSITION_REQUIRED（"假设 SELL 一定是减仓"）。"""
     projector = PositionPlanFillProjector(
         PositionPlanStore(tmp_path / "trade.duckdb")
     )
     with pytest.raises(
         RuntimeError,
-        match="POSITION_PLAN_OPEN_POSITION_REQUIRED",
+        match="POSITION_PLAN_TRADE_PLAN_REQUIRED",
     ):
         projector.apply(
             fill=_fill(

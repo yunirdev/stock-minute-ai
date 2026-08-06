@@ -58,6 +58,53 @@ _FAILED_ITEM_UNCLASSIFIED = "DAILY_RESEARCH_ITEM_FAILED_UNCLASSIFIED"
 _FAILED_SNAPSHOT_UNCLASSIFIED = "RESEARCH_SNAPSHOT_FAILED_UNCLASSIFIED"
 _INTERRUPTED_RUN_ERROR = "DAILY_RESEARCH_INTERRUPTED"
 
+# 深度分析的"复杂度"分级——按初筛排名分配，不再是"前 N 名深挖、剩下的完全
+# 不分析"的硬截断：每个标的都会被分析，只是排名越靠后，分析花的功夫越少
+# （辩论轮数更少、用更快的模型），控制总耗时不会随候选数线性爆炸。
+COMPLEXITY_HIGH = "HIGH"
+COMPLEXITY_MEDIUM = "MEDIUM"
+COMPLEXITY_LIGHT = "LIGHT"
+
+
+def complexity_for_rank(rank: int) -> str:
+    if rank <= 3:
+        return COMPLEXITY_HIGH
+    if rank <= 7:
+        return COMPLEXITY_MEDIUM
+    return COMPLEXITY_LIGHT
+
+
+# 每档对应的 TradingAgents 配置覆盖。max_debate_rounds/max_risk_discuss_rounds
+# 是库里本来就有的旋钮（见 tradingagents/default_config.py），默认都是 1 轮——
+# MEDIUM 就是维持现状，HIGH 多辩几轮，LIGHT 用快模型顶替深模型省时间。
+_COMPLEXITY_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
+    COMPLEXITY_HIGH: {
+        "max_debate_rounds": 2,
+        "max_risk_discuss_rounds": 2,
+    },
+    COMPLEXITY_MEDIUM: {
+        "max_debate_rounds": 1,
+        "max_risk_discuss_rounds": 1,
+    },
+    COMPLEXITY_LIGHT: {
+        "max_debate_rounds": 1,
+        "max_risk_discuss_rounds": 1,
+        "use_quick_model_only": True,
+    },
+}
+
+
+def _apply_complexity(config: dict[str, Any], complexity: str) -> dict[str, Any]:
+    """Mutates and returns `config` in place with this tier's TradingAgents knobs."""
+    overrides = _COMPLEXITY_CONFIG_OVERRIDES.get(complexity, _COMPLEXITY_CONFIG_OVERRIDES[COMPLEXITY_MEDIUM])
+    for key, value in overrides.items():
+        if key == "use_quick_model_only":
+            if value and config.get("quick_think_llm"):
+                config["deep_think_llm"] = config["quick_think_llm"]
+            continue
+        config[key] = value
+    return config
+
 
 def _utc(value: datetime) -> datetime:
     if value.tzinfo is None:
@@ -133,19 +180,27 @@ def research_target_date(
     return current.isoformat()
 
 
-def in_daily_run_window(
-    now: datetime,
-    *,
-    close_hour_et: int = 16,
-    close_minute_et: int = 15,
-) -> bool:
+def in_daily_run_window(now: datetime) -> bool:
+    """研究批次只在盘前这一个窗口触发：5:30-9:15 ET。
+
+    原来还有一个"收盘后"窗口（16:15 ET 之后）。实际观察下来它才是真正在跑
+    的那个——`start_if_due()` 一旦当天已经有一条 run（不管是自动触发还是手
+    动强制跑的）就不会再跑第二次，而收盘后那次几乎总是先发生，导致盘前窗口
+    形同虚设，从没真正执行过。代价是：从收盘后跑批那一刻到第二天开盘之间
+    （大半夜到早上 9:30 ET）出现的消息、隔夜行情，全部赶不上当天这批结论，
+    等于用一份"隔了一整夜"的判断去交易。
+
+    改成只留盘前窗口，5:30 ET 起（比原来 6:00 提前半小时，给本地跑的多智能体
+    辩论多留一点余量）——这样每天的结论离真正下单最近，覆盖了收盘后到开盘
+    前这整段本来会被错过的信息。代价对称：这个窗口本身就是唯一机会，如果引
+    擎那天没在 5:30-9:15 之间起来、或者批次跑太久没能在 9:15 前完成，当天就
+    没有新结论可用——不再有"收盘后已经跑过一次"的兜底。
+    """
     local = _utc(now).astimezone(_ET)
     if local.weekday() >= 5:
         return False
     current = local.time()
-    premarket = wall_time(6, 0) <= current <= wall_time(9, 15)
-    postclose = current >= wall_time(close_hour_et, close_minute_et)
-    return premarket or postclose
+    return wall_time(5, 30) <= current <= wall_time(9, 15)
 
 
 @dataclass(frozen=True)
@@ -230,6 +285,7 @@ class DailyResearchItem:
     model_version: str = ""
     invocation_id: str = ""
     ta_snapshot_id: str = ""
+    complexity: str = ""        # HIGH | MEDIUM | LIGHT — see _complexity_for_rank()
 
 
 @dataclass(frozen=True)
@@ -326,9 +382,15 @@ class TradingAgentsAdapter:
             raise RuntimeError("TRADINGAGENTS_MODULE_UNAVAILABLE") from exc
         return graph_module.TradingAgentsGraph, config_module.DEFAULT_CONFIG
 
-    def analyze(self, symbol: str, trading_date: str) -> ResearchAnalysis:
+    def analyze(
+        self,
+        symbol: str,
+        trading_date: str,
+        *,
+        complexity: str = COMPLEXITY_MEDIUM,
+    ) -> ResearchAnalysis:
         if self.python_executable:
-            return self._analyze_subprocess(symbol, trading_date)
+            return self._analyze_subprocess(symbol, trading_date, complexity=complexity)
         graph_cls, defaults = self._load()
         config = dict(defaults)
         if self.llm_provider:
@@ -339,13 +401,14 @@ class TradingAgentsAdapter:
             config["quick_think_llm"] = self.quick_model
         if self.backend_url:
             config["backend_url"] = self.backend_url
+        _apply_complexity(config, complexity)
         graph = graph_cls(debug=self.debug, config=config)
         state, decision = graph.propagate(symbol, trading_date)
         raw = {"decision": _json_value(decision), "state": _json_value(state)}
         recommendation = _recommendation(decision)
         confidence = _confidence(decision)
         score = _score(recommendation, confidence)
-        thesis = _thesis(decision)
+        thesis = _briefing_thesis(decision, state)
         risks = _risks(decision)
         return ResearchAnalysis(
             recommendation=recommendation,
@@ -363,6 +426,8 @@ class TradingAgentsAdapter:
         symbol: str,
         trading_date: str,
         invocation: TradingAgentsInvocation,
+        *,
+        complexity: str = COMPLEXITY_MEDIUM,
     ) -> ResearchAnalysis:
         if symbol.strip().upper() != invocation.symbol:
             raise ValueError("TRADINGAGENTS_INVOCATION_SYMBOL_MISMATCH")
@@ -373,8 +438,9 @@ class TradingAgentsAdapter:
                 symbol,
                 trading_date,
                 invocation=invocation,
+                complexity=complexity,
             )
-        analysis = self.analyze(symbol, trading_date)
+        analysis = self.analyze(symbol, trading_date, complexity=complexity)
         return ResearchAnalysis(
             **{
                 **analysis.__dict__,
@@ -392,6 +458,7 @@ class TradingAgentsAdapter:
         trading_date: str,
         *,
         invocation: TradingAgentsInvocation | None = None,
+        complexity: str = COMPLEXITY_MEDIUM,
     ) -> ResearchAnalysis:
         python_path = Path(self.python_executable).expanduser().resolve()
         if not python_path.is_file():
@@ -409,6 +476,10 @@ class TradingAgentsAdapter:
             "memory_log_path": self.memory_log_path,
             "debug": self.debug,
             "worker_contract_version": 1,
+            "complexity": complexity,
+            "complexity_overrides": _COMPLEXITY_CONFIG_OVERRIDES.get(
+                complexity, _COMPLEXITY_CONFIG_OVERRIDES[COMPLEXITY_MEDIUM]
+            ),
         }
         if invocation is not None:
             payload["invocation"] = invocation.to_dict()
@@ -470,7 +541,7 @@ class TradingAgentsAdapter:
             recommendation=recommendation,
             score=_score(recommendation, confidence),
             confidence=confidence,
-            thesis=_thesis(decision),
+            thesis=_briefing_thesis(decision, result.get("state")),
             risks=_risks(decision),
             provider=self.provider,
             model=self.model,
@@ -651,6 +722,24 @@ def _thesis(value: Any) -> str:
     return _decision_text(value).strip()
 
 
+def _briefing_thesis(decision: Any, state: Any) -> str:
+    """决策台"说明"栏要的简报，不是 decision 本身。
+
+    ``decision`` 常常只是 TradingAgentsGraph 吐出来的一个裁决词
+    （比如就是字符串 "Overweight"），没有任何解释——早前 thesis 直接取
+    decision 原文，说明栏就只显示得出这一个词，看不出为什么。真正的分析
+    内容在 ``state`` 里：trader_investment_plan 有落地的入场价/止损/仓位
+    和一段推理，final_trade_decision 有执行摘要，都比裸的 decision 有信息量。
+    investment_plan 是完整的多空辩论记录（几千字），不适合当"简报"，不取。
+    """
+    if isinstance(state, dict):
+        for key in ("trader_investment_plan", "final_trade_decision"):
+            text = str(state.get(key) or "").strip()
+            if text:
+                return text
+    return _decision_text(decision).strip()
+
+
 def _risks(value: Any) -> list[str]:
     if not isinstance(value, dict):
         return []
@@ -729,6 +818,7 @@ class DailyResearchStore:
                     model_version VARCHAR,
                     invocation_id VARCHAR,
                     ta_snapshot_id VARCHAR,
+                    complexity VARCHAR,
                     PRIMARY KEY(run_id, symbol)
                 )
                 """
@@ -745,6 +835,7 @@ class DailyResearchStore:
                 "model_version",
                 "invocation_id",
                 "ta_snapshot_id",
+                "complexity",
             ):
                 if name not in columns:
                     con.execute(
@@ -860,9 +951,9 @@ class DailyResearchStore:
                     confidence, thesis, risks_json, provider, model,
                     error_code, created_at, completed_at, raw_json,
                     snapshot_id, data_version, model_version, invocation_id,
-                    ta_snapshot_id
+                    ta_snapshot_id, complexity
                 ) VALUES
-                (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(run_id, symbol) DO UPDATE SET
                     status=excluded.status,
                     recommendation=excluded.recommendation,
@@ -879,7 +970,8 @@ class DailyResearchStore:
                     data_version=excluded.data_version,
                     model_version=excluded.model_version,
                     invocation_id=excluded.invocation_id,
-                    ta_snapshot_id=excluded.ta_snapshot_id
+                    ta_snapshot_id=excluded.ta_snapshot_id,
+                    complexity=excluded.complexity
                 """,
                 [
                     item.run_id,
@@ -905,6 +997,7 @@ class DailyResearchStore:
                     item.model_version,
                     item.invocation_id,
                     item.ta_snapshot_id,
+                    item.complexity,
                 ],
             )
             con.commit()
@@ -1264,24 +1357,13 @@ class DailyResearchStore:
     ) -> dict[str, AIScoreSnapshot]:
         now = _utc(now)
         trading_date = now.astimezone(_ET).date().isoformat()
-        con = self._connect(read_only=True)
-        try:
-            successful = con.execute(
-                """
-                SELECT run_id FROM daily_research_runs
-                WHERE trading_date=? AND status IN (?,?)
-                ORDER BY completed_at DESC
-                """,
-                [
-                    trading_date,
-                    "COMPLETED",
-                    "COMPLETED_WITH_ERRORS",
-                ],
-            ).fetchall()
-        finally:
-            con.close()
-        if len(successful) != 1:
-            return {}
+        # 原来要求"当天刚好只有一条已完成批次，否则不确定用哪个、直接返回
+        # 空"——手动重跑一次研究（"运行今日研究"按钮，force=True）在同一个
+        # 交易日产生第二条 COMPLETED 记录是完全合法的操作场景，不是数据损坏；
+        # 之前这条防呆规则反而会让 runtime 的选股/AI 门槛在这种完全正常的
+        # 情况下拿到空数据，一整天选不出任何候选。latest_run(successful_only)
+        # 已经按 started_at 倒序取最新一条，直接用它做唯一数据源即可——最新
+        # 一次重跑就是应该被采信的那次。
         run = self.latest_run(trading_date, successful_only=True)
         if run is None or run.completed_at is None:
             return {}
@@ -1328,6 +1410,10 @@ class DailyResearchStore:
                 has_llm=True,
                 fallback_count=0,
                 recommendation=item.recommendation,
+                complexity=item.complexity,
+                # 方向无关的信心强度，直接用这条研究项本来就有的 confidence（不是从
+                # 双极 ai_score 反推）——下游所有"够不够格"的门槛判断都比这个字段。
+                confidence=item.confidence,
             )
         return snapshots
 
@@ -1516,6 +1602,7 @@ class DailyResearchStore:
             model_version=(row[20] or "") if len(row) > 20 else "",
             invocation_id=(row[21] or "") if len(row) > 21 else "",
             ta_snapshot_id=(row[22] or "") if len(row) > 22 else "",
+            complexity=(row[23] or "") if len(row) > 23 else "",
         )
 
 
@@ -1587,7 +1674,6 @@ class DailyResearchService:
             now=now,
             input_capture=screening_inputs,
         )
-        deep = self._deep_candidates(candidates, deep_limit)
         universe_version = hashlib.sha256(
             json.dumps(symbols, separators=(",", ":")).encode()
         ).hexdigest()[:20]
@@ -1632,7 +1718,7 @@ class DailyResearchService:
             deep_limit=deep_limit,
             provider=provider,
             model=model,
-            total_symbols=len(deep),
+            total_symbols=len(candidates),
             completed_symbols=0,
             failed_symbols=0,
             started_at=now,
@@ -1645,23 +1731,32 @@ class DailyResearchService:
             screening_inputs=screening_inputs,
             strategy_statistics_path=strategy_statistics_path,
         )
-        deep_symbols = {candidate.symbol for candidate in deep}
+        # 每个候选都会真正被分析，不再是"前 deep_limit 名深挖、剩下的完全不分析"
+        # 的硬截断——排名决定分析力度（complexity_for_rank），不决定要不要分析。
         for candidate in candidates:
             self.store.save_item(
-                self._screened_item(run, candidate, candidate.symbol in deep_symbols)
+                self._screened_item(
+                    run,
+                    candidate,
+                    selected=True,
+                    status="PENDING",
+                    complexity=complexity_for_rank(candidate.rank),
+                )
             )
 
         completed = 0
         failed = 0
-        first_error = "" if deep else "NO_ELIGIBLE_DEEP_CANDIDATES"
-        for candidate in deep:
+        first_error = "" if candidates else "NO_ELIGIBLE_DEEP_CANDIDATES"
+        for candidate in candidates:
             created_at = now
+            complexity = complexity_for_rank(candidate.rank)
             self.store.save_item(
                 self._screened_item(
                     run,
                     candidate,
                     selected=True,
                     status="RUNNING",
+                    complexity=complexity,
                 )
             )
             try:
@@ -1671,11 +1766,13 @@ class DailyResearchService:
                         candidate.symbol,
                         trading_date,
                         invocation,
+                        complexity=complexity,
                     )
                 else:
                     analysis = self.analyzer.analyze(
                         candidate.symbol,
                         trading_date,
+                        complexity=complexity,
                     )
                 ta_snapshot_id = self._write_ta_snapshot(
                     run,
@@ -1706,6 +1803,7 @@ class DailyResearchService:
                     model_version=invocation.model_version,
                     invocation_id=invocation.invocation_id,
                     ta_snapshot_id=ta_snapshot_id,
+                    complexity=complexity,
                 )
                 completed += 1
             except Exception as exc:
@@ -1725,6 +1823,7 @@ class DailyResearchService:
                     model=model,
                     created_at=created_at,
                     completed_at=now,
+                    complexity=complexity,
                 )
                 logger.warning(
                     "Daily research %s failed: %s", candidate.symbol, error_code
@@ -1905,114 +2004,138 @@ class DailyResearchService:
             screening_inputs.get("strategy_statistics") or ()
         )
         for candidate in candidates:
-            try:
-                snapshot = build_screening_shadow_snapshot(
-                    run_id=run.run_id,
-                    trading_date=run.trading_date,
-                    timeframe=run.timeframe,
-                    candidate=candidate,
-                    bars=bars_by_symbol.get(candidate.symbol),
-                    strategy_statistics=statistics,
-                    strategy_statistics_path=strategy_statistics_path,
-                    captured_at=run.data_cutoff,
-                )
-                if hasattr(self.snapshot_store, "save_or_get"):
-                    result = self.snapshot_store.save_or_get(snapshot)
-                    snapshot_id = result.snapshot_id
-                    created = result.created
-                    self.snapshot_store.bind_to_run(
-                        run_id=run.run_id,
-                        symbol=candidate.symbol,
-                        trading_date=run.trading_date,
-                        snapshot_id=snapshot_id,
-                        bound_at=run.data_cutoff,
+            # This does 5+ separate DuckDB round-trips per candidate (save_or_get,
+            # bind_to_run, replay, save_snapshot_link, save_snapshot_comparison),
+            # all in a tight loop across every candidate in the batch — a burst
+            # dense enough to land on the engine/dashboard mid-write fairly often.
+            # A candidate whose shadow snapshot fails here can never be analyzed
+            # later (see _invocation()'s TRADINGAGENTS_SNAPSHOT_LINK_UNAVAILABLE),
+            # so a transient lock collision here silently dooms that symbol for
+            # the whole run unless we retry.
+            for attempt in range(3):
+                try:
+                    self._write_shadow_snapshot_for(
+                        run,
+                        candidate,
+                        bars_by_symbol=bars_by_symbol,
+                        statistics=statistics,
+                        strategy_statistics_path=strategy_statistics_path,
                     )
-                else:
-                    created = self.snapshot_store.save(snapshot)
-                    snapshot_id = snapshot.snapshot_id
-                replayed = (
-                    self.snapshot_store.replay(snapshot_id)
-                    if hasattr(self.snapshot_store, "replay")
-                    else snapshot
-                )
-                differences = compare_candidate_to_snapshot(
-                    candidate,
-                    replayed,
-                )
-                comparison_status = (
-                    "MATCH" if not differences else "MISMATCH"
-                )
-                classification = (
-                    "MATCH"
-                    if not differences
-                    else (
-                        "CLASSIFIED"
-                        if all(
-                            item.get("classification")
-                            not in {"", "UNCLASSIFIED", None}
-                            for item in differences
-                        )
-                        else "UNCLASSIFIED"
+                    break
+                except duckdb.IOException:
+                    if attempt < 2:
+                        time.sleep(0.2)
+                        continue
+                    self._record_shadow_snapshot_failure(run, candidate, "IOException")
+                except Exception as exc:
+                    self._record_shadow_snapshot_failure(
+                        run, candidate, _stable_error_code(exc)
                     )
-                )
-                self.store.save_snapshot_link(
-                    run_id=run.run_id,
-                    symbol=candidate.symbol,
-                    snapshot_id=snapshot_id,
-                    status="WRITTEN" if created else "EXISTS",
-                    created_at=run.data_cutoff,
-                )
-                self.store.save_snapshot_comparison(
-                    run_id=run.run_id,
-                    symbol=candidate.symbol,
-                    snapshot_id=snapshot_id,
-                    status=comparison_status,
-                    differences=differences,
-                    classification=classification,
-                    checked_at=run.data_cutoff,
-                )
-            except Exception as exc:
-                error_code = _stable_error_code(exc)
-                self.store.save_snapshot_link(
-                    run_id=run.run_id,
-                    symbol=candidate.symbol,
-                    snapshot_id="",
-                    status="FAILED",
-                    error_code=error_code,
-                    created_at=run.data_cutoff,
-                )
-                self.store.save_snapshot_comparison(
-                    run_id=run.run_id,
-                    symbol=candidate.symbol,
-                    snapshot_id="",
-                    status="NOT_AVAILABLE",
-                    differences=[],
-                    classification="SNAPSHOT_WRITE_FAILED",
-                    checked_at=run.data_cutoff,
-                )
-                logger.warning(
-                    "ResearchSnapshot shadow write %s failed: %s",
-                    candidate.symbol,
-                    error_code,
-                )
+                    break
 
-    @staticmethod
-    def _deep_candidates(
-        candidates: list[DailyCandidate], deep_limit: int
-    ) -> list[DailyCandidate]:
-        eligible = [
-            candidate
-            for candidate in candidates
-            if candidate.status not in {"AVOID_NOW", "MARKET_ANCHOR"}
-            and candidate.data_confidence != "低"
-        ]
-        fallback = [
-            candidate
-            for candidate in candidates
-            if candidate.status not in {"AVOID_NOW", "MARKET_ANCHOR"}
-            and candidate.data_confidence == "低"
-        ]
-        return (eligible + fallback)[: max(1, int(deep_limit))]
+    def _write_shadow_snapshot_for(
+        self,
+        run: DailyResearchRun,
+        candidate: DailyCandidate,
+        *,
+        bars_by_symbol: dict[str, Any],
+        statistics: tuple[Any, ...],
+        strategy_statistics_path: str,
+    ) -> None:
+        snapshot = build_screening_shadow_snapshot(
+            run_id=run.run_id,
+            trading_date=run.trading_date,
+            timeframe=run.timeframe,
+            candidate=candidate,
+            bars=bars_by_symbol.get(candidate.symbol),
+            strategy_statistics=statistics,
+            strategy_statistics_path=strategy_statistics_path,
+            captured_at=run.data_cutoff,
+        )
+        if hasattr(self.snapshot_store, "save_or_get"):
+            result = self.snapshot_store.save_or_get(snapshot)
+            snapshot_id = result.snapshot_id
+            created = result.created
+            self.snapshot_store.bind_to_run(
+                run_id=run.run_id,
+                symbol=candidate.symbol,
+                trading_date=run.trading_date,
+                snapshot_id=snapshot_id,
+                bound_at=run.data_cutoff,
+            )
+        else:
+            created = self.snapshot_store.save(snapshot)
+            snapshot_id = snapshot.snapshot_id
+        replayed = (
+            self.snapshot_store.replay(snapshot_id)
+            if hasattr(self.snapshot_store, "replay")
+            else snapshot
+        )
+        differences = compare_candidate_to_snapshot(
+            candidate,
+            replayed,
+        )
+        comparison_status = (
+            "MATCH" if not differences else "MISMATCH"
+        )
+        classification = (
+            "MATCH"
+            if not differences
+            else (
+                "CLASSIFIED"
+                if all(
+                    item.get("classification")
+                    not in {"", "UNCLASSIFIED", None}
+                    for item in differences
+                )
+                else "UNCLASSIFIED"
+            )
+        )
+        self.store.save_snapshot_link(
+            run_id=run.run_id,
+            symbol=candidate.symbol,
+            snapshot_id=snapshot_id,
+            status="WRITTEN" if created else "EXISTS",
+            created_at=run.data_cutoff,
+        )
+        self.store.save_snapshot_comparison(
+            run_id=run.run_id,
+            symbol=candidate.symbol,
+            snapshot_id=snapshot_id,
+            status=comparison_status,
+            differences=differences,
+            classification=classification,
+            checked_at=run.data_cutoff,
+        )
+
+    def _record_shadow_snapshot_failure(
+        self,
+        run: DailyResearchRun,
+        candidate: DailyCandidate,
+        error_code: str,
+    ) -> None:
+        self.store.save_snapshot_link(
+            run_id=run.run_id,
+            symbol=candidate.symbol,
+            snapshot_id="",
+            status="FAILED",
+            error_code=error_code,
+            created_at=run.data_cutoff,
+        )
+        self.store.save_snapshot_comparison(
+            run_id=run.run_id,
+            symbol=candidate.symbol,
+            snapshot_id="",
+            status="NOT_AVAILABLE",
+            differences=[],
+            classification="SNAPSHOT_WRITE_FAILED",
+            checked_at=run.data_cutoff,
+        )
+        logger.warning(
+            "ResearchSnapshot shadow write %s failed: %s",
+            candidate.symbol,
+            error_code,
+        )
 
     @staticmethod
     def _research_risks(
@@ -2032,6 +2155,7 @@ class DailyResearchService:
         selected: bool,
         *,
         status: str = "",
+        complexity: str = "",
     ) -> DailyResearchItem:
         risks = tuple(candidate.risk_flags)
         if selected:
@@ -2049,6 +2173,7 @@ class DailyResearchService:
             provider=run.provider,
             model=run.model,
             created_at=run.started_at,
+            complexity=complexity,
         )
 
     def _publish(self, run: DailyResearchRun) -> None:
@@ -2119,11 +2244,7 @@ class DailyResearchWorker:
                     )
                 ),
             )
-        if not force and not in_daily_run_window(
-            now,
-            close_hour_et=self.close_hour_et,
-            close_minute_et=self.close_minute_et,
-        ):
+        if not force and not in_daily_run_window(now):
             return False
         trading_date = research_target_date(
             now,
