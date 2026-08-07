@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import urllib.request
 from dataclasses import dataclass
@@ -14,7 +15,7 @@ _HEADERS = {
     # bls.gov 会对伪装成浏览器的 UA 返回 403（实测 3/3 次全部被拒），
     # 换成标识型 UA 就正常返回（symbol_master.py 一直用的就是这种）。
     # 这直接决定 CPI/PPI/就业/JOLTS 的官方确认能不能进晨报。
-    "User-Agent": "stock-minute-ai/1.0 (contact: cle19@uci.edu)",
+    "User-Agent": os.getenv("SEC_USER_AGENT", "stock-minute-ai/1.0 contact@example.com"),
     "Accept": "text/html,application/xhtml+xml",
 }
 
