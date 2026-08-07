@@ -382,6 +382,25 @@ def describe_cached_bars(
             else None
         )
 
+    # 缓存文件里最近一次写入用的 feed 是否还和当前配置一致 —— data_cache 严格
+    # 本地优先、绝不自动核实文件内容，所以这是唯一能发现"这份数据是用旧口径
+    # 抓的"的地方。2026-08-06：一批 IEX 单一交易所口径的成交量（只有真实值
+    # 2~7%）在磁盘上躺了几个月没被发现，起因正是完全没有这层核对。
+    cached_feed = ""
+    feed_mismatch = False
+    if not normalized.empty:
+        if "source_feed" in normalized.columns:
+            last_feed = normalized["source_feed"].dropna()
+            cached_feed = str(last_feed.iloc[-1]) if not last_feed.empty else ""
+        # 没打过标签（老文件，早于本次修复）同样当可疑处理，不默认信任——
+        # 不知道来源就是不知道，"当它是对的"正是这批脏数据躺了几个月的原因。
+        if cached_feed != "yfinance":
+            try:
+                configured_feed = _alpaca_creds()[2]
+            except Exception:
+                configured_feed = ""
+            feed_mismatch = bool(configured_feed) and cached_feed != configured_feed
+
     if normalized.empty:
         status = "MISSING"
         quality_score = 0.0
@@ -398,6 +417,13 @@ def describe_cached_bars(
         status = "DEGRADED"
         quality_score = min(len(rows) / 40.0, 1.0)
         failure_code = "BAR_HISTORY_SHORT"
+    elif feed_mismatch:
+        # 文件没被数据本身的问题拖累（够长、列齐全），但抓取时用的 feed 和
+        # 现在配置的不一样 —— 典型场景就是成交量口径不一致。数据可能仍然可
+        # 用（价格类字段通常影响很小），所以降级而不是判 MISSING。
+        status = "DEGRADED"
+        quality_score = 0.5
+        failure_code = "BAR_FEED_STALE"
     else:
         status = "OK"
         quality_score = 1.0
@@ -433,6 +459,8 @@ def describe_cached_bars(
             "data_end": (
                 data_end.isoformat() if data_end is not None else None
             ),
+            "cached_feed": cached_feed,
+            "feed_mismatch": feed_mismatch,
         },
         "payload": {
             "symbol": symbol,
@@ -752,7 +780,10 @@ def _alpaca_fetch_full(symbol: str, timeframe: str) -> pd.DataFrame:
 def upsert_bars(symbol: str, timeframe: str, df: pd.DataFrame) -> None:
     """Merge a fresh DataFrame from the live data feed into the in-memory cache
     and flush to the local Parquet file.  Called by the Runtime after each tick
-    so that exploration/backtest panels always see the latest live bars."""
+    so that exploration/backtest panels always see the latest live bars, and by
+    ensure_bars() to top up thin caches. Both callers source exclusively from
+    Alpaca (data_feed.AlpacaDataFeed / fetch_alpaca_bars_window), so the
+    currently configured feed is an accurate tag for what's being written."""
     if df is None or df.empty:
         return
     df = df.copy()
@@ -762,6 +793,7 @@ def upsert_bars(symbol: str, timeframe: str, df: pd.DataFrame) -> None:
     df["timestamp"] = df["timestamp_utc"]
     if "symbol" not in df.columns:
         df["symbol"] = symbol
+    df["source_feed"] = _alpaca_creds()[2]
     key = (symbol, timeframe)
     _merge_into_cache(key, df)
     with _CACHE_LOCK:
@@ -848,24 +880,33 @@ def fetch_and_save(symbol: str, timeframe: str) -> pd.DataFrame:
     """
     key = (symbol, timeframe)
     df = pd.DataFrame()
+    source_feed = ""
 
     if timeframe == "1m":
         # Alpaca 免费计划 1m 历史很短，直接用 yfinance
         logger.info("fetch_and_save %s 1m — yfinance (7d)", symbol)
         df = _yf_fetch(symbol, "1m", "7d")
+        source_feed = "yfinance"
     else:
         # 优先 Alpaca（2016 至今）
         logger.info("fetch_and_save %s %s — Alpaca (2016-present)", symbol, timeframe)
         df = _alpaca_fetch_full(symbol, timeframe)
+        source_feed = _alpaca_creds()[2]
         if df.empty:
             # Alpaca 失败（无 Key 或网络问题）→ yfinance 兜底
             period = _YF_PERIOD.get(timeframe, "60d")
             logger.warning("fetch_and_save %s %s — Alpaca failed, fallback yfinance (%s)", symbol, timeframe, period)
             df = _yf_fetch(symbol, timeframe, period)
+            source_feed = "yfinance"
 
     if not df.empty:
         df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
         df = df.sort_values("timestamp_utc").drop_duplicates(subset=["timestamp_utc"]).reset_index(drop=True)
+        # 记录这批数据是用哪个 feed 抓的，供 describe_cached_bars 核对是否和
+        # 当前配置一致 —— 这是 2026-08-06 发现的成交量口径问题的补救：那批
+        # 脏数据（IEX 单一交易所成交量，只有真实值的 2~7%）没有任何标记能
+        # 让系统自己发现它和当前 sip 配置不一致，只能一直悄悄躺在缓存里。
+        df["source_feed"] = source_feed
         with _CACHE_LOCK:
             _CACHE[key] = df
         _LAST_NETWORK_FETCH[key] = datetime.now(timezone.utc)

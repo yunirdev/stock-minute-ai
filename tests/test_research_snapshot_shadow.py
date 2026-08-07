@@ -52,6 +52,12 @@ def _bars() -> pd.DataFrame:
             "low": [99.0 + index for index in range(50)],
             "close": [100.5 + index for index in range(50)],
             "volume": [1_000.0 + index for index in range(50)],
+            # "yfinance" rather than a real Alpaca feed name so this fixture
+            # stays exempt from data_cache's feed-mismatch check regardless of
+            # whatever ALPACA_DATA_FEED happens to be set to in .env -- these
+            # tests represent healthy, correctly-provenanced bars, not the
+            # feed-staleness scenario that check exists to catch.
+            "source_feed": ["yfinance"] * 50,
         }
     )
 
