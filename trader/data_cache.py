@@ -831,22 +831,33 @@ def ensure_bars(
     "不被标记为降级"，但远不够跑筛选和生成策略统计。实测 120 根 5m（约 1.5
     个交易日）就会让 strategy_statistics 完全生不成该标的的记录。
 
+    行数够了不代表数据是新的：_FILE_MAX_AGE 之前定义了但没接到任何地方——
+    这正是那批 IEX 口径脏数据能在磁盘上躺几个月不被发现的原因，文件行数一
+    直够、只是内容早就不对了。这里把它接上：文件超过对应周期的最大寿命，
+    即使行数达标也重新拉一次。
+
     任何一个标的失败都不抛异常：补数据是尽力而为的前置动作，不该让整个研究
     批次因为一次网络抖动而失败。
     """
     if lookback_days is None:
         lookback_days = _ENSURE_LOOKBACK_DAYS.get(timeframe, 30)
+    max_age = _FILE_MAX_AGE.get(timeframe)
     filled: list[str] = []
     sufficient: list[str] = []
+    stale: list[str] = []
     failed: list[str] = []
 
     for raw in symbols:
         symbol = str(raw).strip().upper()
         if not symbol:
             continue
-        if len(get_bars(symbol, timeframe)) >= min_rows:
+        has_enough_rows = len(get_bars(symbol, timeframe)) >= min_rows
+        is_stale = max_age is not None and _file_age_seconds(symbol, timeframe) > max_age
+        if has_enough_rows and not is_stale:
             sufficient.append(symbol)
             continue
+        if is_stale and has_enough_rows:
+            stale.append(symbol)
         try:
             end = datetime.now(timezone.utc) - timedelta(minutes=20)
             start = end - timedelta(days=lookback_days)
@@ -862,11 +873,16 @@ def ensure_bars(
 
     if filled or failed:
         logger.info(
-            "ensure_bars %s — filled=%d sufficient=%d failed=%d%s",
-            timeframe, len(filled), len(sufficient), len(failed),
+            "ensure_bars %s — filled=%d (of which stale=%d) sufficient=%d failed=%d%s",
+            timeframe, len(filled), len(stale), len(sufficient), len(failed),
             f" (failed: {', '.join(failed)})" if failed else "",
         )
-    return {"filled": filled, "sufficient": sufficient, "failed": failed}
+    return {
+        "filled": filled,
+        "sufficient": sufficient,
+        "stale": stale,
+        "failed": failed,
+    }
 
 
 def fetch_and_save(symbol: str, timeframe: str) -> pd.DataFrame:

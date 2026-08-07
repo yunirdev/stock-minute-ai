@@ -31,11 +31,19 @@ def _frame(rows: int, symbol: str = "AAPL") -> pd.DataFrame:
 
 @pytest.fixture
 def stub_cache(monkeypatch, tmp_path):
-    """Isolate the cache and record what would have been fetched/persisted."""
+    """Isolate the cache and record what would have been fetched/persisted.
+
+    get_bars is stubbed, so nothing here actually touches disk -- without a
+    default, _file_age_seconds would see "file does not exist" (age=inf) and
+    treat every symbol as stale. Default to "just fetched" so existing tests
+    keep describing "this data is fine" unless a test overrides it to cover
+    the staleness path itself.
+    """
     calls = {"fetched": [], "saved": []}
 
     monkeypatch.setattr(data_cache, "_BARS_DIR", tmp_path)
     monkeypatch.setattr(data_cache, "_CACHE", {})
+    monkeypatch.setattr(data_cache, "_file_age_seconds", lambda s, tf: 0.0)
 
     def fake_window(symbol, timeframe, start, end):
         calls["fetched"].append((symbol, timeframe))
@@ -154,3 +162,51 @@ def test_blank_symbols_are_skipped(stub_cache, monkeypatch):
     result = data_cache.ensure_bars(["AAPL", "", "  "], "5m")
 
     assert result["sufficient"] == ["AAPL"]
+
+
+# --- staleness: row count alone is not enough -------------------------------
+#
+# _FILE_MAX_AGE existed in this module for a long time but nothing ever read
+# it -- _ensure_loaded's own docstring said staleness was "left to manual
+# refresh". That gap is exactly how a batch of IEX-scale volume (see
+# test_data_cache_feed_tag.py) sat on disk undetected for months: the files
+# had plenty of rows, so nothing ever asked whether the rows were current.
+
+
+def test_refetches_a_fresh_row_count_that_is_past_its_max_age(stub_cache, monkeypatch):
+    monkeypatch.setattr(data_cache, "get_bars", lambda s, tf: _frame(300))
+    old_age = data_cache._FILE_MAX_AGE["5m"] + 3600  # one hour past the limit
+    monkeypatch.setattr(data_cache, "_file_age_seconds", lambda s, tf: old_age)
+
+    result = data_cache.ensure_bars(["AAPL"], "5m")
+
+    assert result["filled"] == ["AAPL"]
+    assert result["stale"] == ["AAPL"]
+    assert result["sufficient"] == []
+
+
+def test_does_not_refetch_a_fresh_file_with_enough_rows(stub_cache, monkeypatch):
+    monkeypatch.setattr(data_cache, "get_bars", lambda s, tf: _frame(300))
+    monkeypatch.setattr(
+        data_cache, "_file_age_seconds", lambda s, tf: data_cache._FILE_MAX_AGE["5m"] - 60
+    )
+
+    result = data_cache.ensure_bars(["AAPL"], "5m")
+
+    assert result["sufficient"] == ["AAPL"]
+    assert result["filled"] == []
+    assert stub_cache["fetched"] == []
+
+
+def test_staleness_check_is_per_timeframe(stub_cache, monkeypatch):
+    """1m tolerates only 8h before refresh; 1d tolerates 24h -- the same
+    absolute age must not be judged the same way across timeframes."""
+    age = 12 * 3600  # stale for 1m (8h), fresh for 1d (24h)
+    monkeypatch.setattr(data_cache, "get_bars", lambda s, tf: _frame(300))
+    monkeypatch.setattr(data_cache, "_file_age_seconds", lambda s, tf: age)
+
+    result_1m = data_cache.ensure_bars(["AAPL"], "1m")
+    result_1d = data_cache.ensure_bars(["AAPL"], "1d")
+
+    assert result_1m["stale"] == ["AAPL"]
+    assert result_1d["sufficient"] == ["AAPL"]
