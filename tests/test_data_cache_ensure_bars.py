@@ -204,9 +204,51 @@ def test_staleness_check_is_per_timeframe(stub_cache, monkeypatch):
     age = 12 * 3600  # stale for 1m (8h), fresh for 1d (24h)
     monkeypatch.setattr(data_cache, "get_bars", lambda s, tf: _frame(300))
     monkeypatch.setattr(data_cache, "_file_age_seconds", lambda s, tf: age)
+    monkeypatch.setattr(data_cache, "_yf_fetch", lambda s, tf, period: _frame(100, s))
 
     result_1m = data_cache.ensure_bars(["AAPL"], "1m")
     result_1d = data_cache.ensure_bars(["AAPL"], "1d")
 
     assert result_1m["stale"] == ["AAPL"]
     assert result_1d["sufficient"] == ["AAPL"]
+
+
+# --- 1m: Alpaca doesn't carry deep history, must fall back to yfinance -----
+
+
+def test_1m_falls_back_to_yfinance_instead_of_failing(stub_cache, monkeypatch):
+    """fetch_alpaca_bars_window rejects "1m" outright in the real
+    implementation (Alpaca free plan has no deep 1m history). If ensure_bars
+    routed 1m through it the way it does every other timeframe, every symbol
+    would land in `failed`."""
+    monkeypatch.setattr(data_cache, "get_bars", lambda s, tf: pd.DataFrame())
+    monkeypatch.setattr(data_cache, "_yf_fetch", lambda s, tf, period: _frame(100, s))
+
+    def alpaca_should_not_be_called(*a, **k):
+        raise AssertionError("1m must not go through the Alpaca window fetch")
+
+    monkeypatch.setattr(data_cache, "fetch_alpaca_bars_window", alpaca_should_not_be_called)
+
+    result = data_cache.ensure_bars(["AAPL"], "1m")
+
+    assert result["filled"] == ["AAPL"]
+    assert result["failed"] == []
+
+
+def test_1m_yfinance_fallback_is_tagged_correctly(tmp_path, monkeypatch):
+    """The real upsert_bars() path (not stubbed): a 1m top-up must be tagged
+    "yfinance", not the configured Alpaca feed -- 1m data never actually came
+    from Alpaca, so tagging it "sip" would be a false provenance claim that
+    describe_cached_bars could never catch."""
+    bars_dir = tmp_path / "bars"
+    bars_dir.mkdir()
+    monkeypatch.setattr(data_cache, "_BARS_DIR", bars_dir)
+    monkeypatch.setattr(data_cache, "_CACHE", {})
+    monkeypatch.setattr(data_cache, "_alpaca_creds", lambda: ("key", "secret", "sip"))
+    monkeypatch.setattr(data_cache, "get_bars", lambda s, tf: pd.DataFrame())
+    monkeypatch.setattr(data_cache, "_yf_fetch", lambda s, tf, period: _frame(100, s))
+
+    data_cache.ensure_bars(["AAPL"], "1m")
+
+    saved = data_cache._load_from_disk("AAPL", "1m")
+    assert set(saved["source_feed"]) == {"yfinance"}

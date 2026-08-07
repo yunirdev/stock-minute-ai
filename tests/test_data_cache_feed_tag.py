@@ -90,6 +90,20 @@ def test_upsert_bars_tags_with_the_configured_feed(isolated_cache, monkeypatch):
     assert set(saved["source_feed"]) == {"sip"}
 
 
+def test_upsert_bars_respects_a_caller_provided_tag(isolated_cache, monkeypatch):
+    """ensure_bars' 1m top-up goes through yfinance, not Alpaca, and tags the
+    frame itself before calling in. upsert_bars must not clobber that with the
+    configured Alpaca feed -- 1m data never came from Alpaca regardless of
+    what ALPACA_DATA_FEED is set to."""
+    _configured(monkeypatch, "sip")
+    pre_tagged = _frame().assign(source_feed="yfinance")
+
+    data_cache.upsert_bars("AAPL", "1m", pre_tagged)
+
+    saved = data_cache._load_from_disk("AAPL", "1m")
+    assert set(saved["source_feed"]) == {"yfinance"}
+
+
 # --- describe_cached_bars flags a stale-feed file ---------------------------
 
 

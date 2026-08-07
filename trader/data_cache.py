@@ -781,9 +781,12 @@ def upsert_bars(symbol: str, timeframe: str, df: pd.DataFrame) -> None:
     """Merge a fresh DataFrame from the live data feed into the in-memory cache
     and flush to the local Parquet file.  Called by the Runtime after each tick
     so that exploration/backtest panels always see the latest live bars, and by
-    ensure_bars() to top up thin caches. Both callers source exclusively from
-    Alpaca (data_feed.AlpacaDataFeed / fetch_alpaca_bars_window), so the
-    currently configured feed is an accurate tag for what's being written."""
+    ensure_bars() to top up thin caches. Both callers source almost exclusively
+    from Alpaca (data_feed.AlpacaDataFeed / fetch_alpaca_bars_window), so the
+    currently configured feed is an accurate default tag -- but a caller that
+    already knows better (ensure_bars' yfinance fallback for 1m) can stamp its
+    own source_feed before calling in, and that tag is respected here rather
+    than overwritten."""
     if df is None or df.empty:
         return
     df = df.copy()
@@ -793,7 +796,8 @@ def upsert_bars(symbol: str, timeframe: str, df: pd.DataFrame) -> None:
     df["timestamp"] = df["timestamp_utc"]
     if "symbol" not in df.columns:
         df["symbol"] = symbol
-    df["source_feed"] = _alpaca_creds()[2]
+    if "source_feed" not in df.columns:
+        df["source_feed"] = _alpaca_creds()[2]
     key = (symbol, timeframe)
     _merge_into_cache(key, df)
     with _CACHE_LOCK:
@@ -859,9 +863,18 @@ def ensure_bars(
         if is_stale and has_enough_rows:
             stale.append(symbol)
         try:
-            end = datetime.now(timezone.utc) - timedelta(minutes=20)
-            start = end - timedelta(days=lookback_days)
-            df = fetch_alpaca_bars_window(symbol, timeframe, start, end)
+            if timeframe == "1m":
+                # fetch_alpaca_bars_window rejects "1m" outright (Alpaca's free
+                # plan doesn't carry deep 1m history -- see _ALPACA_TF); every
+                # symbol would land in `failed` without this. Same yfinance
+                # fallback fetch_and_save() already uses for this timeframe.
+                df = _yf_fetch(symbol, "1m", "7d")
+                if not df.empty:
+                    df["source_feed"] = "yfinance"
+            else:
+                end = datetime.now(timezone.utc) - timedelta(minutes=20)
+                start = end - timedelta(days=lookback_days)
+                df = fetch_alpaca_bars_window(symbol, timeframe, start, end)
             if df.empty:
                 failed.append(symbol)
                 continue
